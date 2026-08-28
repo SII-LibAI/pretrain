@@ -6,15 +6,20 @@ import torch
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.internvla_a1_5.configuration_internvla_a1_5 import InternVLAA15Config
+from lerobot.policies.wsa_pretrain.configuration_wsa_pretrain import WSAPretrainConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 
-AVAILABLE_POLICIES = ("pi0", "pi0_fast", "pi05", "internvla_a1_5")
+AVAILABLE_POLICIES = ("pi0", "pi0_fast", "pi05", "internvla_a1_5", "wsa_pretrain")
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
+    if name == "wsa_pretrain":
+        from lerobot.policies.wsa_pretrain.modeling_wsa_pretrain import WSAPretrainPolicy
+
+        return WSAPretrainPolicy
     if name == "internvla_a1_5":
         from lerobot.policies.internvla_a1_5.modeling_internvla_a1_5 import InternVLAA15Policy
 
@@ -36,6 +41,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
+    if policy_type == "wsa_pretrain":
+        return WSAPretrainConfig(**kwargs)
     if policy_type == "internvla_a1_5":
         return InternVLAA15Config(**kwargs)
     if policy_type == "pi0":
