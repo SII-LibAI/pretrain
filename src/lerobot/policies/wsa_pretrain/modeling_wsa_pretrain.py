@@ -1436,8 +1436,53 @@ class WSAPretrainPolicy(PreTrainedPolicy):
                     del metadata[key]
         return state
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self) -> list[dict]:
+        """Return independently scheduled VLM and action parameter groups.
+
+        WAN is intentionally not assigned here. ``action_loss_only=True`` does
+        not load WAN, and failing on any other unmatched trainable parameter
+        prevents a newly added module from silently receiving the wrong LR.
+        """
+        vlm_params = []
+        action_params = []
+        unmatched = []
+
+        vlm_prefixes = (
+            "model.qwen3_5_with_expert.qwen3_5.",
+        )
+        action_prefixes = (
+            "model.qwen3_5_with_expert.action_expert.",
+            "model.action_in_proj.",
+            "model.action_out_proj.",
+            "model.state_proj.",
+            "model.action_time_mlp_in.",
+            "model.action_time_mlp_out.",
+        )
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith(vlm_prefixes):
+                vlm_params.append(param)
+            elif name.startswith(action_prefixes):
+                action_params.append(param)
+            else:
+                unmatched.append(name)
+
+        if unmatched:
+            raise ValueError(
+                "Trainable parameters were not assigned to the VLM or action optimizer group:\n"
+                + "\n".join(unmatched)
+            )
+
+        groups = []
+        if vlm_params:
+            groups.append({"name": "vlm", "params": vlm_params, "lr": self.config.vlm_lr})
+        if action_params:
+            groups.append({"name": "action", "params": action_params, "lr": self.config.action_lr})
+        if not groups:
+            raise ValueError("WSAPretrainPolicy has no trainable parameters")
+        return groups
 
     def reset(self):
         self._action_queue = deque(maxlen=self.config.n_action_steps)

@@ -476,8 +476,17 @@ def make_dataset(cfg: TrainPipelineConfig):
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
+    wsa_pretrain_pi05_image_aug = (
+        getattr(cfg.policy, "type", None) == "wsa_pretrain"
+        and cfg.dataset.image_transforms.enable
+        and cfg.dataset.image_transforms.preset in {"pi05", "pi0.5", "pi05_style"}
+    )
     image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+        None
+        if wsa_pretrain_pi05_image_aug
+        else ImageTransforms(cfg.dataset.image_transforms)
+        if cfg.dataset.image_transforms.enable
+        else None
     )
 
     all_data_stats = {}

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.transforms import Pi05StyleAugment
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.transforms.utils import resize_with_pad, resize_center_crop
 from lerobot.utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE, ACTION
@@ -164,6 +165,26 @@ class ResizeShortestCenterCropFn(DataTransformFn):
         for k, v in data.items():
             if k.startswith(OBS_IMAGES) or k == OBS_IMAGE or "image" in k:
                 data[k] = resize_center_crop(v, self.height, self.width, self.mode)
+        return data
+
+
+@DataTransformFn.register_subclass("wsa_pretrain_pi05_image_augment")
+@dataclass
+class Pi05ImageAugmentFn(DataTransformFn):
+    """Apply pi0.5-style augmentation to the image tensors of a WSA sample."""
+
+    def __post_init__(self):
+        self.augment = Pi05StyleAugment()
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not hasattr(self, "augment"):
+            self.augment = Pi05StyleAugment()
+        for key, value in data.items():
+            if "is_pad" in key:
+                continue
+            if key.startswith(OBS_IMAGES) or key == OBS_IMAGE or "image" in key:
+                self.augment.set_current_key(key)
+                data[key] = self.augment(value)
         return data
 
 

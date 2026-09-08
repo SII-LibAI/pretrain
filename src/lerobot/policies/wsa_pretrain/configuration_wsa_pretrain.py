@@ -6,7 +6,7 @@ from lerobot.configs.default import DatasetConfig, VQADatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.optim.schedulers import MultiGroupCosineDecayWithWarmupSchedulerConfig
 from lerobot.policies.wsa_pretrain.transform_wsa_pretrain import (
     ExtractVideoFramesTransformFn,
     FASTWSAPretrainActionTokenizerTransformFn,
@@ -66,6 +66,19 @@ class WSAPretrainDatasetConfig(DatasetConfig):
     def __post_init__(self):
         super().__post_init__()
         inputs = list(self.data_transforms.inputs)
+
+        uses_pi05_image_aug = (
+            self.image_transforms.enable
+            and self.image_transforms.preset in {"pi05", "pi0.5", "pi05_style"}
+        )
+        inputs = [t for t in inputs if not isinstance(t, Pi05ImageAugmentFn)]
+        if uses_pi05_image_aug:
+            insert_idx = next(
+                (idx + 1 for idx, transform in enumerate(inputs) if isinstance(transform, ResizeImagesWithPadFn)),
+                0,
+            )
+            inputs.insert(insert_idx, Pi05ImageAugmentFn())
+
         has_delta = any(isinstance(t, DeltaActionTransformFn) for t in inputs)
         if self.action_mode == "delta" and not has_delta:
             logging.info("action_mode='delta' -> Adding DeltaActionTransformFn")
@@ -292,16 +305,22 @@ class WSAPretrainConfig(PreTrainedConfig):
     compile_mode: str = "max-autotune"
     device: str | None = None
 
-    # Optimizer settings
-    optimizer_lr: float = 2.5e-5
+    # Optimizer settings. VLM is pretrained, while the action branch is mostly
+    # initialized from scratch, so they use independent learning-rate curves.
+    vlm_lr: float = 1.0e-5
+    vlm_decay_lr: float = 1.0e-6
+    vlm_warmup_steps: int = 2_000
+    vlm_decay_steps: int = 100_000
+
+    action_lr: float = 1.0e-4
+    action_decay_lr: float = 1.0e-5
+    action_warmup_steps: int = 1_000
+    action_decay_steps: int = 100_000
+
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
-
-    scheduler_warmup_steps: int = 1_000
-    scheduler_decay_steps: int = 30_000
-    scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 48
 
@@ -309,7 +328,8 @@ class WSAPretrainConfig(PreTrainedConfig):
     train_expert_only: bool = False
 
     # VQA configurations
-    enable_vqa_loss: bool = True
+    # WSA pretraining defaults to flow-matching action supervision only.
+    enable_vqa_loss: bool = False
     lambda_vqa: float = 1.0
     tokenize_state: bool = True
 
@@ -340,7 +360,7 @@ class WSAPretrainConfig(PreTrainedConfig):
     video_width: int = 224
     video_loss_weight: float = 1.0
     video_loss_only: bool = False
-    action_loss_only: bool = False
+    action_loss_only: bool = True
     freeze_learnable_tokens: bool = False
 
     def __post_init__(self):
@@ -393,7 +413,9 @@ class WSAPretrainConfig(PreTrainedConfig):
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
-            lr=self.optimizer_lr,
+            # Parameter-group learning rates returned by get_optim_params()
+            # override this optimizer-level fallback.
+            lr=self.action_lr,
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
@@ -401,11 +423,21 @@ class WSAPretrainConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
-        return CosineDecayWithWarmupSchedulerConfig(
-            peak_lr=self.optimizer_lr,
-            decay_lr=self.scheduler_decay_lr,
-            num_warmup_steps=self.scheduler_warmup_steps,
-            num_decay_steps=self.scheduler_decay_steps,
+        return MultiGroupCosineDecayWithWarmupSchedulerConfig(
+            group_schedules={
+                "vlm": {
+                    "peak_lr": self.vlm_lr,
+                    "decay_lr": self.vlm_decay_lr,
+                    "num_warmup_steps": self.vlm_warmup_steps,
+                    "num_decay_steps": self.vlm_decay_steps,
+                },
+                "action": {
+                    "peak_lr": self.action_lr,
+                    "decay_lr": self.action_decay_lr,
+                    "num_warmup_steps": self.action_warmup_steps,
+                    "num_decay_steps": self.action_decay_steps,
+                },
+            }
         )
 
     @property

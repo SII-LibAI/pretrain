@@ -127,7 +127,16 @@ def update_policy(
     if "loss_subtask" in output_dict:
         train_metrics.loss_subtask = output_dict["loss_subtask"]
     train_metrics.grad_norm = grad_norm.item()
-    train_metrics.lr = optimizer.param_groups[0]["lr"]
+    group_lrs = {
+        group["name"]: group["lr"]
+        for group in optimizer.param_groups
+        if "name" in group
+    }
+    # Keep the existing aggregate metric meaningful for action training, and
+    # expose every named group separately to structured loggers such as WandB.
+    train_metrics.lr = group_lrs.get("action", optimizer.param_groups[0]["lr"])
+    if output_dict is not None and group_lrs:
+        output_dict.update({f"lr/{name}": lr for name, lr in group_lrs.items()})
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 

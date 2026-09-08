@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from torchvision.transforms import v2
+from torchvision.transforms import InterpolationMode, v2
 from torchvision.transforms.v2 import (
     Transform,
     functional as F,  # noqa: N812
@@ -144,6 +144,99 @@ class SharpnessJitter(Transform):
         return self._call_kernel(F.adjust_sharpness, inpt, sharpness_factor=sharpness_factor)
 
 
+class Pi05StyleAugment(Transform):
+    """Approximate the OpenPI pi0.5 training image augmentation policy."""
+
+    def __init__(
+        self,
+        crop_scale: float = 0.95,
+        degrees: Sequence[float] = (-5.0, 5.0),
+        brightness: Sequence[float] = (0.7, 1.3),
+        contrast: Sequence[float] = (0.6, 1.4),
+        saturation: Sequence[float] = (0.5, 1.5),
+        apply_geometric: bool = True,
+        wrist_camera_keywords: Sequence[str] = ("wrist", "hand", "left", "right", "image1", "image2"),
+    ) -> None:
+        super().__init__()
+        if not 0.0 < crop_scale <= 1.0:
+            raise ValueError(f"crop_scale must be in (0, 1], got {crop_scale}.")
+        self.crop_scale = float(crop_scale)
+        self.degrees = self._check_range(degrees, "degrees")
+        self.brightness = self._check_range(brightness, "brightness")
+        self.contrast = self._check_range(contrast, "contrast")
+        self.saturation = self._check_range(saturation, "saturation")
+        self.apply_geometric = bool(apply_geometric)
+        self.wrist_camera_keywords = tuple(keyword.lower() for keyword in wrist_camera_keywords)
+        self._camera_key: str | None = None
+
+    def set_current_key(self, camera_key: str | None) -> None:
+        self._camera_key = camera_key
+
+    @staticmethod
+    def _check_range(value: Sequence[float], name: str) -> tuple[float, float]:
+        if not isinstance(value, collections.abc.Sequence) or len(value) != 2:
+            raise TypeError(f"{name} must be a sequence of two numbers.")
+        low, high = float(value[0]), float(value[1])
+        if low > high:
+            raise ValueError(f"{name} lower bound must be <= upper bound, got {value}.")
+        return low, high
+
+    @staticmethod
+    def _sample_uniform(bounds: tuple[float, float]) -> float:
+        return torch.empty(1).uniform_(bounds[0], bounds[1]).item()
+
+    @staticmethod
+    def _get_height_width(inpt: Any) -> tuple[int, int]:
+        if hasattr(inpt, "shape"):
+            return int(inpt.shape[-2]), int(inpt.shape[-1])
+        if hasattr(inpt, "size"):
+            width, height = inpt.size
+            return int(height), int(width)
+        raise TypeError(f"Unsupported image input type for Pi05StyleAugment: {type(inpt)!r}")
+
+    def _is_wrist_camera(self) -> bool:
+        if self._camera_key is None:
+            return False
+        camera_key = self._camera_key.lower()
+        return any(keyword in camera_key for keyword in self.wrist_camera_keywords)
+
+    def forward(self, inpt: Any) -> Any:
+        if self.apply_geometric and not self._is_wrist_camera():
+            height, width = self._get_height_width(inpt)
+            crop_height = max(1, int(height * self.crop_scale))
+            crop_width = max(1, int(width * self.crop_scale))
+            max_top = height - crop_height
+            max_left = width - crop_width
+            top = torch.randint(0, max_top + 1, (1,)).item() if max_top > 0 else 0
+            left = torch.randint(0, max_left + 1, (1,)).item() if max_left > 0 else 0
+            inpt = F.resized_crop(
+                inpt,
+                top=int(top),
+                left=int(left),
+                height=crop_height,
+                width=crop_width,
+                size=[height, width],
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+
+            angle = self._sample_uniform(self.degrees)
+            if abs(angle) > 0.1:
+                inpt = F.rotate(
+                    inpt,
+                    angle=angle,
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=0.0,
+                )
+
+        inpt = F.adjust_brightness(inpt, self._sample_uniform(self.brightness))
+        inpt = F.adjust_contrast(inpt, self._sample_uniform(self.contrast))
+        inpt = F.adjust_saturation(inpt, self._sample_uniform(self.saturation))
+        if isinstance(inpt, torch.Tensor) and torch.is_floating_point(inpt):
+            inpt = inpt.clamp(0.0, 1.0)
+        return inpt
+
+
 @dataclass
 class ImageTransformConfig:
     """
@@ -173,6 +266,8 @@ class ImageTransformsConfig:
 
     # Set this flag to `true` to enable transforms during training
     enable: bool = False
+    # Optional named preset. ``pi05`` is handled inside the WSA pretrain data pipeline.
+    preset: str | None = None
     # This is the maximum number of transforms (sampled from these below) that will be applied to each frame.
     # It's an integer in the interval [1, number_of_available_transforms].
     max_num_transforms: int = 3

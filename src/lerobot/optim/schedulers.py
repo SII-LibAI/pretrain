@@ -16,7 +16,7 @@
 import abc
 import logging
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import draccus
@@ -130,6 +130,102 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
             return cosine_decay_schedule(current_step)
 
         return LambdaLR(optimizer, lr_lambda, -1)
+
+
+@LRSchedulerConfig.register_subclass("multi_group_cosine_decay_with_warmup")
+@dataclass
+class MultiGroupCosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
+    """Independent warmup/cosine schedules for named optimizer parameter groups.
+
+    ``group_schedules`` is keyed by the ``name`` stored in each optimizer
+    parameter group. Every group must provide ``peak_lr``, ``decay_lr``,
+    ``num_warmup_steps`` and ``num_decay_steps``.
+    """
+
+    # Kept for compatibility with the LRSchedulerConfig interface. Each group
+    # uses its own warmup value from ``group_schedules``.
+    num_warmup_steps: int = 0
+    group_schedules: dict[str, dict[str, float | int]] = field(default_factory=dict)
+
+    def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        def make_lr_lambda(group_name: str, schedule: dict[str, float | int]):
+            required = {"peak_lr", "decay_lr", "num_warmup_steps", "num_decay_steps"}
+            missing = required - schedule.keys()
+            if missing:
+                raise ValueError(
+                    f"LR schedule for optimizer group {group_name!r} is missing: {sorted(missing)}"
+                )
+
+            peak_lr = float(schedule["peak_lr"])
+            decay_lr = float(schedule["decay_lr"])
+            configured_warmup_steps = int(schedule["num_warmup_steps"])
+            configured_decay_steps = int(schedule["num_decay_steps"])
+
+            if peak_lr <= 0:
+                raise ValueError(f"peak_lr for optimizer group {group_name!r} must be positive")
+            if not 0 <= decay_lr <= peak_lr:
+                raise ValueError(
+                    f"decay_lr for optimizer group {group_name!r} must be in [0, peak_lr]"
+                )
+            if configured_warmup_steps < 0 or configured_decay_steps <= 0:
+                raise ValueError(
+                    f"Invalid warmup/decay steps for optimizer group {group_name!r}"
+                )
+
+            # Preserve the existing scheduler behavior: when a run is shorter
+            # than the configured schedule, fit the full curve into the run.
+            if num_training_steps < configured_decay_steps:
+                scale = num_training_steps / configured_decay_steps
+                warmup_steps = int(configured_warmup_steps * scale)
+                decay_steps = num_training_steps
+                logging.info(
+                    "Auto-scaling LR schedule for group %s: warmup %d -> %d, decay %d -> %d",
+                    group_name,
+                    configured_warmup_steps,
+                    warmup_steps,
+                    configured_decay_steps,
+                    decay_steps,
+                )
+            else:
+                warmup_steps = configured_warmup_steps
+                decay_steps = configured_decay_steps
+
+            warmup_steps = min(warmup_steps, decay_steps)
+            min_lr_ratio = decay_lr / peak_lr
+
+            def lr_lambda(current_step: int) -> float:
+                if warmup_steps > 0 and current_step < warmup_steps:
+                    return (current_step + 1) / warmup_steps
+
+                # Decay starts at peak_lr after warmup and reaches decay_lr at
+                # decay_steps. Past decay_steps it remains at decay_lr.
+                decay_span = max(1, decay_steps - warmup_steps)
+                progress = (current_step - warmup_steps) / decay_span
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+            return lr_lambda
+
+        lr_lambdas = []
+        seen_groups = set()
+        for group in optimizer.param_groups:
+            group_name = group.get("name")
+            if not group_name:
+                raise ValueError("Every optimizer parameter group must have a non-empty 'name'")
+            if group_name in seen_groups:
+                raise ValueError(f"Duplicate optimizer parameter group name: {group_name!r}")
+            if group_name not in self.group_schedules:
+                raise ValueError(f"No LR schedule configured for optimizer group {group_name!r}")
+
+            seen_groups.add(group_name)
+            lr_lambdas.append(make_lr_lambda(group_name, self.group_schedules[group_name]))
+
+        unused_schedules = set(self.group_schedules) - seen_groups
+        if unused_schedules:
+            logging.info("Ignoring LR schedules for empty parameter groups: %s", sorted(unused_schedules))
+
+        return LambdaLR(optimizer, lr_lambda=lr_lambdas, last_epoch=-1)
 
 
 def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
