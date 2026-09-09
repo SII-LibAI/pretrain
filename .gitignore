@@ -27,7 +27,7 @@ node_modules/
 poetry.lock
 uv.lock
 Pipfile.lock
-
+stats/
 ### Build & Distribution ###
 build/
 dist/

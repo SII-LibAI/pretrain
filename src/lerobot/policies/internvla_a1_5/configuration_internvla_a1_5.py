@@ -251,7 +251,7 @@ class InternVLAA15VQADatasetConfig(VQADatasetConfig):
 @dataclass
 class InternVLAA15Config(PreTrainedConfig):
     # VLM model selection - supports Qwen3.5-2B/4B/8B
-    vlm_model_name_or_path: str = "Qwen/Qwen3.5-2B"
+    vlm_model_name_or_path: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b"
 
     # Action expert customization
     action_expert_hidden_size: int | None = 1024

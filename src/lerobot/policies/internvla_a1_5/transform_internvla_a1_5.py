@@ -62,7 +62,7 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
       - NONE: no supervision
     """
 
-    pretrained_model_name_or_path: str = "Qwen/Qwen3.5-2B"
+    pretrained_model_name_or_path: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b"
     max_length: int = 650
     task_key: str = "task"
     language_memory_key: str = "language_memory"
@@ -267,7 +267,7 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
 class InternVLAA15VQAProcessorTransformFn(DataTransformFn):
     """VQA processor used by InternVLA-A1.5 mixed robot/VQA training."""
 
-    pretrained_model_name_or_path: str = "Qwen/Qwen3.5-2B"
+    pretrained_model_name_or_path: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b"
     max_length: int = 650
     num_views: int = 3
     truncation: bool = True
@@ -367,8 +367,8 @@ class InternVLAA15VQAProcessorTransformFn(DataTransformFn):
 @dataclass
 class FASTInternVLAA15ActionTokenizerTransformFn(DataTransformFn):
     
-    action_tokenizer_name: str = "physical-intelligence/fast"
-    qwen35_model_name: str = "Qwen/Qwen3.5-2B"
+    action_tokenizer_name: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/fast"
+    qwen35_model_name: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b"
     max_action_tokens: int = 256
     chunk_size: int = 50
     max_action_dim: int = 32

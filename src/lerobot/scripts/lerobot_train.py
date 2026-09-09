@@ -165,11 +165,28 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        from datetime import timedelta
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        accelerator = Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
+        from accelerate.utils import (
+            DistributedDataParallelKwargs,
+            InitProcessGroupKwargs,
+        )
+
+        ddp_kwargs = DistributedDataParallelKwargs(
+            find_unused_parameters=True
+        )
+
+        nccl_timeout_kwargs = InitProcessGroupKwargs(
+            timeout=timedelta(hours=2)
+        )
+
+        accelerator = Accelerator(
+            step_scheduler_with_optimizer=False,
+            kwargs_handlers=[
+                ddp_kwargs,
+                nccl_timeout_kwargs,
+            ],
+        )
 
     init_logging(accelerator=accelerator)
 
@@ -214,15 +231,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
-        dataset, data_stats = make_dataset(cfg)
+    dataset, data_stats = make_dataset(cfg)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
-    if not is_main_process:
-        dataset, data_stats = make_dataset(cfg)
+    # if not is_main_process:
+    #     dataset, data_stats = make_dataset(cfg)
 
-    accelerator.wait_for_everyone()
+    # accelerator.wait_for_everyone()
 
     if accelerator.num_processes>1:
         all_data_stats = gather_object(data_stats, accelerator)
@@ -293,7 +310,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     policy.train()
 
-    if cfg.policy.type == "internvla_a1_5":
+    if cfg.policy.type in {"internvla_a1_5", "wsa_pretrain"}:
         train_metrics = {
             "loss": AverageMeter("loss", ":.3f"),
             "loss_action": AverageMeter("loss_action", ":.3f"),
@@ -315,10 +332,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics["loss_vqa"] = AverageMeter("loss_vqa", ":.3f")
         train_metrics["loss_action"] = AverageMeter("loss_action", ":.3f")
     
-    if cfg.policy.type == "internvla_a1_5":
+    if cfg.policy.type in {"internvla_a1_5", "wsa_pretrain"}:
         train_metrics["loss_video"] = AverageMeter("loss_video", ":.3f")
 
-    if cfg.policy.type == "internvla_a1_5":
+    if cfg.policy.type in {"internvla_a1_5", "wsa_pretrain"}:
         train_metrics["loss_fast"] = AverageMeter("loss_fast", ":.3f")
         train_metrics["loss_subtask"] = AverageMeter("loss_subtask", ":.3f")
 

@@ -362,7 +362,7 @@ class InternVLAA15WithExpertModel(nn.Module):
 
     def __init__(
         self,
-        vlm_model_name_or_path: str = "Qwen/Qwen3.5-2B",
+        vlm_model_name_or_path: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b",
         action_expert_config: ActionExpertConfig | None = None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
     ):

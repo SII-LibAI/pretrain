@@ -76,7 +76,7 @@ DATASET_REPO_ID="$(
 )"
 ACTION_TYPE=abs          # abs | delta
 USE_EXTERNAL_STATS=true  # true | false
-
+external_stats_path=""
 # 3. output configs
 BASE_OUTPUT_DIR="outputs/${POLICY}"
 PRETRAINED_DETAIL="a15_pretrain" # Only used to make the output name clear.
@@ -126,7 +126,7 @@ ARGS=(
     --dataset.repo_id="$DATASET_REPO_ID"
     --dataset.action_mode="$ACTION_TYPE" 
     --dataset.use_external_stats="$USE_EXTERNAL_STATS"
-    --dataset.external_stats_path=${HF_HOME}/lerobot/stats/aloha/${ACTION_TYPE}/stats.json
+    --dataset.external_stats_path=${external_stats_path:-}/
     --dataset.dist_loading=true              # Each distributed rank loads its own shard. (For single gpu, it should be false)
     --dataset.tokenize_state=true
     --dataset.use_fast_action_tokens=true    # Use FAST action-token labels for Qwen loss.
