@@ -29,7 +29,8 @@ conda activate pretrain
 
 cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
 
-PROC_PER_NODE=8 \
-bash /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/launch/internvla_a1.5_pretrain_interndata.sh
+SMOKE_NUM_DATASETS=24 \
+PROC_PER_NODE=2 \
+bash /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/launch/qwen_pretrain.sh
 '
 ```

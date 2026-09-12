@@ -18,7 +18,7 @@ set -euo pipefail
 ###############################################################################
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-export MASTER_PORT=${MASTER_PORT:-6379}
+export MASTER_PORT=${MASTER_PORT:-6300}
 echo "MASTER_ADDR=${MASTER_ADDR}, MASTER_PORT=${MASTER_PORT}"
 
 PROC_PER_NODE="${PROC_PER_NODE:-2}"
@@ -126,7 +126,7 @@ ARGS=(
 
     # ---- Output ----
     --output_dir="${OUTPUT_DIR}"
-    --num_workers=12
+    --num_workers=8
     --job_name="${JOB_NAME}"
 
     # uncomment `resume` and `config_path` if you want to resume training
@@ -165,7 +165,7 @@ ARGS=(
     --dataset.use_fast_action_tokens=false
     --dataset.weight_rules_path=${PROJ_ROOT}/configs/weight_rules_pretrain.yaml # pretrain data mix weight rules
     --dataset.max_prompt_length=650
-
+    --dataset.video_backend=pyav
     # ---- Optional external VQA data ----
     # --vqa_dataset.type="$POLICY"
     # --vqa_dataset.root="$VQA_BASE"

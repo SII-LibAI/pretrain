@@ -422,5 +422,8 @@ class InternVLAA15Config(PreTrainedConfig):
 
     @property
     def image_delta_indices(self) -> list | None:
+        if self.action_loss_only:
+            return [0]
+
         n = self.num_video_frames + 1
         return [self.chunk_size * i // (n - 1) for i in range(n)]

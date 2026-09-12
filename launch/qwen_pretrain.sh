@@ -171,7 +171,7 @@ ARGS=(
     --dataset.use_fast_action_tokens=false
     --dataset.weight_rules_path=${PROJ_ROOT}/configs/weight_rules_pretrain.yaml # pretrain data mix weight rules
     --dataset.max_prompt_length=650
-
+    --dataset.video_backend=pyav
     # ---- Optional external VQA data ----
     # --vqa_dataset.type="$POLICY"
     # --vqa_dataset.root="$VQA_BASE"
