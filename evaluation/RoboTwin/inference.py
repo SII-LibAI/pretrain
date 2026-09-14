@@ -151,12 +151,16 @@ def make_env(task_name: str):
 
 
 def build_task_args(task_config: str, task_name: str, configs_path: str):
-    with open(ROBOTWIN_ROOT / "task_config" / f"{task_config}.yml", "r", encoding="utf-8") as f:
+    # RoboTwin exports the active task-config directory through CONFIGS_PATH.
+    # This is `env_cfg/task_config` in current versions and `task_config` in
+    # older versions, so avoid hard-coding either repository layout here.
+    configs_dir = Path(configs_path)
+    with open(configs_dir / f"{task_config}.yml", "r", encoding="utf-8") as f:
         task_args = OmegaConf.to_container(OmegaConf.load(f), resolve=True)
 
-    with open(configs_path + "_embodiment_config.yml", "r", encoding="utf-8") as f:
+    with open(configs_dir / "_embodiment_config.yml", "r", encoding="utf-8") as f:
         embodiment_types = OmegaConf.to_container(OmegaConf.load(f), resolve=True)
-    with open(configs_path + "_camera_config.yml", "r", encoding="utf-8") as f:
+    with open(configs_dir / "_camera_config.yml", "r", encoding="utf-8") as f:
         camera_cfg = OmegaConf.to_container(OmegaConf.load(f), resolve=True)
 
     def get_embodiment_file(embodiment_type):
@@ -298,7 +302,9 @@ def tensor_chw_to_uint8_hwc(image_chw: torch.Tensor) -> np.ndarray:
 
 def save_replay_video(video_path: Path, replay_images: list[np.ndarray], fps: int):
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimwrite(video_path, replay_images, fps=fps)
+    temporary_path = video_path.with_name(f".{video_path.stem}.tmp{video_path.suffix}")
+    imageio.mimwrite(temporary_path, replay_images, fps=fps)
+    temporary_path.replace(video_path)
 
 
 def maybe_close_env(task_env, *, clear_cache: bool = False):
