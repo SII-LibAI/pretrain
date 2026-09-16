@@ -267,7 +267,7 @@ class WSAPretrainChatProcessorTransformFn(DataTransformFn):
 class WSAPretrainVQAProcessorTransformFn(DataTransformFn):
     """VQA processor used by WSA-Pretrain mixed robot/VQA training."""
 
-    pretrained_model_name_or_path: str = "Qwen/Qwen3.5-2B"
+    pretrained_model_name_or_path: str = "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b"
     max_length: int = 650
     num_views: int = 3
     truncation: bool = True
@@ -623,7 +623,7 @@ class FASTWSAPretrainActionTokenizerTransformFn(DataTransformFn):
         return data
 
 
-@DataTransformFn.register_subclass("wsa_pretrain_extract_video_frames")
+@DataTransformFn.register_subclass("extract_video_frames")
 @dataclass
 class ExtractVideoFramesTransformFn(DataTransformFn):
     """Extract multi-frame video data for WAN and reduce camera keys to single frame for VLM.

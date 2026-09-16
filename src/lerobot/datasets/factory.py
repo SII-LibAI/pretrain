@@ -25,6 +25,9 @@ from torch.utils.data._utils.collate import default_collate
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.configuration_synthetic_embodiment import (
+    SyntheticEmbodimentDatasetConfig,
+)
 from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
@@ -32,6 +35,10 @@ from lerobot.datasets.lerobot_dataset import (
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import load_json, cast_stats_to_numpy
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+from lerobot.datasets.synthetic_embodiment import (
+    SyntheticEmbodimentDataset,
+    load_stats_selection,
+)
 from lerobot.datasets.transformed_dataset import (
     TransformedLeRobotDataset, 
     TransformedStreamingLeRobotDataset, 
@@ -342,13 +349,21 @@ def _build_single_dataset(
         robot_type
     """
 
+    use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
+    dataset_root = cfg.dataset.root
+    if use_synthetic_embodiments:
+        dataset_root = Path(cfg.dataset.root) / repo_id
+
     # Load metadata + determine delta timestamps
     ds_meta = LeRobotDatasetMetadata(
         repo_id,
-        root=cfg.dataset.root,
+        root=dataset_root,
         revision=cfg.dataset.revision,
     )
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    if use_synthetic_embodiments and delta_timestamps is not None:
+        delta_timestamps.pop(ACTION, None)
+        delta_timestamps = delta_timestamps or None
 
     if cfg.dataset.streaming:
         root = cfg.dataset.root if cfg.dataset.root is not None else HF_LEROBOT_HOME / repo_id
@@ -376,7 +391,7 @@ def _build_single_dataset(
         # Create the actual LeRobot dataset (non-streaming recommended for multi-robot)
         base_ds = LeRobotDataset(
             repo_id,
-            root=cfg.dataset.root,
+            root=dataset_root,
             episodes=cfg.dataset.episodes,
             delta_timestamps=delta_timestamps,
             # tolerance_s=0.2, 
@@ -384,10 +399,23 @@ def _build_single_dataset(
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
         )
-        transformed_ds = TransformedLeRobotDataset.from_base(
-            base_ds,
-            cfg.dataset.data_transforms.inputs,
-        )
+        if use_synthetic_embodiments:
+            transformed_ds = SyntheticEmbodimentDataset(
+                base_ds,
+                annotation_file=cfg.dataset.annotation_file,
+                stats_dir=cfg.dataset.stats_dir,
+                chunk_size=cfg.policy.chunk_size,
+                max_state_dim=cfg.policy.max_state_dim,
+                max_action_dim=cfg.policy.max_action_dim,
+                embodiments=cfg.dataset.embodiments,
+                schema_prefix=cfg.dataset.embodiment_schema_prefix,
+                transforms=cfg.dataset.data_transforms.inputs,
+            )
+        else:
+            transformed_ds = TransformedLeRobotDataset.from_base(
+                base_ds,
+                cfg.dataset.data_transforms.inputs,
+            )
 
     # Optional: override stats using ImageNet norm
     if cfg.dataset.use_imagenet_stats:
@@ -417,7 +445,11 @@ def _build_single_dataset(
                 f"use_external_stats=True but no file found at {stat_path}."
             )
 
-    stats_copy = base_ds.meta.stats.copy()
+    stats_copy = (
+        transformed_ds.checkpoint_stats
+        if use_synthetic_embodiments
+        else base_ds.meta.stats.copy()
+    )
 
     return transformed_ds, stats_copy, robot_type
 
@@ -490,7 +522,35 @@ def make_dataset(cfg: TrainPipelineConfig):
     )
 
     all_data_stats = {}
+    use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
     all_repo_ids = parse_repo_ids(cfg.dataset.repo_id)
+    if use_synthetic_embodiments:
+        if cfg.dataset.root is None:
+            raise ValueError("synthetic_embodiment requires dataset.root")
+        if getattr(cfg.policy, "type", None) != "internvla_a1_5":
+            raise ValueError("synthetic_embodiment currently requires policy.type=internvla_a1_5")
+
+        collection_root = Path(cfg.dataset.root).resolve()
+        stats_dir = (
+            Path(cfg.dataset.stats_dir)
+            if cfg.dataset.stats_dir is not None
+            else collection_root / cfg.dataset.default_stats_directory
+        )
+        selected_embodiments = load_stats_selection(
+            stats_dir,
+            cfg.dataset.embodiments,
+            action_mode=cfg.dataset.action_mode,
+            chunk_size=cfg.policy.chunk_size,
+            schema_prefix=cfg.dataset.embodiment_schema_prefix,
+        )
+        cfg.dataset.stats_dir = str(stats_dir)
+        cfg.dataset.embodiments = selected_embodiments
+        logging.info(
+            "[make_dataset] synthetic embodiments=%s; model dimensions=(state=%d, action=%d)",
+            selected_embodiments,
+            cfg.policy.max_state_dim,
+            cfg.policy.max_action_dim,
+        )
     if not all_repo_ids:
         raise ValueError(
             "cfg.dataset.repo_id is empty. "

@@ -16,11 +16,12 @@ Design principles:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, ClassVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
+
 import torch
 
-from lerobot.utils.constants import OBS_STATE, ACTION, OBS_IMAGES
 from lerobot.transforms.utils import make_bool_mask
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 if TYPE_CHECKING:
     from .registry import SchemaRegistry
@@ -45,6 +46,9 @@ class DatasetSchema:
                         Allows gaps (zero-filled regions) in the output.
         state_reorder: State reorder spec, same format as action_reorder
         action_mode: Action representation mode, either "joint" or "end_effector"
+        state_dim: Optional canonical state dimension used for schema validation
+        action_dim: Optional canonical action dimension used for schema validation
+        action_layout: Ordered semantic blocks in the canonical action vector
         description: Description string
         base_schema: Optional parent schema name (for configuration inheritance)
     """
@@ -56,6 +60,9 @@ class DatasetSchema:
     action_reorder: Optional[list[list[int]]] = None
     state_reorder: Optional[list[list[int]]] = None
     action_mode: str = "joint"
+    state_dim: Optional[int] = None
+    action_dim: Optional[int] = None
+    action_layout: list[dict[str, Any]] = field(default_factory=list)
     description: str = ""
     base_schema: Optional[str] = None  # For configuration inheritance
     
@@ -124,6 +131,9 @@ class DatasetSchema:
             action_reorder=self.action_reorder or parent.action_reorder,
             state_reorder=self.state_reorder or parent.state_reorder,
             action_mode=self.action_mode or parent.action_mode,
+            state_dim=self.state_dim or parent.state_dim,
+            action_dim=self.action_dim or parent.action_dim,
+            action_layout=self.action_layout or parent.action_layout,
             description=self.description or parent.description,
             base_schema=None,  # Already resolved, no longer needed
         )
@@ -163,6 +173,9 @@ class DatasetSchema:
             action_reorder=action_reorder,
             state_reorder=state_reorder,
             action_mode=config.get("action_mode", "joint"),
+            state_dim=config.get("state_dim"),
+            action_dim=config.get("action_dim"),
+            action_layout=config.get("action_layout", []),
             description=config.get("description", ""),
             base_schema=config.get("base_schema"),
         )
@@ -184,6 +197,12 @@ class DatasetSchema:
             result["state_reorder"] = self.state_reorder
         if self.action_mode != "joint":
             result["action_mode"] = self.action_mode
+        if self.state_dim is not None:
+            result["state_dim"] = self.state_dim
+        if self.action_dim is not None:
+            result["action_dim"] = self.action_dim
+        if self.action_layout:
+            result["action_layout"] = self.action_layout
         if self.description:
             result["description"] = self.description
         if self.base_schema:

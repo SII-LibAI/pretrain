@@ -1,0 +1,160 @@
+# The first schema describes only the source EgoDex media columns. Synthetic
+# actions use the embodiment-specific schemas below after an embodiment is
+# selected by SyntheticEmbodimentDataset.
+# Annotation vectors are right-side first; training vectors are left-side first.
+- robot_type: egodex_v
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "EgoDex source video schema (not an embodiment action schema)"
+
+- robot_type: egodex_synthetic_piper_inspire
+  state_dim: 40
+  action_dim: 40
+  action_mode: joint
+  action_mask_spec: [6, -14, 6, -14]
+  action_reorder: &piper_inspire_reorder
+    - [20, 26, 0, 6]
+    - [26, 40, 6, 20]
+    - [0, 6, 20, 26]
+    - [6, 20, 26, 40]
+  state_reorder: *piper_inspire_reorder
+  action_layout:
+    - {name: left_arm, size: 6}
+    - {name: left_hand, size: 14}
+    - {name: right_arm, size: 6}
+    - {name: right_hand, size: 14}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual Piper arm with Inspire hands"
+
+- robot_type: egodex_synthetic_franka
+  state_dim: 18
+  action_dim: 18
+  action_mode: joint
+  action_mask_spec: [7, -2, 7, -2]
+  action_reorder: &franka_reorder
+    - [9, 16, 0, 7]
+    - [16, 18, 7, 9]
+    - [0, 7, 9, 16]
+    - [7, 9, 16, 18]
+  state_reorder: *franka_reorder
+  action_layout:
+    - {name: left_arm, size: 7}
+    - {name: left_gripper, size: 2}
+    - {name: right_arm, size: 7}
+    - {name: right_gripper, size: 2}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual Franka arm with parallel grippers"
+
+- robot_type: egodex_synthetic_arx_l5
+  state_dim: 16
+  action_dim: 16
+  action_mode: joint
+  action_mask_spec: [6, -2, 6, -2]
+  action_reorder: &arx_l5_reorder
+    - [8, 14, 0, 6]
+    - [14, 16, 6, 8]
+    - [0, 6, 8, 14]
+    - [6, 8, 14, 16]
+  state_reorder: *arx_l5_reorder
+  action_layout:
+    - {name: left_arm, size: 6}
+    - {name: left_gripper, size: 2}
+    - {name: right_arm, size: 6}
+    - {name: right_gripper, size: 2}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual ARX L5 arm with grippers"
+
+- robot_type: egodex_synthetic_xarm7
+  state_dim: 14
+  action_dim: 14
+  action_mode: joint
+  action_mask_spec: [14]
+  action_reorder: &xarm7_reorder
+    - [7, 14, 0, 7]
+    - [0, 7, 7, 14]
+  state_reorder: *xarm7_reorder
+  action_layout:
+    - {name: left_arm, size: 7}
+    - {name: right_arm, size: 7}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual xArm7"
+
+- robot_type: egodex_synthetic_rm75
+  state_dim: 14
+  action_dim: 14
+  action_mode: joint
+  action_mask_spec: [14]
+  action_reorder: &rm75_reorder
+    - [7, 14, 0, 7]
+    - [0, 7, 7, 14]
+  state_reorder: *rm75_reorder
+  action_layout:
+    - {name: left_arm, size: 7}
+    - {name: right_arm, size: 7}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual RM75"
+
+- robot_type: egodex_synthetic_ur7e
+  state_dim: 12
+  action_dim: 12
+  action_mode: joint
+  action_mask_spec: [12]
+  action_reorder: &ur7e_reorder
+    - [6, 12, 0, 6]
+    - [0, 6, 6, 12]
+  state_reorder: *ur7e_reorder
+  action_layout:
+    - {name: left_arm, size: 6}
+    - {name: right_arm, size: 6}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual UR7e"
+
+- robot_type: egodex_synthetic_ur7e_wuji
+  state_dim: 52
+  action_dim: 52
+  action_mode: joint
+  action_mask_spec: [6, -20, 6, -20]
+  action_reorder: &ur7e_wuji_reorder
+    - [26, 32, 0, 6]
+    - [32, 52, 6, 26]
+    - [0, 6, 26, 32]
+    - [6, 26, 32, 52]
+  state_reorder: *ur7e_wuji_reorder
+  action_layout:
+    - {name: left_arm, size: 6}
+    - {name: left_hand, size: 20}
+    - {name: right_arm, size: 6}
+    - {name: right_hand, size: 20}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Dual UR7e arm with Wuji dexterous hands"
