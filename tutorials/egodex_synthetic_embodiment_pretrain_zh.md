@@ -88,28 +88,36 @@ adapter 不再手写 delta、归一化或 reorder。它使用仓库原有的 `De
 - action：所有可训练 action chunk 中实际送入模型的 delta/absolute 混合向量；
 - 只统计完整有效窗口，与训练 Dataset 的过滤条件一致。
 
-预计算命令：
+预计算分两步。先递归扫描父目录，生成一行一个 LeRobotV3 子数据集**绝对路径**的 TXT；可以手工删行来控制参与统计的数据集：
+
+```bash
+python util_scripts/discover_lerobot_root.py \
+  --parent-dir /data/Egodex-LerobotV3/extra \
+  --output-file /data/Egodex-LerobotV3/extra/dataset_roots.txt
+```
+
+再检查 TXT 内容并计算归一化统计：
 
 ```bash
 export PYTHONPATH="$PWD/src"
 
-python tools/compute_synthetic_embodiment_stats.py \
-  --dataset-root /data/Egodex-LerobotV3/extra \
+python util_scripts/compute_synthetic_embodiment_stats.py \
+  --dataset-roots-file /data/Egodex-LerobotV3/extra/dataset_roots.txt \
   --chunk-size 50 \
   --num-workers 8
 ```
 
-统计工具参考 `util_scripts/compute_norm_stats_multi.py`，采用 `spawn` 多进程、每个子数据集一个任务、主进程合并 Welford 累积量；`--num-workers 1` 可做串行检查，`--batch-size` 控制每批 anchor 数量。离线工具可以递归扫描父目录；这个扫描只发生在预处理脚本中，不发生在训练 Dataset 中。只计算部分本体时重复传入 `--embodiment`：
+统计工具只读取 TXT，不递归发现目录。TXT 可包含空行和 `#` 注释；相对路径以 TXT 所在目录为基准，同一数据集目录不能重复。统计工具参考 `util_scripts/compute_norm_stats_multi.py`，采用 `spawn` 多进程、每个子数据集一个任务、主进程合并 Welford 累积量；`--num-workers 1` 可做串行检查，`--batch-size` 控制每批 anchor 数量。只计算部分本体时重复传入 `--embodiment`：
 
 ```bash
-python tools/compute_synthetic_embodiment_stats.py \
-  --dataset-root /data/Egodex-LerobotV3/extra \
+python util_scripts/compute_synthetic_embodiment_stats.py \
+  --dataset-roots-file /data/Egodex-LerobotV3/extra/dataset_roots.txt \
   --chunk-size 50 \
   --embodiment franka \
   --embodiment rm75
 ```
 
-默认输出到 `<dataset-root>/synthetic_embodiment_stats/`，包含 `manifest.json` 和每个本体的 `<embodiment>/stats.json`。`manifest.json` 记录 `action_mode=delta` 和 `chunk_size`。训练启动时会检查两者是否与当前配置一致；改变 chunk size 后需要重新计算统计量。
+默认输出到 TXT 旁的 `synthetic_embodiment_stats/`，也可通过 `--output-dir` 指定；其中包含 `manifest.json` 和每个本体的 `<embodiment>/stats.json`。`manifest.json` 记录 `action_mode=delta` 和 `chunk_size`。训练启动时会检查两者是否与当前配置一致；改变 chunk size 后需要重新计算统计量。
 
 ## 5. 每个本体的 schema 与 reorder
 
@@ -182,6 +190,8 @@ PYTHONPATH=src python -m pytest \
 - `src/lerobot/datasets/configuration_synthetic_embodiment.py`：独立 `synthetic_embodiment` DatasetConfig；
 - `src/lerobot/datasets/factory.py`：接收脚本提供的 repo_id 并创建 adapter；
 - `src/lerobot/dataset_schemas/configs/egodex_v.yaml`：源数据和逐本体 schema；
-- `tools/compute_synthetic_embodiment_stats.py`：独立的离线 delta 归一化计算与文件写入；
+- `util_scripts/discover_lerobot_root.py`：递归发现子数据集并生成目录 TXT；
+- `util_scripts/compute_synthetic_embodiment_stats.py`：读取目录 TXT，离线计算 delta 归一化并写入文件；
 - `launch/internvla_a1.5_pretrain_egodex.sh`：目录发现和训练参数入口；
-- `tests/test_synthetic_embodiment_dataset.py`：不加载模型的独立测试。
+- `tests/test_synthetic_embodiment_dataset.py`：不加载模型的独立测试；
+- `tests/test_synthetic_embodiment_stats_paths.py`：目录发现与 TXT 清单读取测试。

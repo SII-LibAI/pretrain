@@ -14,7 +14,7 @@ from lerobot.datasets.synthetic_embodiment import (
     SyntheticEmbodimentDataset,
     load_stats_selection,
 )
-from tools.compute_synthetic_embodiment_stats import (
+from util_scripts.compute_synthetic_embodiment_stats import (
     RunningVectorStats,
     compute_embodiment_stats,
     write_embodiment_stats,

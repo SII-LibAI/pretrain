@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
-import os
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,28 +28,33 @@ from lerobot.datasets.synthetic_embodiment import (
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
-def discover_dataset_roots(
-    search_roots: list[str],
-    annotation_file: str,
-) -> list[Path]:
-    """Find annotated LeRobot roots for this offline preprocessing command."""
-    annotation_path = Path(annotation_file)
-    roots: set[Path] = set()
-    for search_root_value in search_roots:
-        search_root = Path(search_root_value).resolve()
-        if (search_root / "meta" / "info.json").is_file():
-            if (search_root / annotation_path).is_file():
-                roots.add(search_root)
+def load_dataset_roots(list_file: str | Path, annotation_file: str | Path) -> list[Path]:
+    """Read one LeRobot root per line; relative paths use the list file's directory."""
+    list_file = Path(list_file).resolve()
+    annotation_file = Path(annotation_file)
+    if annotation_file.is_absolute():
+        raise ValueError("annotation_file must be relative to each dataset root")
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for line_number, line in enumerate(list_file.read_text(encoding="utf-8-sig").splitlines(), 1):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
             continue
-        for directory, _, files in os.walk(search_root, followlinks=True):
-            directory = Path(directory)
-            if directory.name == "meta" and "info.json" in files:
-                dataset_root = directory.parent
-                if (dataset_root / annotation_path).is_file():
-                    roots.add(dataset_root)
+        root = Path(entry).expanduser()
+        if not root.is_absolute():
+            root = list_file.parent / root
+        root = root.resolve()
+        if root in seen:
+            raise ValueError(f"Duplicate dataset root on line {line_number}: {root}")
+        if not (root / "meta" / "info.json").is_file() or not (root / "data").is_dir():
+            raise FileNotFoundError(f"Line {line_number} is not a LeRobot dataset root: {root}")
+        if not (root / annotation_file).is_file():
+            raise FileNotFoundError(f"Line {line_number} has no {annotation_file}: {root}")
+        seen.add(root)
+        roots.append(root)
     if not roots:
-        raise FileNotFoundError(f"No LeRobot datasets with {annotation_file} were found")
-    return sorted(roots, key=str)
+        raise ValueError(f"No dataset roots in {list_file}")
+    return roots
 
 
 class RunningVectorStats:
@@ -255,14 +259,14 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--dataset-root",
-        action="append",
+        "--dataset-roots-file",
+        type=Path,
         required=True,
-        help="A LeRobot dataset root or a directory recursively containing dataset roots. Repeat as needed.",
+        help="UTF-8 text file containing one LeRobot dataset root per line.",
     )
     parser.add_argument(
         "--output-dir",
-        help="Directory for stats. Defaults to <dataset-root>/synthetic_embodiment_stats.",
+        help="Directory for stats. Defaults to synthetic_embodiment_stats beside the roots file.",
     )
     parser.add_argument(
         "--annotation-file",
@@ -293,7 +297,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    roots = discover_dataset_roots(args.dataset_root, args.annotation_file)
+    roots = load_dataset_roots(args.dataset_roots_file, args.annotation_file)
     stats, specs = compute_embodiment_stats(
         roots,
         annotation_file=args.annotation_file,
@@ -305,7 +309,7 @@ def main() -> None:
     output_dir = (
         Path(args.output_dir)
         if args.output_dir is not None
-        else Path(args.dataset_root[0]).resolve() / "synthetic_embodiment_stats"
+        else args.dataset_roots_file.resolve().parent / "synthetic_embodiment_stats"
     )
     write_embodiment_stats(
         output_dir,
