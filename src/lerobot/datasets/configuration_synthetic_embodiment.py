@@ -29,8 +29,6 @@ class SyntheticEmbodimentDatasetConfig(InternVLAA15DatasetConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.action_mode != "delta":
-            raise ValueError("synthetic_embodiment requires action_mode='delta'")
         if self.streaming:
             raise ValueError("synthetic_embodiment does not support streaming")
         if self.use_external_stats:

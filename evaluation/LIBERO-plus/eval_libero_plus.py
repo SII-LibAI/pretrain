@@ -20,6 +20,15 @@ if str(REPO_ROOT) not in sys.path:
 # Reuse the stock-LIBERO env-side adapter unchanged: LIBERO-plus keeps the same
 # obs keys / action convention and only bakes perturbations into bddl+init files.
 from evaluation.LIBERO.model2libero_interface import LiberoModelClient
+from resume_utils import (
+    archive_shard_summary,
+    load_progress,
+    progress_path,
+    read_run_id,
+    save_progress,
+    video_path,
+    write_json_atomic,
+)
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
@@ -57,6 +66,9 @@ def evaluate_task(
     max_steps: int,
     video_dir: Path,
     video_tag: str,
+    completed_successes: list[bool],
+    progress_file: Path,
+    signature: dict,
 ):
     """Run all episodes for one LIBERO-plus task; returns list[bool] of successes.
 
@@ -64,36 +76,44 @@ def evaluate_task(
     used for video filenames because LIBERO-plus task `.language` repeats across
     perturbations of the same base task.
     """
-    env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
     n_episodes = min(args.num_trials_per_task, len(initial_states))
-    successes: list[bool] = []
+    successes = completed_successes.copy()
+    env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+    try:
+        for episode_idx in tqdm(range(len(successes), n_episodes), desc=f"task: {video_tag}", leave=False):
+            client.reset(task_description)
+            env.reset()
+            obs = env.set_init_state(initial_states[episode_idx])
 
-    for episode_idx in tqdm(range(n_episodes), desc=f"task: {video_tag}", leave=False):
-        client.reset(task_description)
-        env.reset()
-        obs = env.set_init_state(initial_states[episode_idx])
+            replay_images: list[np.ndarray] = []
+            done = False
+            for t in range(max_steps + args.num_steps_wait):
+                if t < args.num_steps_wait:
+                    obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+                    continue
 
-        replay_images: list[np.ndarray] = []
-        done = False
-        for t in range(max_steps + args.num_steps_wait):
-            if t < args.num_steps_wait:
-                obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
-                continue
+                action = client.step(obs, task_description)
+                if args.save_videos:
+                    replay_images.append(np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1, ::-1]))
+                obs, _, done, _ = env.step(action.tolist())
+                if done:
+                    break
 
-            action = client.step(obs, task_description)
-            replay_images.append(np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1, ::-1]))
-            obs, _, done, _ = env.step(action.tolist())
-            if done:
-                break
+            if args.save_videos:
+                if not replay_images:
+                    raise RuntimeError(f"No replay frames for {video_tag} episode {episode_idx}")
+                out_path = video_path(video_dir, video_tag, episode_idx, bool(done))
+                temporary = out_path.with_name(f".{out_path.stem}.{os.getpid()}.tmp.mp4")
+                try:
+                    imageio.mimwrite(temporary, replay_images, fps=10)
+                    temporary.replace(out_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
 
-        successes.append(bool(done))
-
-        if args.save_videos and replay_images:
-            suffix = "success" if done else "failure"
-            out_path = video_dir / f"rollout_{video_tag}_episode{episode_idx}_{suffix}.mp4"
-            imageio.mimwrite(out_path, [np.asarray(x) for x in replay_images], fps=10)
-
-    env.close()
+            successes.append(bool(done))
+            save_progress(progress_file, signature, successes)
+    finally:
+        env.close()
     return successes, task_description
 
 
@@ -136,6 +156,8 @@ def evaluate_policy(args: argparse.Namespace, client: LiberoModelClient) -> dict
     id2category, disturb_res = _load_id2category(args.task_classification_path, args.task_suite_name)
 
     max_steps = args.max_steps_override if args.max_steps_override > 0 else TASK_SUITE_MAX_STEPS[args.task_suite_name]
+    if args.num_trials_per_task <= 0:
+        raise ValueError("--num_trials_per_task must be positive")
 
     LOGGER.info(
         "Suite=%s | shard [%d, %d) of %d tasks | max_steps=%d | trials/task=%d",
@@ -148,6 +170,13 @@ def evaluate_policy(args: argparse.Namespace, client: LiberoModelClient) -> dict
         video_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = eval_log_dir / "logs" / args.task_suite_name
     logs_dir.mkdir(parents=True, exist_ok=True)
+    out_json = logs_dir / f"{start_idx}_to_{end_idx}.json"
+    run_id = read_run_id(eval_log_dir)
+
+    # A shard summary is valid only after the entire shard finishes. Preserve
+    # an older copy for inspection, but keep it out of aggregation while this
+    # shard is being rerun after an interruption.
+    archive_shard_summary(out_json)
 
     total_episodes = 0
     total_successes = 0
@@ -156,9 +185,36 @@ def evaluate_policy(args: argparse.Namespace, client: LiberoModelClient) -> dict
         category, clean_name = id2category[task_id + 1]
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
-        successes, task_desc = evaluate_task(
-            task, initial_states, args, client, max_steps, video_dir, clean_name,
-        )
+        n_episodes = min(args.num_trials_per_task, len(initial_states))
+        if n_episodes == 0:
+            raise ValueError(f"Task {args.task_suite_name}/{task_id} has no initial states")
+        signature = {
+            "run_id": run_id,
+            "suite": args.task_suite_name,
+            "task_id": task_id,
+            "category": category,
+            "video_tag": clean_name,
+            "num_episodes": n_episodes,
+            "max_steps": max_steps,
+            "num_steps_wait": args.num_steps_wait,
+            "seed": args.seed,
+            "replan_steps": args.replan_steps,
+            "rotate_images": not args.no_rotate_images,
+            "binarize_gripper": not args.no_binarize_gripper,
+            "save_videos": args.save_videos,
+        }
+        task_progress_file = progress_path(eval_log_dir, args.task_suite_name, task_id)
+        completed = load_progress(task_progress_file, signature, video_dir)
+        if len(completed) == n_episodes:
+            successes, task_desc = completed, task.language
+            LOGGER.info("Skipping completed task_id=%d [%s] (%d/%d episodes)", task_id, category, len(completed), n_episodes)
+        else:
+            if completed:
+                LOGGER.info("Resuming task_id=%d [%s] from episode %d/%d", task_id, category, len(completed), n_episodes)
+            successes, task_desc = evaluate_task(
+                task, initial_states, args, client, max_steps, video_dir, clean_name,
+                completed, task_progress_file, signature,
+            )
         n_succ = int(sum(successes))
         disturb_res[category]["total_count"] += len(successes)
         disturb_res[category]["success_count"] += n_succ
@@ -181,9 +237,7 @@ def evaluate_policy(args: argparse.Namespace, client: LiberoModelClient) -> dict
     }
 
     # Per-shard file consumed by aggregate_results.py: {category: {total_count, success_count}}.
-    out_json = logs_dir / f"{start_idx}_to_{end_idx}.json"
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(disturb_res, f, indent=2)
+    write_json_atomic(out_json, disturb_res)
     LOGGER.info("Saved per-shard category results to %s", out_json)
 
     return shard_summary

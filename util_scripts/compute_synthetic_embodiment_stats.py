@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pyarrow.parquet as pq
+import torch
 
 from lerobot.datasets.synthetic_embodiment import (
     DEFAULT_ANNOTATION_FILE,
@@ -20,8 +23,6 @@ from lerobot.datasets.synthetic_embodiment import (
     EmbodimentSpec,
     SyntheticActionTable,
     _build_candidate_masks,
-    _schema_delta_mask,
-    _to_delta_action,
     discover_embodiments,
     load_embodiment_schemas,
 )
@@ -77,6 +78,25 @@ class RunningVectorStats:
         self.minimum = np.minimum(self.minimum, values.min(axis=0))
         self.maximum = np.maximum(self.maximum, values.max(axis=0))
 
+    def merge(self, other: RunningVectorStats) -> None:
+        """Merge one worker's Welford accumulator without losing variance."""
+        if other.count == 0:
+            return
+        if self.count == 0:
+            self.count = other.count
+            self.mean = other.mean.copy()
+            self.m2 = other.m2.copy()
+            self.minimum = other.minimum.copy()
+            self.maximum = other.maximum.copy()
+            return
+        total = self.count + other.count
+        delta = other.mean - self.mean
+        self.m2 += other.m2 + np.square(delta) * self.count * other.count / total
+        self.mean += delta * other.count / total
+        self.count = total
+        self.minimum = np.minimum(self.minimum, other.minimum)
+        self.maximum = np.maximum(self.maximum, other.maximum)
+
     def as_dict(self) -> dict[str, Any]:
         if self.count == 0:
             raise ValueError("Cannot serialize empty statistics")
@@ -89,66 +109,98 @@ class RunningVectorStats:
         }
 
 
+def _compute_one_root(
+    root: Path,
+    annotation_file: str | Path,
+    embodiments: Sequence[str] | None,
+    chunk_size: int,
+    batch_size: int,
+    schema_prefix: str,
+) -> tuple[tuple[EmbodimentSpec, ...], dict[str, tuple[RunningVectorStats, RunningVectorStats]]]:
+    """Worker: accumulate each embodiment's trainable state/action vectors."""
+    from lerobot.transforms.core import DeltaActionTransformFn
+
+    path = root / annotation_file
+    parquet = pq.ParquetFile(path)
+    specs = discover_embodiments(parquet, embodiments)
+    schemas = load_embodiment_schemas(specs, schema_prefix)
+    accumulators = {
+        spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
+        for spec in specs
+    }
+
+    for spec, schema in zip(specs, schemas):
+        table = SyntheticActionTable.from_parquet(path, [spec.name])
+        anchors = np.flatnonzero(_build_candidate_masks(table, chunk_size))
+        values = table.values[0]
+        state_stats, action_stats = accumulators[spec.name]
+        view = SimpleNamespace(meta=SimpleNamespace(robot_type=schema.robot_type))
+        delta_transform = DeltaActionTransformFn().hydrate(view)
+
+        for start in range(0, len(anchors), batch_size):
+            batch_anchors = anchors[start : start + batch_size]
+            states = values[batch_anchors]
+            state_stats.update(states)
+            actions = np.empty((len(batch_anchors) * chunk_size, spec.dim), dtype=np.float32)
+            for i, anchor in enumerate(batch_anchors):
+                sample = {
+                    OBS_STATE: torch.from_numpy(states[i]),
+                    ACTION: torch.from_numpy(values[anchor + 1 : anchor + chunk_size + 1].copy()),
+                }
+                delta_transform(sample)
+                actions[i * chunk_size : (i + 1) * chunk_size] = sample[ACTION].numpy()
+            action_stats.update(actions)
+
+    return specs, accumulators
+
+
 def compute_embodiment_stats(
     dataset_roots: Sequence[str | Path],
     *,
     annotation_file: str | Path = DEFAULT_ANNOTATION_FILE,
     embodiments: Sequence[str] | None = None,
     chunk_size: int = 50,
-    batch_size: int = 8192,
+    batch_size: int = 1024,
+    num_workers: int = 1,
     schema_prefix: str = DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], tuple[EmbodimentSpec, ...]]:
-    """Compute state and delta-action statistics over eligible training samples."""
-    if chunk_size < 1:
-        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-
+    """Aggregate worker-local statistics, parallelized across dataset roots."""
+    if chunk_size < 1 or batch_size < 1 or num_workers < 1:
+        raise ValueError("chunk_size, batch_size, and num_workers must be positive")
     roots = [Path(root).resolve() for root in dataset_roots]
-    reference_specs: tuple[EmbodimentSpec, ...] | None = None
-    schemas: dict[str, Any] = {}
-    state_accumulators: dict[str, RunningVectorStats] = {}
-    action_accumulators: dict[str, RunningVectorStats] = {}
+    if not roots:
+        raise ValueError("dataset_roots is empty")
+    jobs = [
+        (root, annotation_file, embodiments, chunk_size, batch_size, schema_prefix)
+        for root in roots
+    ]
+    if num_workers == 1:
+        results = [_compute_one_root(*job) for job in jobs]
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=min(num_workers, len(roots))) as pool:
+            results = pool.starmap(_compute_one_root, jobs)
 
-    for root in roots:
-        path = root / annotation_file
-        parquet = pq.ParquetFile(path)
-        specs = discover_embodiments(parquet, embodiments)
-        if reference_specs is None:
-            reference_specs = specs
-            loaded_schemas = load_embodiment_schemas(specs, schema_prefix)
-            schemas = dict(zip((spec.name for spec in specs), loaded_schemas))
-            state_accumulators = {spec.name: RunningVectorStats(spec.dim) for spec in specs}
-            action_accumulators = {spec.name: RunningVectorStats(spec.dim) for spec in specs}
-        elif [(spec.name, spec.dim) for spec in specs] != [
+    reference_specs = results[0][0]
+    accumulators = {
+        spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
+        for spec in reference_specs
+    }
+    for root, (specs, worker_stats) in zip(roots, results):
+        if [(spec.name, spec.dim) for spec in specs] != [
             (spec.name, spec.dim) for spec in reference_specs
         ]:
-            raise ValueError(f"Embodiment schema differs in {path}")
+            raise ValueError(f"Embodiment schema differs in {root / annotation_file}")
+        for spec in reference_specs:
+            state_stats, action_stats = accumulators[spec.name]
+            worker_state, worker_action = worker_stats[spec.name]
+            state_stats.merge(worker_state)
+            action_stats.merge(worker_action)
 
-        # Read one embodiment at a time so peak memory is bounded by its vector width.
-        for spec in specs:
-            table = SyntheticActionTable.from_parquet(path, [spec.name])
-            anchors = np.flatnonzero(_build_candidate_masks(table, chunk_size)).astype(np.int64)
-            values = table.values[0]
-            delta_mask = _schema_delta_mask(schemas[spec.name], spec)
-            for start in range(0, len(anchors), batch_size):
-                batch_anchors = anchors[start : start + batch_size]
-                states = values[batch_anchors]
-                state_accumulators[spec.name].update(states)
-                for offset in range(1, chunk_size + 1):
-                    actions = _to_delta_action(
-                        values[batch_anchors + offset],
-                        states,
-                        delta_mask,
-                    )
-                    action_accumulators[spec.name].update(actions)
-
-    if reference_specs is None:
-        raise ValueError("dataset_roots is empty")
     return {
         spec.name: {
-            OBS_STATE: state_accumulators[spec.name].as_dict(),
-            ACTION: action_accumulators[spec.name].as_dict(),
+            OBS_STATE: accumulators[spec.name][0].as_dict(),
+            ACTION: accumulators[spec.name][1].as_dict(),
         }
         for spec in reference_specs
     }, reference_specs
@@ -229,7 +281,13 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Training action chunk length. Delta-action stats are computed over the same windows.",
     )
-    parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="Number of spawned processes computing dataset roots in parallel.",
+    )
     return parser.parse_args()
 
 
@@ -242,6 +300,7 @@ def main() -> None:
         embodiments=args.embodiments,
         chunk_size=args.chunk_size,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
     output_dir = (
         Path(args.output_dir)

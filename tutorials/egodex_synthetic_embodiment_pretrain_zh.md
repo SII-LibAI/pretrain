@@ -68,7 +68,7 @@ valid(q[t]) AND valid(q[t+1]) ... AND valid(q[t+H])
 
 ## 4. Delta 动作与归一化
 
-`synthetic_embodiment` DatasetConfig 内部固定为 `action_mode=delta`，启动脚本无需重复传参。每个 schema 的 `action_mask_spec` 与仓库其他机器人含义相同：正数段使用 delta，负数段保留绝对目标。例如 Franka：
+`synthetic_embodiment` DatasetConfig 默认 `action_mode=delta`，启动脚本无需重复传参。每个 schema 的 `action_mask_spec` 与仓库其他机器人含义相同：正数段使用 delta，负数段保留绝对目标。例如 Franka：
 
 ```yaml
 action_mask_spec: [7, -2, 7, -2]
@@ -80,7 +80,7 @@ action_mask_spec: [7, -2, 7, -2]
 原始 q -> 按 action_mask_spec 计算 delta -> 按本体归一化 -> padding -> reorder
 ```
 
-adapter 会移除默认 transform 链中的 `DeltaActionTransformFn` 和 `NormalizeTransformFn`，防止二次 delta 或使用源数据集统计量重复归一化。
+adapter 不再手写 delta、归一化或 reorder。它使用仓库原有的 `DeltaActionTransformFn`、`NormalizeTransformFn`、`PadStateAndActionTransformFn` 和 `ReorderStateActionTransform`，按此顺序、按选中本体的 schema 与统计量执行一次，再进入提示词处理。离线统计也使用原有 `DeltaActionTransformFn` 计算 action 统计量。
 
 归一化文件中的 state 和 action 统计量不是同一份：
 
@@ -95,10 +95,11 @@ export PYTHONPATH="$PWD/src"
 
 python tools/compute_synthetic_embodiment_stats.py \
   --dataset-root /data/Egodex-LerobotV3/extra \
-  --chunk-size 50
+  --chunk-size 50 \
+  --num-workers 8
 ```
 
-离线统计工具可以递归扫描父目录；这个扫描只发生在预处理脚本中，不发生在训练 Dataset 中。只计算部分本体时重复传入 `--embodiment`：
+统计工具参考 `util_scripts/compute_norm_stats_multi.py`，采用 `spawn` 多进程、每个子数据集一个任务、主进程合并 Welford 累积量；`--num-workers 1` 可做串行检查，`--batch-size` 控制每批 anchor 数量。离线工具可以递归扫描父目录；这个扫描只发生在预处理脚本中，不发生在训练 Dataset 中。只计算部分本体时重复传入 `--embodiment`：
 
 ```bash
 python tools/compute_synthetic_embodiment_stats.py \
@@ -133,7 +134,7 @@ state_reorder:
   - [src_start, src_end, dst_start, dst_end]
 ```
 
-当前 EgoDex parquet 的原始 state/action 向量均为右侧在前、左侧在后；训练时统一为左侧在前、右侧在后。每个 schema 的 `state_reorder` 和 `action_reorder` 都交换左右两半，同时保留各侧内部的“arm → hand/gripper”顺序。例如 Franka 原始 `[right_arm(7), right_gripper(2), left_arm(7), left_gripper(2)]` 会变成 `[left_arm(7), left_gripper(2), right_arm(7), right_gripper(2)]`。delta 和归一化在原始顺序上完成，然后在 Dataset 内执行 reorder；默认 transform 链中的后续 reorder 会被跳过，保证数值 state 与提示词里的 state token 顺序一致。仅改变左右顺序不需要重算已有统计文件。以后某个本体的源向量顺序变化时，可修改对应 schema 的 src/dst 区间，不需要修改 Dataset 或 policy。
+当前 EgoDex parquet 的原始 state/action 向量均为右侧在前、左侧在后；训练时统一为左侧在前、右侧在后。每个 schema 的 `state_reorder` 和 `action_reorder` 都交换左右两半，同时保留各侧内部的“arm → hand/gripper”顺序。例如 Franka 原始 `[right_arm(7), right_gripper(2), left_arm(7), left_gripper(2)]` 会变成 `[left_arm(7), left_gripper(2), right_arm(7), right_gripper(2)]`。原有 transform 在原始顺序上完成 delta 和归一化，再用原有 `ReorderStateActionTransform` 交换左右；它被提前到提示词处理之前，保证数值 state 与提示词里的 state token 顺序一致。仅改变左右顺序不需要重算已有统计文件。以后某个本体的源向量顺序变化时，可修改对应 schema 的 src/dst 区间，不需要修改 Dataset 或 policy。
 
 ## 6. 模型维度由用户指定
 
@@ -177,7 +178,7 @@ PYTHONPATH=src python -m pytest \
 
 ## 8. 代码位置
 
-- `src/lerobot/datasets/synthetic_embodiment.py`：训练时的 adapter、有效窗口、delta 构造和统计文件读取；
+- `src/lerobot/datasets/synthetic_embodiment.py`：训练时的 adapter、有效窗口、原有变换的调度和统计文件读取；
 - `src/lerobot/datasets/configuration_synthetic_embodiment.py`：独立 `synthetic_embodiment` DatasetConfig；
 - `src/lerobot/datasets/factory.py`：接收脚本提供的 repo_id 并创建 adapter；
 - `src/lerobot/dataset_schemas/configs/egodex_v.yaml`：源数据和逐本体 schema；

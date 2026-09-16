@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 STATS_FORMAT_VERSION = 2
 DEFAULT_ANNOTATION_FILE = "meta/annotations/action.parquet"
 DEFAULT_EMBODIMENT_SCHEMA_PREFIX = "egodex_synthetic_"
-NORMALIZATION_EPS = 1e-6
 
 
 @dataclass(frozen=True)
@@ -113,9 +112,12 @@ class SyntheticDatasetMetadataView:
         episode_indices: np.ndarray,
         *,
         robot_type: str | None = None,
+        stats: dict[str, dict[str, np.ndarray]] | None = None,
     ) -> None:
         self._base_meta = base_meta
         self.robot_type = robot_type or base_meta.robot_type
+        if stats is not None:
+            self.stats = stats
         boundaries = np.flatnonzero(np.diff(episode_indices) != 0) + 1
         starts = np.concatenate(([0], boundaries)).tolist()
         ends = np.concatenate((boundaries, [len(episode_indices)])).tolist()
@@ -227,35 +229,69 @@ class SyntheticEmbodimentDataset(Dataset):
 
         source_transforms = list(transforms or [])
         if source_transforms:
-            from lerobot.policies.internvla_a1_5.transform_internvla_a1_5 import (
-                InternVLAA15ChatProcessorTransformFn,
-            )
             from lerobot.transforms.core import (
                 DeltaActionTransformFn,
                 NormalizeTransformFn,
+                PadStateAndActionTransformFn,
                 ReorderStateActionTransform,
                 compose,
             )
 
-            source_transforms = [
-                transform
-                for transform in source_transforms
-                if not isinstance(
-                    transform,
-                    (DeltaActionTransformFn, NormalizeTransformFn, ReorderStateActionTransform),
+            chat_transform_type = None
+            if any(type(t).__name__ == "InternVLAA15ChatProcessorTransformFn" for t in source_transforms):
+                from lerobot.policies.internvla_a1_5.transform_internvla_a1_5 import (
+                    InternVLAA15ChatProcessorTransformFn,
                 )
+
+                chat_transform_type = InternVLAA15ChatProcessorTransformFn
+
+            pose_types = (
+                DeltaActionTransformFn,
+                NormalizeTransformFn,
+                PadStateAndActionTransformFn,
+                ReorderStateActionTransform,
+            )
+            pose_sources = []
+            for transform_type in pose_types:
+                matches = [t for t in source_transforms if isinstance(t, transform_type)]
+                if len(matches) != 1:
+                    raise ValueError(f"Expected one {transform_type.__name__} in dataset transforms")
+                pose_sources.append(matches[0])
+            remaining_transforms = [
+                t for t in source_transforms if not isinstance(t, pose_types)
             ]
+            self._pose_transforms = []
             self._transforms = []
-            for schema in self.embodiment_schemas:
+            for spec, schema in zip(self.annotations.specs, self.embodiment_schemas):
+                stats = self.embodiment_stats[spec.name]
                 body_meta = SyntheticDatasetMetadataView(
                     base_dataset.meta,
                     eligible_episodes,
                     robot_type=schema.robot_type,
+                    stats={
+                        OBS_STATE: {"mean": stats.state_mean, "std": stats.state_std},
+                        ACTION: {"mean": stats.action_mean, "std": stats.action_std},
+                    },
                 )
                 view = SyntheticDatasetHydrationView(self, body_meta)
+                delta, normalize, pad, reorder = pose_sources
+                self._pose_transforms.append(
+                    compose(
+                        [
+                            delta.hydrate(view),
+                            normalize.hydrate(view),
+                            replace(
+                                pad,
+                                max_state_dim=max_state_dim,
+                                max_action_dim=max_action_dim,
+                            ),
+                            reorder.hydrate(view),
+                        ]
+                    )
+                )
                 hydrated = []
-                for transform in source_transforms:
-                    if isinstance(transform, InternVLAA15ChatProcessorTransformFn):
+                for transform in remaining_transforms:
+                    if chat_transform_type is not None and isinstance(transform, chat_transform_type):
                         body_transform = copy(transform)
                         body_transform.action_mode = schema.action_mode
                     else:
@@ -263,6 +299,7 @@ class SyntheticEmbodimentDataset(Dataset):
                     hydrated.append(body_transform)
                 self._transforms.append(compose(hydrated))
         else:
+            self._pose_transforms = [_identity] * len(self.annotations.specs)
             self._transforms = [_identity] * len(self.annotations.specs)
 
     @property
@@ -307,31 +344,14 @@ class SyntheticEmbodimentDataset(Dataset):
         body_id = candidate_ids[torch.randint(len(candidate_ids), ()).item()]
         spec = self.annotations.specs[body_id]
         schema = self.embodiment_schemas[body_id]
-        stats = self.embodiment_stats[spec.name]
         poses = self.annotations.values[body_id]
 
-        raw_state = poses[annotation_row]
-        raw_action = poses[annotation_row + 1 : annotation_row + self.chunk_size + 1]
-        delta_mask = _schema_delta_mask(schema, spec)
-        training_action = _to_delta_action(raw_action, raw_state, delta_mask)
-
-        state = _normalize(raw_state, stats.state_mean, stats.state_std)
-        action = _normalize(
-            training_action,
-            stats.action_mean,
-            stats.action_std,
-        )
-
-        padded_state = np.zeros(self.max_state_dim, dtype=np.float32)
-        padded_action = np.zeros((self.chunk_size, self.max_action_dim), dtype=np.float32)
-        padded_state[: spec.dim] = state
-        padded_action[:, : spec.dim] = action
-
         sample = self.base_dataset[base_row]
-        # Reorder before the chat processor tokenizes state; the default pipeline
-        # would reorder only after that textual state representation was built.
-        sample[OBS_STATE] = torch.from_numpy(_reorder_vector(padded_state, schema.state_reorder))
-        sample[ACTION] = torch.from_numpy(_reorder_vector(padded_action, schema.action_reorder))
+        sample[OBS_STATE] = torch.from_numpy(poses[annotation_row].copy())
+        sample[ACTION] = torch.from_numpy(
+            poses[annotation_row + 1 : annotation_row + self.chunk_size + 1].copy()
+        )
+        sample = self._pose_transforms[body_id](sample)
         layout = ", ".join(
             f"{block['name']}[{block['size']}]" for block in schema.action_layout
         )
@@ -624,32 +644,6 @@ def _reorder_output_dim(reorder: Sequence[Sequence[int]] | None, source_dim: int
     if not reorder:
         return source_dim
     return max(source_dim, max(item[3] for item in reorder))
-
-
-def _reorder_vector(
-    values: np.ndarray,
-    reorder: Sequence[Sequence[int]] | None,
-) -> np.ndarray:
-    if reorder is None:
-        return values
-    result = np.zeros_like(values)
-    for src_start, src_end, dst_start, dst_end in reorder:
-        result[..., dst_start:dst_end] = values[..., src_start:src_end]
-    return result
-
-
-def _to_delta_action(
-    future_poses: np.ndarray,
-    current_pose: np.ndarray,
-    delta_mask: np.ndarray,
-) -> np.ndarray:
-    action = np.asarray(future_poses, dtype=np.float32).copy()
-    action[..., delta_mask] -= np.asarray(current_pose, dtype=np.float32)[..., delta_mask]
-    return action
-
-
-def _normalize(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return np.asarray((values - mean) / (std + NORMALIZATION_EPS), dtype=np.float32)
 
 
 def _identity(sample: dict[str, Any]) -> dict[str, Any]:

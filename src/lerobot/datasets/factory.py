@@ -527,8 +527,6 @@ def make_dataset(cfg: TrainPipelineConfig):
     if use_synthetic_embodiments:
         if cfg.dataset.root is None:
             raise ValueError("synthetic_embodiment requires dataset.root")
-        if getattr(cfg.policy, "type", None) != "internvla_a1_5":
-            raise ValueError("synthetic_embodiment currently requires policy.type=internvla_a1_5")
 
         collection_root = Path(cfg.dataset.root).resolve()
         stats_dir = (

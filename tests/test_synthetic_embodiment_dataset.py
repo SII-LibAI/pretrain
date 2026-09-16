@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 
 from lerobot.dataset_schemas import DatasetSchema, get_schema, register_schema
@@ -14,6 +15,7 @@ from lerobot.datasets.synthetic_embodiment import (
     load_stats_selection,
 )
 from tools.compute_synthetic_embodiment_stats import (
+    RunningVectorStats,
     compute_embodiment_stats,
     write_embodiment_stats,
 )
@@ -102,12 +104,13 @@ def _register_test_schema(
             action_reorder=reorder,
             state_reorder=reorder,
             action_layout=[{"name": "joints", "size": dim}],
+            feature_mapping={"observation.state": ["observation.state"], "action": ["action"]},
         ),
         override=True,
     )
 
 
-def test_adapter_filters_invalid_windows_and_shifts_action(tmp_path: Path) -> None:
+def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     alpha = [[float(i), float(i) + 0.5] for i in range(6)]
     beta = [[float(i) + 10, float(i) + 20, float(i) + 30] for i in range(6)]
@@ -144,13 +147,8 @@ def test_adapter_filters_invalid_windows_and_shifts_action(tmp_path: Path) -> No
     assert dataset.candidate_embodiments(1) == ("beta",)
 
     sample = dataset[1]
-    scale = 1.0 + 1e-6
-    np.testing.assert_allclose(
-        sample["observation.state"].numpy(),
-        np.asarray([31.0, 11.0, 21.0]) / scale,
-    )
-    expected_action = np.asarray([[32.0, 1.0, 1.0], [33.0, 2.0, 2.0]]) / scale
-    np.testing.assert_allclose(sample["action"].numpy(), expected_action)
+    np.testing.assert_allclose(sample["observation.state"].numpy(), np.asarray(beta[1]))
+    np.testing.assert_allclose(sample["action"].numpy(), np.asarray(beta[2:4]))
     assert get_schema("test_synthetic_beta").action_reorder == [
         [0, 2, 1, 3],
         [2, 3, 0, 1],
@@ -171,8 +169,8 @@ def test_adapter_filters_invalid_windows_and_shifts_action(tmp_path: Path) -> No
     )
     assert len(alpha_only) == 1
     alpha_sample = alpha_only[0]
-    assert alpha_sample["observation.state"][-1].item() == 0.0
-    assert torch.equal(alpha_sample["action"][:, -1], torch.zeros(2))
+    assert alpha_sample["observation.state"].shape == (2,)
+    assert alpha_sample["action"].shape == (2, 2)
 
     beta_only = SyntheticEmbodimentDataset(
         _FakeBaseDataset(root, len(beta)),
@@ -192,6 +190,9 @@ def test_adapter_filters_invalid_windows_and_shifts_action(tmp_path: Path) -> No
 
 
 def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
+    pytest.importorskip("draccus")
+    pytest.importorskip("datasets")
+    pytest.importorskip("av")
     first = tmp_path / "collection" / "first"
     second = tmp_path / "collection" / "second"
     _write_annotations(
@@ -229,6 +230,85 @@ def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
         action_mode="delta",
         chunk_size=1,
     ) == ["arm"]
+
+
+def test_parallel_stats_match_serial(tmp_path: Path) -> None:
+    pytest.importorskip("draccus")
+    pytest.importorskip("datasets")
+    pytest.importorskip("av")
+    roots = [tmp_path / "first", tmp_path / "second"]
+    for offset, root in enumerate(roots):
+        values = [[float(offset * 10 + frame + dim) for dim in range(18)] for frame in range(4)]
+        _write_annotations(root, {"franka": values}, {"franka": [True] * 4})
+    serial, specs = compute_embodiment_stats(roots, chunk_size=2, num_workers=1)
+    parallel, parallel_specs = compute_embodiment_stats(roots, chunk_size=2, num_workers=2)
+    assert specs == parallel_specs
+    for key in ("observation.state", "action"):
+        for stat in ("mean", "std", "min", "max"):
+            np.testing.assert_allclose(
+                parallel["franka"][key][stat], serial["franka"][key][stat]
+            )
+        assert parallel["franka"][key]["count"] == serial["franka"][key]["count"]
+
+
+def test_adapter_uses_source_delta_normalize_and_reorder(tmp_path: Path) -> None:
+    pytest.importorskip("draccus")
+    pytest.importorskip("datasets")
+    pytest.importorskip("av")
+    from lerobot.transforms.core import (
+        DeltaActionTransformFn,
+        NormalizeTransformFn,
+        PadStateAndActionTransformFn,
+        ReorderStateActionTransform,
+    )
+
+    root = tmp_path / "dataset"
+    _write_annotations(
+        root,
+        {"arm": [[1.0, 10.0], [3.0, 20.0], [5.0, 30.0]]},
+        {"arm": [True] * 3},
+    )
+    _register_test_schema(
+        "arm",
+        2,
+        action_mask_spec=[1, -1],
+        reorder=[[1, 2, 0, 1], [0, 1, 1, 2]],
+    )
+    stats_dir = tmp_path / "stats"
+    _write_unit_stats(stats_dir, {"arm": 2})
+    dataset = SyntheticEmbodimentDataset(
+        _FakeBaseDataset(root, 3),
+        stats_dir=stats_dir,
+        chunk_size=1,
+        max_state_dim=3,
+        max_action_dim=3,
+        schema_prefix="test_synthetic_",
+        transforms=[
+            DeltaActionTransformFn(),
+            NormalizeTransformFn(),
+            PadStateAndActionTransformFn(),
+            ReorderStateActionTransform(),
+        ],
+    )
+    sample = dataset[0]
+    scale = 1.0 + 1e-6
+    np.testing.assert_allclose(sample["observation.state"].numpy(), [10.0 / scale, 1.0 / scale, 0.0])
+    np.testing.assert_allclose(sample["action"].numpy(), [[20.0 / scale, 2.0 / scale, 0.0]])
+    assert "arm" in sample["task"]
+
+
+def test_running_stats_merge_matches_single_pass() -> None:
+    values = np.asarray([[1.0, 2.0], [3.0, 4.0], [5.0, 8.0]])
+    whole = RunningVectorStats(2)
+    whole.update(values)
+    left = RunningVectorStats(2)
+    right = RunningVectorStats(2)
+    left.update(values[:1])
+    right.update(values[1:])
+    left.merge(right)
+    for key in ("mean", "std", "min", "max"):
+        np.testing.assert_allclose(left.as_dict()[key], whole.as_dict()[key])
+    assert left.count == whole.count
 
 
 def test_egodex_reorder_moves_left_side_before_right_side() -> None:

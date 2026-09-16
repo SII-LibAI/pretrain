@@ -57,6 +57,10 @@ if [[ -z "${LIBERO_HOME}" ]]; then
   echo "[ERROR] LIBERO_HOME is required (point at the LIBERO-plus repo root)." >&2
   exit 2
 fi
+LIBERO_HOME="$(cd "${LIBERO_HOME}" && pwd)"
+if [[ -d "${CKPT_PATH}" ]]; then
+  CKPT_PATH="$(cd "${CKPT_PATH}" && pwd)"
+fi
 TASK_CLASSIFICATION="${LIBERO_HOME}/libero/libero/benchmark/task_classification.json"
 if [[ ! -f "${TASK_CLASSIFICATION}" ]]; then
   echo "[ERROR] task_classification.json not found at ${TASK_CLASSIFICATION}" >&2
@@ -68,6 +72,52 @@ if [[ -z "${EVAL_LOG_DIR}" ]]; then
   EVAL_LOG_DIR="outputs/sim_eval/libero_plus/$(date +%Y%m%d_%H%M%S)_single_gpu${GPU_ID}"
 fi
 mkdir -p "${EVAL_LOG_DIR}"
+EVAL_LOG_DIR="$(cd "${EVAL_LOG_DIR}" && pwd)"
+
+RUN_ID="$(python3 "${SCRIPT_DIR}/resume_utils.py" manifest "${EVAL_LOG_DIR}" \
+  checkpoint "${CKPT_PATH}" libero_home "${LIBERO_HOME}" classification_path "${TASK_CLASSIFICATION}" \
+  layout "single:${TASK_SUITE}:${START_IDX}:${END_IDX}" trials "${NUM_TRIALS_PER_TASK}" \
+  wait_steps "${NUM_STEPS_WAIT}" seed "${SEED}" resize "${RESIZE_SIZE}" replan "${REPLAN_STEPS}" \
+  stats_key "${STATS_KEY}" robot_type "${ROBOT_TYPE}" \
+  vlm_model "${VLM_MODEL_PATH}" wan_model "${WAN_MODEL_PATH}" wan_vae "${WAN_VAE_PATH}" \
+  action_loss_only "${ACTION_LOSS_ONLY_FLAG}" backend "${INFERENCE_BACKEND}" \
+  no_rotate "${NO_ROTATE_FLAG}" no_binarize "${NO_BINARIZE_FLAG}" no_video "${NO_VIDEO_FLAG}")"
+
+if python3 - "${TASK_CLASSIFICATION}" "${EVAL_LOG_DIR}" "${RUN_ID}" \
+  "${TASK_SUITE}" "${START_IDX}" "${END_IDX}" "${NUM_TRIALS_PER_TASK}" \
+  "${NO_VIDEO_FLAG}" "${SCRIPT_DIR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[9])
+from resume_utils import archive_shard_summary, shard_complete
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    classification = json.load(file)
+suite = sys.argv[4]
+by_id = {int(item["id"]) - 1: item for item in classification[suite]}
+start = max(0, int(sys.argv[5]))
+requested_end = int(sys.argv[6])
+end = min(requested_end, len(by_id)) if requested_end >= 0 else len(by_id)
+complete = shard_complete(
+    Path(sys.argv[2]), suite, start, end, by_id,
+    sys.argv[3], int(sys.argv[7]), sys.argv[8] != "--no-save_videos",
+)
+if not complete:
+    archive_shard_summary(Path(sys.argv[2]) / "logs" / suite / f"{start}_to_{end}.json")
+raise SystemExit(0 if complete else 1)
+PY
+then
+  echo "[resume] ${TASK_SUITE} [${START_IDX},${END_IDX}) already complete; skipping server and evaluation."
+  (
+    source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+    conda activate "${CLIENT_ENV}"
+    cd "${PROJ_ROOT}"
+    python evaluation/LIBERO-plus/aggregate_results.py --root "${EVAL_LOG_DIR}"
+  )
+  exit 0
+fi
 
 # Dedicated LIBERO config dir pointing at the LIBERO-plus repo (NOT ~/.libero,
 # which points at stock LIBERO). Without this the package prompts
@@ -188,11 +238,14 @@ echo "==== [${TASK_SUITE} ${START_IDX}-${END_IDX}] starting ===="
 echo "==== [${TASK_SUITE} ${START_IDX}-${END_IDX}] done ===="
 
 # ---------------- Aggregate (single shard) ----------------
-(
+if ! (
   source "${CONDA_ROOT}/etc/profile.d/conda.sh"
   conda activate "${CLIENT_ENV}"
   cd "${PROJ_ROOT}"
   python evaluation/LIBERO-plus/aggregate_results.py --root "${EVAL_LOG_DIR}"
-) || echo "[WARN] aggregation failed; per-shard json under ${EVAL_LOG_DIR}/logs" >&2
+); then
+  echo "[WARN] aggregation failed; per-shard json under ${EVAL_LOG_DIR}/logs" >&2
+  exit 1
+fi
 
 echo "Done. Logs: ${EVAL_LOG_DIR}"

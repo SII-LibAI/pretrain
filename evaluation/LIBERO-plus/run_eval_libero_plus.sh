@@ -83,6 +83,10 @@ if [[ -z "${LIBERO_HOME}" ]]; then
   echo "[ERROR] LIBERO_HOME is required (point at the LIBERO-plus repo root)." >&2
   exit 2
 fi
+LIBERO_HOME="$(cd "${LIBERO_HOME}" && pwd)"
+if [[ -d "${CKPT_PATH}" ]]; then
+  CKPT_PATH="$(cd "${CKPT_PATH}" && pwd)"
+fi
 TASK_CLASSIFICATION="${LIBERO_HOME}/libero/libero/benchmark/task_classification.json"
 if [[ ! -f "${TASK_CLASSIFICATION}" ]]; then
   echo "[ERROR] task_classification.json not found at ${TASK_CLASSIFICATION}" >&2
@@ -93,6 +97,18 @@ if [[ -z "${EVAL_LOG_DIR}" ]]; then
   EVAL_LOG_DIR="outputs/sim_eval/libero_plus/$(date +%Y%m%d_%H%M%S)_all"
 fi
 mkdir -p "${EVAL_LOG_DIR}"
+EVAL_LOG_DIR="$(cd "${EVAL_LOG_DIR}" && pwd)"
+
+# A resume directory belongs to one checkpoint, simulator and evaluation
+# configuration. Reject changed settings before any GPU workers are started.
+RUN_ID="$(python3 "${SCRIPT_DIR}/resume_utils.py" manifest "${EVAL_LOG_DIR}" \
+  checkpoint "${CKPT_PATH}" libero_home "${LIBERO_HOME}" classification_path "${TASK_CLASSIFICATION}" \
+  layout "multi:${SHARDS_PER_SUITE}" trials "${NUM_TRIALS_PER_TASK}" wait_steps "${NUM_STEPS_WAIT}" \
+  seed "${SEED}" resize "${RESIZE_SIZE}" replan "${REPLAN_STEPS}" \
+  stats_key_mode "${STATS_KEY_MODE}" robot_type_mode "${ROBOT_TYPE_MODE}" \
+  vlm_model "${VLM_MODEL_PATH}" wan_model "${WAN_MODEL_PATH}" wan_vae "${WAN_VAE_PATH}" \
+  action_loss_only "${ACTION_LOSS_ONLY_FLAG}" backend "${INFERENCE_BACKEND}" \
+  no_rotate "${NO_ROTATE_FLAG}" no_binarize "${NO_BINARIZE_FLAG}" no_video "${NO_VIDEO_FLAG}")"
 
 # Dedicated LIBERO config dir so the LIBERO-plus `libero` package resolves its
 # bddl/init/assets paths to the LIBERO-plus repo (NOT ~/.libero, which points
@@ -132,14 +148,29 @@ source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 
 # ---------------- Build the (suite, shard) work queue ----------------
 build_queue() {
-  python3 - "$TASK_CLASSIFICATION" "$SHARDS_PER_SUITE" "${TASK_SUITES[@]}" <<'PY' > "${QUEUE_FILE}"
+  python3 - "$TASK_CLASSIFICATION" "$SHARDS_PER_SUITE" "$EVAL_LOG_DIR" "$RUN_ID" \
+    "$NUM_TRIALS_PER_TASK" "$NO_VIDEO_FLAG" "$SCRIPT_DIR" "${TASK_SUITES[@]}" <<'PY' > "${QUEUE_FILE}"
 import json, sys
+from pathlib import Path
+
 path = sys.argv[1]
 shards = int(sys.argv[2])
-suites = sys.argv[3:]
+if shards <= 0:
+    raise SystemExit("SHARDS_PER_SUITE must be positive")
+root = Path(sys.argv[3])
+run_id = sys.argv[4]
+trials = int(sys.argv[5])
+if trials <= 0:
+    raise SystemExit("NUM_TRIALS_PER_TASK must be positive")
+save_videos = sys.argv[6] != "--no-save_videos"
+sys.path.insert(0, sys.argv[7])
+from resume_utils import archive_shard_summary, shard_complete
+
+suites = sys.argv[8:]
 mapping = json.load(open(path))
 for suite in suites:
     n = len(mapping[suite])
+    by_id = {int(item["id"]) - 1: item for item in mapping[suite]}
     shards_eff = min(shards, n)
     base = n // shards_eff
     rem = n % shards_eff
@@ -147,12 +178,27 @@ for suite in suites:
     for i in range(shards_eff):
         size = base + (1 if i < rem else 0)
         end = start + size
-        print(f"{suite} {start} {end}")
+        if shard_complete(root, suite, start, end, by_id, run_id, trials, save_videos):
+            print(f"[resume] skipping completed {suite} [{start},{end})", file=sys.stderr)
+        else:
+            archive_shard_summary(root / "logs" / suite / f"{start}_to_{end}.json")
+            print(f"{suite} {start} {end}")
         start = end
 PY
 }
 build_queue
 NUM_UNITS=$(wc -l < "${QUEUE_FILE}")
+
+if (( NUM_UNITS == 0 )); then
+  echo "All shards complete. Aggregating existing results..."
+  (
+    source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+    conda activate "${CLIENT_ENV}"
+    cd "${PROJ_ROOT}"
+    python evaluation/LIBERO-plus/aggregate_results.py --root "${EVAL_LOG_DIR}"
+  )
+  exit 0
+fi
 
 # ---------------- GPU discovery ----------------
 detect_free_gpus() {
@@ -208,6 +254,7 @@ run_worker() {
   local gpu_id="$1"
   local worker_idx="$2"
   local port=$((BASE_PORT + worker_idx))
+  local failed=0
 
   local worker_dir="${EVAL_LOG_DIR}/worker_gpu${gpu_id}"
   mkdir -p "${worker_dir}"
@@ -290,13 +337,14 @@ sys.exit(f"server healthcheck failed after {timeout}s")
 PY
     ) >>"${worker_log}" 2>&1; then
       echo "[gpu=${gpu_id}] [${suite} ${start}-${end}] server failed to come up; skipping" | tee -a "${worker_log}" >&2
+      failed=1
       kill "${server_pid}" >/dev/null 2>&1 || true
       wait "${server_pid}" 2>/dev/null || true
       continue
     fi
 
     echo "==== [gpu=${gpu_id}] [${suite} ${start}-${end}] starting ====" | tee -a "${worker_log}"
-    (
+    if ! (
       source "${CONDA_ROOT}/etc/profile.d/conda.sh"
       conda activate "${CLIENT_ENV}"
       cd "${PROJ_ROOT}"
@@ -319,7 +367,10 @@ PY
         --task_classification_path "${TASK_CLASSIFICATION}" \
         --eval_log_dir "${task_dir}" \
         ${NO_ROTATE_FLAG} ${NO_BINARIZE_FLAG} ${NO_VIDEO_FLAG} ${DEBUG_FLAG}
-    ) >"${client_log}" 2>&1 || echo "[gpu=${gpu_id}] [${suite} ${start}-${end}] FAILED (see ${client_log})" | tee -a "${worker_log}" >&2
+    ) >"${client_log}" 2>&1; then
+      echo "[gpu=${gpu_id}] [${suite} ${start}-${end}] FAILED (see ${client_log})" | tee -a "${worker_log}" >&2
+      failed=1
+    fi
     echo "==== [gpu=${gpu_id}] [${suite} ${start}-${end}] done ====" | tee -a "${worker_log}"
 
     kill "${server_pid}" >/dev/null 2>&1 || true
@@ -327,6 +378,7 @@ PY
   done
 
   echo "[gpu=${gpu_id}] queue drained" | tee -a "${worker_log}"
+  return "${failed}"
 }
 
 # ---------------- Spawn workers ----------------
@@ -345,13 +397,20 @@ for pid in "${WORKER_PIDS[@]}"; do
 done
 
 # ---------------- Aggregate ----------------
-echo "All shards done. Aggregating..."
-(
+if (( EXIT_CODE != 0 )); then
+  echo "[WARN] Some shards failed; aggregating completed shards only. Rerun with the same EVAL_LOG_DIR to resume." >&2
+else
+  echo "All shards complete. Aggregating..."
+fi
+if ! (
   source "${CONDA_ROOT}/etc/profile.d/conda.sh"
   conda activate "${CLIENT_ENV}"
   cd "${PROJ_ROOT}"
   python evaluation/LIBERO-plus/aggregate_results.py --root "${EVAL_LOG_DIR}"
-) || echo "[WARN] aggregation failed; per-shard json still under ${EVAL_LOG_DIR}/logs" >&2
+); then
+  echo "[WARN] aggregation failed; per-shard json still under ${EVAL_LOG_DIR}/logs" >&2
+  EXIT_CODE=1
+fi
 
 echo "Done. Logs: ${EVAL_LOG_DIR}"
 exit "${EXIT_CODE}"

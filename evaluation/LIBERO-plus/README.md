@@ -17,7 +17,8 @@ driver differs.
 
 | file | purpose |
 |------|---------|
-| `eval_libero_plus.py` | per-shard eval driver: iterate a task-id range of one suite, bucket results by perturbation category, write `logs/{suite}/{start}_to_{end}.json` |
+| `eval_libero_plus.py` | per-shard eval driver: resume task episodes, bucket results by perturbation category, write `logs/{suite}/{start}_to_{end}.json` only after the shard finishes |
+| `resume_utils.py` | atomic per-task progress, run-configuration validation, and completed-shard checks |
 | `aggregate_results.py` | merge all per-shard jsons into `overall_results.json` (per-category, per-suite, and a leaderboard summary row) |
 | `run_eval_libero_plus.sh` | multi-GPU + sharded launcher (flock work queue of `(suite, shard)` units), aggregates at the end |
 | `run_eval_libero_plus_single.sh` | single-GPU smoke test over a small task-id range |
@@ -70,6 +71,30 @@ SHARDS_PER_SUITE=8 bash evaluation/LIBERO-plus/run_eval_libero_plus.sh
 GPU_IDS=0,1,2,3 SHARDS_PER_SUITE=8 bash evaluation/LIBERO-plus/run_eval_libero_plus.sh
 ```
 
+**Resume after an instance stops:** set a fixed `EVAL_LOG_DIR` and rerun the
+same command with the same checkpoint and evaluation settings:
+
+```bash
+export EVAL_LOG_DIR=outputs/sim_eval/libero_plus/my_run
+GPU_IDS=0,1,2,3 SHARDS_PER_SUITE=8 bash evaluation/LIBERO-plus/run_eval_libero_plus.sh
+# On the next instance, use the same EVAL_LOG_DIR and command again.
+```
+
+Each finished episode is recorded atomically in
+`progress/{suite}/{task_id}.json`. When videos are enabled, a result is trusted
+only if its success/failure MP4 is nonempty; a missing or incomplete video is
+rerun. Fully completed shards are skipped before starting the policy server.
+Partially completed shards resume at the first unfinished episode of each task.
+`logs/{suite}/{start}_to_{end}.json` is committed only after a full shard, so
+aggregation never includes an interrupted shard. A changed checkpoint,
+classification file, shard layout or evaluation setting is rejected for the
+same output directory. Use a new directory for a new run.
+
+Runs produced by older code have only shard-level category counts and cannot
+prove which individual tasks or episodes finished. Those shards are evaluated
+once with the new code to establish per-task progress; previous shard summaries
+are preserved as `*.json.previous.*` but excluded from aggregation.
+
 Common env-var overrides:
 
 - `CKPT_PATH` *(required)*: checkpoint path for the policy server, you can download our fine-tuned ckpt on https://huggingface.co/InternRobotics/InternVLA-A1.5-Libero.
@@ -86,4 +111,4 @@ Common env-var overrides:
 - `WAN_MODEL_PATH` / `WAN_VAE_PATH`: only used when overriding `ACTION_LOSS_ONLY_FLAG=--no-action_loss_only`. The default `--action_loss_only` skips WAN weight loading, which matches the public InternVLA-A1.5 release.
 - `INFERENCE_BACKEND` *(default `standard`)*: `optimized` requires `--action_loss_only`.
 - `NO_VIDEO_FLAG=--no-save_videos` disables video recording (recommended for the ~10k full run).
-- `EVAL_LOG_DIR`: destination log dir (default `outputs/sim_eval/libero_plus/<timestamp>_all`).
+- `EVAL_LOG_DIR`: destination log dir (default `outputs/sim_eval/libero_plus/<timestamp>_all`); set it explicitly to the same path on every resumed instance.
