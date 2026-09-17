@@ -24,8 +24,6 @@ DATASET_ROOT="${DATASET_ROOT:-/path/to/Egodex-LerobotV3/extra}"
 DATASET_ROOT="${DATASET_ROOT%/}"
 STATS_DIR="${STATS_DIR:-${DATASET_ROOT}/synthetic_embodiment_stats}"
 EMBODIMENTS="${EMBODIMENTS:-[\"franka\"]}"
-MAX_STATE_DIM="${MAX_STATE_DIM:-52}"
-MAX_ACTION_DIM="${MAX_ACTION_DIM:-52}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
 BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-12}"
 
@@ -58,11 +56,7 @@ DATASET_REPO_ID="$(
 )"
 
 if [[ -z "${DATASET_REPO_ID}" ]]; then
-  echo "No EgoDex LeRobotV3 datasets found under ${DATASET_ROOT}" >&2
-  exit 1
-fi
-if [[ ! -f "${STATS_DIR}/manifest.json" ]]; then
-  echo "Missing normalization manifest: ${STATS_DIR}/manifest.json" >&2
+  echo "No annotated LeRobotV3 datasets found under ${DATASET_ROOT}" >&2
   exit 1
 fi
 
@@ -86,8 +80,6 @@ ARGS=(
   --policy.vlm_model_name_or_path="${VLM_MODEL_PATH}"
   --policy.repo_id="lerobot_lab/${POLICY}"
   --policy.push_to_hub=false
-  --policy.max_state_dim="${MAX_STATE_DIM}"
-  --policy.max_action_dim="${MAX_ACTION_DIM}"
   --policy.chunk_size="${CHUNK_SIZE}"
   --policy.n_action_steps="${CHUNK_SIZE}"
   --policy.gradient_checkpointing=false
@@ -131,6 +123,5 @@ ARGS=(
 echo "DATASET_ROOT=${DATASET_ROOT}"
 echo "DATASET_REPO_ID=${DATASET_REPO_ID}"
 echo "EMBODIMENTS=${EMBODIMENTS}"
-echo "MAX_STATE_DIM=${MAX_STATE_DIM}, MAX_ACTION_DIM=${MAX_ACTION_DIM}, CHUNK_SIZE=${CHUNK_SIZE}"
 
 accelerate launch "${ARGS[@]}"

@@ -11,8 +11,9 @@ import torch
 
 from lerobot.dataset_schemas import DatasetSchema, get_schema, register_schema
 from lerobot.datasets.synthetic_embodiment import (
+    EmbodimentSpec,
     SyntheticEmbodimentDataset,
-    load_stats_selection,
+    load_embodiment_stats,
 )
 from util_scripts.compute_synthetic_embodiment_stats import (
     RunningVectorStats,
@@ -22,15 +23,17 @@ from util_scripts.compute_synthetic_embodiment_stats import (
 
 
 class _FakeMeta:
-    robot_type = "egodex_v"
     total_episodes = 1
+
+    def __init__(self, robot_type: str = "egodex_v") -> None:
+        self.robot_type = robot_type
 
 
 class _FakeBaseDataset:
-    def __init__(self, root: Path, length: int) -> None:
+    def __init__(self, root: Path, length: int, robot_type: str = "egodex_v") -> None:
         self.root = root
         self.repo_id = "fake/egodex"
-        self.meta = _FakeMeta()
+        self.meta = _FakeMeta(robot_type)
         self.fps = 30
         self.num_episodes = 1
         self.hf_dataset = {
@@ -52,6 +55,7 @@ def _write_annotations(
     root: Path,
     body_values: dict[str, list[list[float]]],
     body_valid: dict[str, list[bool]],
+    robot_type: str = "egodex_v",
 ) -> None:
     length = len(next(iter(body_values.values())))
     payload = {
@@ -66,7 +70,7 @@ def _write_annotations(
     path.parent.mkdir(parents=True)
     pq.write_table(pa.table(payload), path)
     info_path = root / "meta" / "info.json"
-    info_path.write_text("{}", encoding="utf-8")
+    info_path.write_text(json.dumps({"robot_type": robot_type}), encoding="utf-8")
 
 
 def _write_unit_stats(stats_dir: Path, dimensions: dict[str, int]) -> None:
@@ -90,7 +94,7 @@ def _register_test_schema(
     name: str,
     dim: int,
     *,
-    prefix: str = "test_synthetic_",
+    prefix: str = "egodex_synthetic_",
     action_mask_spec: list[int] | None = None,
     reorder: list[list[int]] | None = None,
 ) -> None:
@@ -138,7 +142,6 @@ def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -
         chunk_size=2,
         max_state_dim=3,
         max_action_dim=3,
-        schema_prefix="test_synthetic_",
         transforms=[],
     )
 
@@ -149,7 +152,7 @@ def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -
     sample = dataset[1]
     np.testing.assert_allclose(sample["observation.state"].numpy(), np.asarray(beta[1]))
     np.testing.assert_allclose(sample["action"].numpy(), np.asarray(beta[2:4]))
-    assert get_schema("test_synthetic_beta").action_reorder == [
+    assert get_schema("egodex_synthetic_beta").action_reorder == [
         [0, 2, 1, 3],
         [2, 3, 0, 1],
     ]
@@ -164,7 +167,6 @@ def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -
         max_state_dim=3,
         max_action_dim=3,
         embodiments=["alpha"],
-        schema_prefix="test_synthetic_",
         transforms=[],
     )
     assert len(alpha_only) == 1
@@ -179,7 +181,6 @@ def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -
         max_state_dim=3,
         max_action_dim=3,
         embodiments=["beta"],
-        schema_prefix="test_synthetic_",
         transforms=[],
     )
     beta_sample = beta_only[0]
@@ -187,6 +188,37 @@ def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -
     assert beta_sample["task"].startswith("Current robot embodiment: beta;")
     assert alpha_sample["task"].startswith("Current robot embodiment: alpha;")
     assert beta_sample["task"] != alpha_sample["task"]
+
+
+def test_sources_use_separate_schemas_and_shared_stats(tmp_path: Path) -> None:
+    stats_dir = tmp_path / "stats"
+    _write_unit_stats(stats_dir, {"franka": 18})
+    values = [[float(frame + joint) for joint in range(18)] for frame in range(3)]
+
+    for source, expected_schema, camera_key in (
+        ("egodex_v", "egodex_synthetic_franka", "observation.image"),
+        (
+            "egoverse_human_bimanual",
+            "egoverse_synthetic_franka",
+            "observation.images.front",
+        ),
+    ):
+        assert get_schema(source).image_mapping == {camera_key: "observation.images.image0"}
+        root = tmp_path / source
+        _write_annotations(root, {"franka": values}, {"franka": [True] * 3}, source)
+        dataset = SyntheticEmbodimentDataset(
+            _FakeBaseDataset(root, 3, source),
+            stats_dir=stats_dir,
+            chunk_size=1,
+            max_state_dim=18,
+            max_action_dim=18,
+            transforms=[],
+        )
+        assert dataset.embodiment_schemas[0].robot_type == expected_schema
+        assert dataset.embodiment_schemas[0].image_mapping == {
+            camera_key: "observation.images.image0"
+        }
+        np.testing.assert_allclose(dataset.embodiment_stats["franka"].state_std, 1)
 
 
 def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
@@ -204,6 +236,7 @@ def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
         second,
         {"arm": [[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]},
         {"arm": [True, True, True]},
+        robot_type="egoverse_human_bimanual",
     )
     _register_test_schema(
         "arm",
@@ -211,11 +244,17 @@ def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
         prefix="egodex_synthetic_",
         action_mask_spec=[1, -1],
     )
+    _register_test_schema(
+        "arm",
+        2,
+        prefix="egoverse_synthetic_",
+        action_mask_spec=[1, -1],
+    )
 
     roots = [first.resolve(), second.resolve()]
     stats, specs = compute_embodiment_stats(roots, chunk_size=1)
     output_dir = tmp_path / "stats"
-    write_embodiment_stats(output_dir, roots, stats, specs, chunk_size=1)
+    write_embodiment_stats(output_dir, stats)
 
     assert roots == [first.resolve(), second.resolve()]
     assert stats["arm"]["observation.state"]["count"] == 3
@@ -224,12 +263,11 @@ def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
     np.testing.assert_allclose(stats["arm"]["action"]["mean"], [2.0, 22 / 3])
     written = json.loads((output_dir / "arm" / "stats.json").read_text(encoding="utf-8"))
     assert written["observation.state"] != written["action"]
-    assert load_stats_selection(
-        output_dir,
-        ["arm"],
-        action_mode="delta",
-        chunk_size=1,
-    ) == ["arm"]
+    assert not (output_dir / "manifest.json").exists()
+    np.testing.assert_allclose(
+        load_embodiment_stats(output_dir, specs)["arm"].action_mean,
+        stats["arm"]["action"]["mean"],
+    )
 
 
 def test_parallel_stats_match_serial(tmp_path: Path) -> None:
@@ -282,7 +320,6 @@ def test_adapter_uses_source_delta_normalize_and_reorder(tmp_path: Path) -> None
         chunk_size=1,
         max_state_dim=3,
         max_action_dim=3,
-        schema_prefix="test_synthetic_",
         transforms=[
             DeltaActionTransformFn(),
             NormalizeTransformFn(),
@@ -311,7 +348,20 @@ def test_running_stats_merge_matches_single_pass() -> None:
     assert left.count == whole.count
 
 
-def test_egodex_reorder_moves_left_side_before_right_side() -> None:
+def test_stats_files_work_without_manifest(tmp_path: Path) -> None:
+    accumulator = RunningVectorStats(2)
+    accumulator.update(np.asarray([[1.0, 2.0], [3.0, 4.0]]))
+    stats = {"arm": {"observation.state": accumulator.as_dict(), "action": accumulator.as_dict()}}
+    write_embodiment_stats(tmp_path, stats)
+
+    assert not (tmp_path / "manifest.json").exists()
+    spec = EmbodimentSpec("arm", "action.arm", "action.arm_valid", 2)
+    loaded = load_embodiment_stats(tmp_path, [spec])["arm"]
+    np.testing.assert_allclose(loaded.state_mean, [2.0, 3.0])
+    np.testing.assert_allclose(loaded.action_std, [1.0, 1.0])
+
+
+def test_source_schemas_share_action_layout_and_reorder() -> None:
     dimensions = {
         "piper_inspire": 40,
         "franka": 18,
@@ -322,12 +372,17 @@ def test_egodex_reorder_moves_left_side_before_right_side() -> None:
         "ur7e_wuji": 52,
     }
     for name, dim in dimensions.items():
-        schema = get_schema(f"egodex_synthetic_{name}")
+        egodex = get_schema(f"egodex_synthetic_{name}")
+        egoverse = get_schema(f"egoverse_synthetic_{name}")
+        assert egodex.action_mask_spec == egoverse.action_mask_spec
+        assert egodex.action_layout == egoverse.action_layout
+        assert egodex.state_reorder == egoverse.state_reorder
+        assert egodex.action_reorder == egoverse.action_reorder
         source = np.arange(dim)
         expected = np.concatenate((source[dim // 2 :], source[: dim // 2]))
-        for reorder in (schema.state_reorder, schema.action_reorder):
+        for reorder in (egodex.state_reorder, egodex.action_reorder):
             actual = np.zeros(dim, dtype=np.int64)
             for src_start, src_end, dst_start, dst_end in reorder:
                 actual[dst_start:dst_end] = source[src_start:src_end]
             np.testing.assert_array_equal(actual, expected, err_msg=name)
-        assert schema.action_layout[0]["name"].startswith("left_")
+        assert egodex.action_layout[0]["name"].startswith("left_")

@@ -35,10 +35,7 @@ from lerobot.datasets.lerobot_dataset import (
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import load_json, cast_stats_to_numpy
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-from lerobot.datasets.synthetic_embodiment import (
-    SyntheticEmbodimentDataset,
-    load_stats_selection,
-)
+from lerobot.datasets.synthetic_embodiment import SyntheticEmbodimentDataset
 from lerobot.datasets.transformed_dataset import (
     TransformedLeRobotDataset, 
     TransformedStreamingLeRobotDataset, 
@@ -407,8 +404,7 @@ def _build_single_dataset(
                 chunk_size=cfg.policy.chunk_size,
                 max_state_dim=cfg.policy.max_state_dim,
                 max_action_dim=cfg.policy.max_action_dim,
-                embodiments=cfg.dataset.embodiments,
-                schema_prefix=cfg.dataset.embodiment_schema_prefix,
+                embodiments=cfg.dataset.embodiments or None,
                 transforms=cfg.dataset.data_transforms.inputs,
             )
         else:
@@ -534,18 +530,10 @@ def make_dataset(cfg: TrainPipelineConfig):
             if cfg.dataset.stats_dir is not None
             else collection_root / cfg.dataset.default_stats_directory
         )
-        selected_embodiments = load_stats_selection(
-            stats_dir,
-            cfg.dataset.embodiments,
-            action_mode=cfg.dataset.action_mode,
-            chunk_size=cfg.policy.chunk_size,
-            schema_prefix=cfg.dataset.embodiment_schema_prefix,
-        )
         cfg.dataset.stats_dir = str(stats_dir)
-        cfg.dataset.embodiments = selected_embodiments
         logging.info(
             "[make_dataset] synthetic embodiments=%s; model dimensions=(state=%d, action=%d)",
-            selected_embodiments,
+            cfg.dataset.embodiments or "all in action.parquet",
             cfg.policy.max_state_dim,
             cfg.policy.max_action_dim,
         )

@@ -17,12 +17,11 @@ import torch
 
 from lerobot.datasets.synthetic_embodiment import (
     DEFAULT_ANNOTATION_FILE,
-    DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
-    STATS_FORMAT_VERSION,
     EmbodimentSpec,
     SyntheticActionTable,
     _build_candidate_masks,
     discover_embodiments,
+    embodiment_schema_prefix,
     load_embodiment_schemas,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
@@ -119,7 +118,6 @@ def _compute_one_root(
     embodiments: Sequence[str] | None,
     chunk_size: int,
     batch_size: int,
-    schema_prefix: str,
 ) -> tuple[tuple[EmbodimentSpec, ...], dict[str, tuple[RunningVectorStats, RunningVectorStats]]]:
     """Worker: accumulate each embodiment's trainable state/action vectors."""
     from lerobot.transforms.core import DeltaActionTransformFn
@@ -127,6 +125,9 @@ def _compute_one_root(
     path = root / annotation_file
     parquet = pq.ParquetFile(path)
     specs = discover_embodiments(parquet, embodiments)
+    with (root / "meta" / "info.json").open(encoding="utf-8") as stream:
+        source_robot_type = json.load(stream)["robot_type"]
+    schema_prefix = embodiment_schema_prefix(source_robot_type)
     schemas = load_embodiment_schemas(specs, schema_prefix)
     accumulators = {
         spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
@@ -166,7 +167,6 @@ def compute_embodiment_stats(
     chunk_size: int = 50,
     batch_size: int = 1024,
     num_workers: int = 1,
-    schema_prefix: str = DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], tuple[EmbodimentSpec, ...]]:
     """Aggregate worker-local statistics, parallelized across dataset roots."""
     if chunk_size < 1 or batch_size < 1 or num_workers < 1:
@@ -175,7 +175,7 @@ def compute_embodiment_stats(
     if not roots:
         raise ValueError("dataset_roots is empty")
     jobs = [
-        (root, annotation_file, embodiments, chunk_size, batch_size, schema_prefix)
+        (root, annotation_file, embodiments, chunk_size, batch_size)
         for root in roots
     ]
     if num_workers == 1:
@@ -212,42 +212,15 @@ def compute_embodiment_stats(
 
 def write_embodiment_stats(
     output_dir: str | Path,
-    dataset_roots: Sequence[str | Path],
     stats: dict[str, dict[str, dict[str, Any]]],
-    specs: Sequence[EmbodimentSpec],
-    *,
-    annotation_file: str | Path = DEFAULT_ANNOTATION_FILE,
-    chunk_size: int,
-    schema_prefix: str = DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
 ) -> None:
-    """Write one normalization file per embodiment and a collection manifest."""
+    """Write one normalization file per embodiment."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for spec in specs:
-        body_dir = output_dir / spec.name
+    for name, body_stats in stats.items():
+        body_dir = output_dir / name
         body_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(body_dir / "stats.json", stats[spec.name])
-
-    manifest = {
-        "format_version": STATS_FORMAT_VERSION,
-        "annotation_file": Path(annotation_file).as_posix(),
-        "action_offset": 1,
-        "action_mode": "delta",
-        "chunk_size": chunk_size,
-        "normalization": "mean_std",
-        "dataset_roots": [str(Path(root).resolve()) for root in dataset_roots],
-        "embodiments": [
-            {
-                "name": spec.name,
-                "schema": f"{schema_prefix}{spec.name}",
-                "dimension": spec.dim,
-                "state_count": stats[spec.name][OBS_STATE]["count"],
-                "action_count": stats[spec.name][ACTION]["count"],
-            }
-            for spec in specs
-        ],
-    }
-    _write_json(output_dir / "manifest.json", manifest)
+        _write_json(body_dir / "stats.json", body_stats)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -298,7 +271,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     roots = load_dataset_roots(args.dataset_roots_file, args.annotation_file)
-    stats, specs = compute_embodiment_stats(
+    stats, _ = compute_embodiment_stats(
         roots,
         annotation_file=args.annotation_file,
         embodiments=args.embodiments,
@@ -313,13 +286,9 @@ def main() -> None:
     )
     write_embodiment_stats(
         output_dir,
-        roots,
         stats,
-        specs,
-        annotation_file=args.annotation_file,
-        chunk_size=args.chunk_size,
     )
-    print(f"Wrote statistics for {len(specs)} embodiments from {len(roots)} datasets to {output_dir}")
+    print(f"Wrote statistics for {len(stats)} embodiments from {len(roots)} datasets to {output_dir}")
 
 
 if __name__ == "__main__":

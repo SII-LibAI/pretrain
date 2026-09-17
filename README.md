@@ -83,6 +83,8 @@ Please refer to the [Pre-training Tutorial](tutorials/pretrain_internvla_a1_5_wi
 
 The pre-training entry uses `launch/internvla_a15_pretrain.sh`, discovers LeRobot-format datasets under `data/a1`, applies `configs/weight_rules_pretrain.yaml`, and trains the `internvla_a1_5` policy with Qwen3.5-2B, FAST action tokens, and the WAN video auxiliary branch.
 
+
+
 ---
 
 ## Fine-tuning

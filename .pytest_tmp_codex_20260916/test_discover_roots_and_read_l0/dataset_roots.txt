@@ -1,0 +1,2 @@
+E:\VLA相关\wam_code\InternVLA-A-series\.pytest_tmp_codex_20260916\test_discover_roots_and_read_l0\collection\task one\demo
+E:\VLA相关\wam_code\InternVLA-A-series\.pytest_tmp_codex_20260916\test_discover_roots_and_read_l0\collection\task two\demo

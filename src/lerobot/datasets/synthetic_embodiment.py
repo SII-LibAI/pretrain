@@ -20,9 +20,15 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 if TYPE_CHECKING:
     from lerobot.transforms.core import DataTransformFn
 
-STATS_FORMAT_VERSION = 2
 DEFAULT_ANNOTATION_FILE = "meta/annotations/action.parquet"
-DEFAULT_EMBODIMENT_SCHEMA_PREFIX = "egodex_synthetic_"
+EMBODIMENT_SCHEMA_PREFIXES = {
+    "egodex_v": "egodex_synthetic_",
+    "egoverse_human_bimanual": "egoverse_synthetic_",
+}
+
+
+def embodiment_schema_prefix(source_robot_type: str) -> str:
+    return EMBODIMENT_SCHEMA_PREFIXES[source_robot_type]
 
 
 @dataclass(frozen=True)
@@ -160,7 +166,6 @@ class SyntheticEmbodimentDataset(Dataset):
         max_state_dim: int,
         max_action_dim: int,
         embodiments: Sequence[str] | None = None,
-        schema_prefix: str = DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
         transforms: Sequence[DataTransformFn] | None = None,
     ) -> None:
         if chunk_size < 1:
@@ -173,12 +178,11 @@ class SyntheticEmbodimentDataset(Dataset):
         self.chunk_size = chunk_size
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
-        self.schema_prefix = schema_prefix
-
         annotation_path = Path(annotation_file)
         if not annotation_path.is_absolute():
             annotation_path = self.root / annotation_path
         self.annotations = SyntheticActionTable.from_parquet(annotation_path, embodiments)
+        schema_prefix = embodiment_schema_prefix(base_dataset.meta.robot_type)
         self.embodiment_schemas = load_embodiment_schemas(self.annotations.specs, schema_prefix)
         self.embodiment_stats = load_embodiment_stats(stats_dir, self.annotations.specs)
 
@@ -406,27 +410,23 @@ def load_embodiment_stats(
     loaded: dict[str, EmbodimentStats] = {}
     for spec in specs:
         path = stats_dir / spec.name / "stats.json"
-        if not path.is_file():
-            raise FileNotFoundError(f"Normalization statistics not found: {path}")
         with path.open(encoding="utf-8") as stream:
             payload = json.load(stream)
         state = payload[OBS_STATE]
         action = payload[ACTION]
         body_stats = EmbodimentStats(
-            state_mean=_stat_vector(state, "mean", spec, path),
-            state_std=_stat_vector(state, "std", spec, path),
-            action_mean=_stat_vector(action, "mean", spec, path),
-            action_std=_stat_vector(action, "std", spec, path),
+            state_mean=np.asarray(state["mean"], dtype=np.float32),
+            state_std=np.asarray(state["std"], dtype=np.float32),
+            action_mean=np.asarray(action["mean"], dtype=np.float32),
+            action_std=np.asarray(action["std"], dtype=np.float32),
         )
-        if (body_stats.state_std < 0).any() or (body_stats.action_std < 0).any():
-            raise ValueError(f"Negative standard deviation in {path}")
         loaded[spec.name] = body_stats
     return loaded
 
 
 def load_embodiment_schemas(
     specs: Sequence[EmbodimentSpec],
-    schema_prefix: str = DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
+    schema_prefix: str,
 ) -> tuple[Any, ...]:
     """Load exact per-embodiment schemas and validate their vector layouts."""
     from lerobot.dataset_schemas import get_registry
@@ -454,54 +454,6 @@ def load_embodiment_schemas(
         _schema_delta_mask(schema, spec)
         schemas.append(schema)
     return tuple(schemas)
-
-
-def load_stats_selection(
-    stats_dir: str | Path,
-    embodiments: Sequence[str] | None,
-    *,
-    action_mode: str,
-    chunk_size: int,
-    schema_prefix: str = DEFAULT_EMBODIMENT_SCHEMA_PREFIX,
-) -> list[str]:
-    """Resolve selected embodiments and verify that stats match the training target."""
-    manifest_path = Path(stats_dir) / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Synthetic embodiment stats manifest not found: {manifest_path}")
-    with manifest_path.open(encoding="utf-8") as stream:
-        manifest = json.load(stream)
-
-    if manifest.get("format_version") != STATS_FORMAT_VERSION:
-        raise ValueError(
-            f"Unsupported synthetic stats format in {manifest_path}: "
-            f"{manifest.get('format_version')!r}"
-        )
-    if manifest.get("action_mode") != action_mode:
-        raise ValueError(
-            f"Stats action_mode is {manifest.get('action_mode')!r}, expected {action_mode!r}"
-        )
-    if manifest.get("chunk_size") != chunk_size:
-        raise ValueError(
-            f"Stats chunk_size is {manifest.get('chunk_size')!r}, expected {chunk_size}"
-        )
-
-    dimensions = {}
-    for item in manifest["embodiments"]:
-        name = item["name"]
-        expected_schema = f"{schema_prefix}{name}"
-        if item.get("schema") != expected_schema:
-            raise ValueError(
-                f"Stats manifest schema for {name!r} is {item.get('schema')!r}, "
-                f"expected {expected_schema!r}"
-            )
-        dimensions[name] = int(item["dimension"])
-    selected = list(embodiments) if embodiments else list(dimensions)
-    missing = [name for name in selected if name not in dimensions]
-    if missing:
-        raise KeyError(f"Embodiments missing from stats manifest: {missing}")
-    if not selected:
-        raise ValueError("Stats manifest contains no embodiments")
-    return selected
 
 
 def _build_candidate_masks(table: SyntheticActionTable, chunk_size: int) -> np.ndarray:
@@ -604,13 +556,6 @@ def _scalar_column_to_numpy(column: pa.ChunkedArray, dtype: np.dtype) -> np.ndar
     if array.null_count:
         raise ValueError("Synthetic annotation scalar column contains null values")
     return np.asarray(array.to_numpy(zero_copy_only=False), dtype=dtype)
-
-
-def _stat_vector(payload: dict[str, Any], key: str, spec: EmbodimentSpec, path: Path) -> np.ndarray:
-    vector = np.asarray(payload[key], dtype=np.float32)
-    if vector.shape != (spec.dim,) or not np.isfinite(vector).all():
-        raise ValueError(f"Invalid {key} for {spec.name!r} in {path}")
-    return vector
 
 
 def _schema_delta_mask(schema: Any, spec: EmbodimentSpec) -> np.ndarray:

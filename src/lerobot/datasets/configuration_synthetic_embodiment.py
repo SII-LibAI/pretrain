@@ -24,7 +24,6 @@ class SyntheticEmbodimentDatasetConfig(InternVLAA15DatasetConfig):
     stats_dir: str | None = None
 
     annotation_file: ClassVar[str] = "meta/annotations/action.parquet"
-    embodiment_schema_prefix: ClassVar[str] = "egodex_synthetic_"
     default_stats_directory: ClassVar[str] = "synthetic_embodiment_stats"
 
     def __post_init__(self) -> None:
