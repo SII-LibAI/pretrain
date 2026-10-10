@@ -623,7 +623,7 @@ class FASTWSAPretrainActionTokenizerTransformFn(DataTransformFn):
         return data
 
 
-@DataTransformFn.register_subclass("extract_video_frames")
+@DataTransformFn.register_subclass("wsa_extract_video_frames")
 @dataclass
 class ExtractVideoFramesTransformFn(DataTransformFn):
     """Extract multi-frame video data for WAN and reduce camera keys to single frame for VLM.

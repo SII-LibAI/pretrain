@@ -4,21 +4,21 @@ set -euo pipefail
 ###############################################################################
 ################################# ENV config ##################################
 
-export HF_HOME=${HF_HOME}
+# export HF_HOME=${HF_HOME}
 
-WANDB_TOKEN=${WANDB_TOKEN}
-CONDA_ROOT=${_CONDA_ROOT}
-CONDA_ENV=internvla_a1_5
+# WANDB_TOKEN=${WANDB_TOKEN}
+# CONDA_ROOT=${_CONDA_ROOT}
+# CONDA_ENV=internvla_a1_5
 
-source ${CONDA_ROOT}/etc/profile.d/conda.sh
-conda activate ${CONDA_ENV}
+# source ${CONDA_ROOT}/etc/profile.d/conda.sh
+# conda activate ${CONDA_ENV}
 
-wandb login ${WANDB_TOKEN}
+# wandb login ${WANDB_TOKEN}
 
 ###############################################################################
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-export MASTER_PORT=${MASTER_PORT:-6379}
+export MASTER_PORT=${MASTER_PORT:-6370}
 echo "MASTER_ADDR=${MASTER_ADDR}, MASTER_PORT=${MASTER_PORT}"
 
 PROC_PER_NODE="${PROC_PER_NODE:-2}"
@@ -32,16 +32,20 @@ NUM_PROCESSES=$((NODE_COUNT * PROC_PER_NODE))
 # export NCCL_SHM_DISABLE=1
 # export NCCL_ASYNC_ERROR_HANDLING=1
 # export TORCH_NCCL_BLOCKING_WAIT=1
-export CUDA_HOME="/usr/local/cuda-12.8"
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export HF_LEROBOT_HOME="$PWD/data"
+
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CONDA_PREFIX"
+export CUDAToolkit_ROOT="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 export WANDB_MODE=offline
-# export HF_HUB_OFFLINE=1
+export HF_HUB_OFFLINE=1
 # export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 
@@ -63,16 +67,16 @@ cd ${PROJ_ROOT}
 # Match the local A1.5 checkpoint config.json: type=internvla_a1_5.
 POLICY="internvla_a1_5"
 # Local pretrain checkpoint with config.json / train_config.json / stats.json.
-PRETRAINED_PATH="InternRobotics/InternVLA-A1.5-base"
+PRETRAINED_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/internvla_a1_5/egodata-eef/checkpoints/200000/pretrained_model"
 # Official Qwen3.5-2B; A1.5 adds FAST action tokens at runtime.
 # The old expanded Qwen3.5-2B-Action path is still compatible.
-VLM_MODEL_PATH="${VLM_MODEL_PATH:-Qwen/Qwen3.5-2B}"
+VLM_MODEL_PATH="${VLM_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b}"
 
 # 2. dataset config
 # Discovers the four LIBERO subsets under data/libero/ that ship with meta/ +
 # videos/ (libero_{10,goal,object,spatial}_no_noops_1.0.0_lerobot).
 DATASET_REPO_ID="$(
-  find -L "data/libero" -mindepth 1 -maxdepth 1 -type d -name "libero_*_no_noops*_lerobot" 2>/dev/null \
+  find -L "data/libero-v3" -mindepth 1 -maxdepth 2 -type d -name "libero_*_no_noops*_lerobot*" 2>/dev/null \
   | while read -r d; do
         if [[ -d "$d/meta" && -d "$d/videos" ]]; then
             echo "${d#data/}"
@@ -95,6 +99,7 @@ if [ "${NODE_RANK}" = "0" ]; then
         info_json="data/${repo}/meta/info.json"
         subset_robot_type="$(basename "${repo}")"
         subset_robot_type="${subset_robot_type%%_no_noops*}"
+        echo '${subset_robot_type}'
         if [ -f "${info_json}" ]; then
             python -c "
 import json
@@ -118,7 +123,7 @@ fi
 
 # 3. output configs
 BASE_OUTPUT_DIR="outputs/${POLICY}"
-PRETRAINED_DETAIL="a15_pretrain" # Only used to make the output name clear.
+PRETRAINED_DETAIL="ego-pretrain-libero" # Only used to make the output name clear.
 JOB_NAME="$(date +'%Y_%m_%d_%H_%M_%S')-${POLICY}-libero-${ACTION_TYPE}-${PRETRAINED_DETAIL}-finetune"
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/${JOB_NAME}"
 
@@ -160,13 +165,13 @@ ARGS=(
     --policy.freeze_vision_encoder=false
     --policy.train_expert_only=false
     --policy.vlm_model_name_or_path=${VLM_MODEL_PATH} # Qwen3.5-2B HF repo id or local path.
-    --policy.enable_vqa_loss=true             # Keep VQA / language-token loss.
+    --policy.enable_vqa_loss=false             # Keep VQA / language-token loss.
     --policy.tokenize_state=true              # Encode robot state into prompt tokens.
     --policy.knowledge_insulation=false       # Allow action expert to attend to prefix context.
     --policy.video_loss_only=false            # Do not train only the video branch.
     --policy.video_loss_weight=1              # Weight for video auxiliary loss.
-    --policy.action_loss_only=false           # Fine-tune with video loss.
-    --policy.freeze_learnable_tokens=false    # Keep the learned foresight tokens trainable.
+    --policy.action_loss_only=true          # Fine-tune with video loss.
+    --policy.freeze_learnable_tokens=true    # Keep the learned foresight tokens trainable.
     --policy.num_learnable_tokens=50
 
     # ---- Dataset ----
@@ -176,13 +181,12 @@ ARGS=(
     --dataset.use_external_stats="$USE_EXTERNAL_STATS"
     --dataset.dist_loading=false              # Aggregated multi-subset loading; keep on one shard.
     --dataset.tokenize_state=true
-    --dataset.use_fast_action_tokens=true     # Use FAST action-token labels for Qwen loss.
-
+    --dataset.use_fast_action_tokens=false    # Use FAST action-token labels for Qwen loss.
     # ---- Training ----
     --seed=42
     --batch_size=16
     --steps=100000
-    --save_freq=5000
+    --save_freq=20000
     --log_freq=200
 
     # ---- Logging ----

@@ -4,16 +4,16 @@ set -euo pipefail
 ###############################################################################
 ################################# ENV config ##################################
 
-export HF_HOME=${HF_HOME}
+# export HF_HOME=${HF_HOME}
 
-WANDB_TOKEN=${WANDB_TOKEN}
-CONDA_ROOT=${_CONDA_ROOT}
-CONDA_ENV=internvla_a1_5
+# WANDB_TOKEN=${WANDB_TOKEN}
+# CONDA_ROOT=${_CONDA_ROOT}
+# CONDA_ENV=internvla_a1_5
 
-source ${CONDA_ROOT}/etc/profile.d/conda.sh
-conda activate ${CONDA_ENV}
+# source ${CONDA_ROOT}/etc/profile.d/conda.sh
+# conda activate ${CONDA_ENV}
 
-wandb login ${WANDB_TOKEN}
+# wandb login ${WANDB_TOKEN}
 
 ###############################################################################
 
@@ -32,9 +32,13 @@ NUM_PROCESSES=$((NODE_COUNT * PROC_PER_NODE))
 # export NCCL_SHM_DISABLE=1
 # export NCCL_ASYNC_ERROR_HANDLING=1
 # export TORCH_NCCL_BLOCKING_WAIT=1
-export CUDA_HOME="/usr/local/cuda-12.8"
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export HF_LEROBOT_HOME="$PWD/data"
+
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CONDA_PREFIX"
+export CUDAToolkit_ROOT="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
@@ -62,11 +66,11 @@ cd ${PROJ_ROOT}
 # 1. policy config
 # Match the local A1.5 checkpoint config.json: type=internvla_a1_5.
 POLICY="internvla_a1_5"
-PRETRAINED_PATH="InternRobotics/InternVLA-A1.5-base"
+PRETRAINED_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/internvla_a1_5/egodata-eef/checkpoints/200000/pretrained_model"
 
 # 2. dataset config
 DATASET_REPO_ID="$(
-  find -L "data/robotwin" -mindepth 2 -maxdepth 2 -type d -name "aloha-agilex*" 2>/dev/null \
+  find -L "data/RoboTwin" -mindepth 2 -maxdepth 2 -type d -name "aloha-agilex_clean*" 2>/dev/null \
   | while read -r d; do
         if [[ -d "$d/meta" && -d "$d/videos" ]]; then
             echo "${d#data/}"
@@ -74,13 +78,15 @@ DATASET_REPO_ID="$(
     done \
   | sort -u
 )"
+echo "DATASET_REPO_ID: ${DATASET_REPO_ID}"
+
 ACTION_TYPE=abs          # abs | delta
 USE_EXTERNAL_STATS=true  # true | false
-external_stats_path=""
+external_stats_path="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/stats/aloha/abs/stats.json"
 # 3. output configs
 BASE_OUTPUT_DIR="outputs/${POLICY}"
-PRETRAINED_DETAIL="a15_pretrain" # Only used to make the output name clear.
-JOB_NAME="$(date +'%Y_%m_%d_%H_%M_%S')-${POLICY}-${DATASET_REPO_ID//[\/ ]/_}-${ACTION_TYPE}-${PRETRAINED_DETAIL}-finetune"
+PRETRAINED_DETAIL="umi-robotwin" # Only used to make the output name clear.
+JOB_NAME="$(date +'%Y_%m_%d_%H_%M_%S')-${POLICY}-robotwin-${ACTION_TYPE}-${PRETRAINED_DETAIL}-finetune"
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/${JOB_NAME}"
 
 
@@ -108,16 +114,16 @@ ARGS=(
     --policy.dtype=bfloat16                
     --policy.optimizer_lr=5e-5
     --policy.scheduler_warmup_steps=2000
-    --policy.scheduler_decay_steps=60000
+    --policy.scheduler_decay_steps=50000
     --policy.scheduler_decay_lr=5e-6
     --policy.freeze_vision_encoder=false
     --policy.train_expert_only=false
-    --policy.enable_vqa_loss=true            # Keep VQA / language-token loss.
+    --policy.enable_vqa_loss=false          # Keep VQA / language-token loss.
     --policy.tokenize_state=true             # Encode robot state into prompt tokens.
     --policy.knowledge_insulation=false      # Allow action expert to attend to prefix context.
     --policy.video_loss_only=false           # Do not train only the video branch.
     --policy.video_loss_weight=1             # Weight for video auxiliary loss.
-    --policy.action_loss_only=false          # fine-tune with video loss.
+    --policy.action_loss_only=true          # fine-tune with video loss.
     --policy.freeze_learnable_tokens=true    # Freeze the learned foresight tokens.
     --policy.num_learnable_tokens=50
 
@@ -129,13 +135,13 @@ ARGS=(
     --dataset.external_stats_path=${external_stats_path:-}/
     --dataset.dist_loading=true              # Each distributed rank loads its own shard. (For single gpu, it should be false)
     --dataset.tokenize_state=true
-    --dataset.use_fast_action_tokens=true    # Use FAST action-token labels for Qwen loss.
-
+    --dataset.use_fast_action_tokens=false    # Use FAST action-token labels for Qwen loss.
+    --dataset.video_backend=pyav
     # ---- Training ----
     --seed=42
-    --batch_size=8
-    --steps=60000
-    --save_freq=20000
+    --batch_size=16
+    --steps=50000
+    --save_freq=25000
     --log_freq=200
 
     # ---- Logging ----

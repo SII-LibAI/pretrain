@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Compute per-embodiment delta-action normalization statistics offline."""
+"""Compute per-representation normalization statistics for synthetic actions."""
 
 from __future__ import annotations
 
@@ -256,7 +256,10 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=50,
-        help="Training action chunk length. Delta-action stats are computed over the same windows.",
+        help=(
+            "Training action chunk length. Joint delta and absolute human EEF statistics "
+            "are computed over the same valid windows."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument(

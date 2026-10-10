@@ -46,7 +46,7 @@ MIX_ROOT=/data/synthetic_pretrain
 mkdir -p "$MIX_ROOT"
 ln -s "$EGODEX_PARENT" "$MIX_ROOT/egodex"
 ln -s "$EGOVERSE_PARENT" "$MIX_ROOT/egoverse"
-find -L "$MIX_ROOT" -type f -path '*/meta/annotations/action.parquet' | head
+find -L "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego" -type f -path '*/meta/annotations/action.parquet' | head
 ```
 
 预期相对路径类似 `egodex/knit_scarf`、`egoverse/task_b`。脚本会将它们作为 `dataset.repo_id`，Dataset 本身不递归扫描。当前脚本用空格分隔 repo_id，因此子数据集的相对路径不要包含空格。不要把同一个真实 LeRobot 根目录同时以原路径和链接路径重复加入训练集合。
@@ -56,25 +56,15 @@ find -L "$MIX_ROOT" -type f -path '*/meta/annotations/action.parquet' | head
 已经算好两数据源合并统计量的，可以跳过计算，直接令 `STATS_DIR` 指向该目录。目录至少应有每个所选本体的 `<本体>/stats.json`；不需要 `manifest.json`。如果尚未计算，先分别对两个**真实父目录**运行 `discover_lerobot_root.py`，再合并两个 TXT；不要依赖该 Python 发现脚本跟随软链接。
 
 ```bash
-python util_scripts/discover_lerobot_root.py \
-  --parent-dir "$EGODEX_PARENT" --output-file "$MIX_ROOT/egodex_roots.txt"
-python util_scripts/discover_lerobot_root.py \
-  --parent-dir "$EGOVERSE_PARENT" --output-file "$MIX_ROOT/egoverse_roots.txt"
-sort -u "$MIX_ROOT/egodex_roots.txt" "$MIX_ROOT/egoverse_roots.txt" \
-  > "$MIX_ROOT/mixed_roots.txt"
 
-python util_scripts/compute_synthetic_embodiment_stats.py \
-  --dataset-roots-file "$MIX_ROOT/mixed_roots.txt" \
-  --output-dir "$MIX_ROOT/synthetic_embodiment_stats" \
-  --chunk-size 50 --num-workers 8 \
-  --embodiment franka --embodiment ur7e
+python /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/util_scripts/compute_synthetic_embodiment_stats.py \
+  --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/repos/egodex.txt \
+  --output-dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/stats/egodex_egoverse  \
+  --chunk-size 50 --num-workers 50 \
+  --embodiment rm75
 ```
-
-统计脚本按每个根目录 `meta/info.json` 的 `robot_type` 选 schema，再把同名本体的 state/action 统计合并。`--chunk-size` 必须与训练的 `CHUNK_SIZE` 一致；`--embodiment` 列表应与训练的 `EMBODIMENTS` 对应。统计只取整段有效的 chunk。合并统计的前提是两数据源最终合成的同名本体向量已经统一单位、关节定义、正方向和坐标约定；此代码不会自动对齐坐标系。
-
 ### 1.4 核对启动参数并训练
 
-当前 `launch/internvla_a1.5_pretrain_egodex.sh` 已固定 `--dataset.type=synthetic_embodiment`，无需再传 `dataset_type`。脚本默认 `EMBODIMENTS='["franka"]'`、`CHUNK_SIZE=50`、`PROC_PER_NODE=2`，并启用 `dataset.dist_loading=true`、`policy.action_loss_only=true`、`policy.enable_vqa_loss=false`。它不设置 `policy.max_state_dim/max_action_dim`；policy 默认均为 32。训练 `franka+ur7e`（最大 18 维）时默认维度足够，若加入 `ur7e_wuji`（52 维）等更长向量，需先在脚本 `ARGS` 中显式加入 `--policy.max_state_dim=52` 和 `--policy.max_action_dim=52`。维度不自动推导。
 
 确认 `VLM_MODEL_PATH` 有效；另外 ChatProcessor 的 `pretrained_model_name_or_path` 在其 transform 配置中有独立默认值，若使用非默认 Qwen3.5 路径，也要确保该处理器配置指向可用的同款模型。确认本体统计文件存在后再启动：
 

@@ -138,14 +138,17 @@ def decode_video_frames_torchvision(
 
     reader = None
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
+    # Keep absolute timestamps in float64. At long video offsets (for example,
+    # around 1200 seconds), float32 has a spacing greater than the default
+    # 1e-4-second tolerance and can reject the correct frame after rounding.
+    query_ts = torch.tensor(timestamps, dtype=torch.float64)
+    loaded_ts = torch.tensor(loaded_ts, dtype=torch.float64)
 
     # compute distances between each query timestamp and timestamps of all loaded frames
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    is_within_tol = min_ <= tolerance_s
     assert is_within_tol.all(), (
         f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
         "It means that the closest frame that can be loaded from the video is too far away in time."
@@ -271,7 +274,7 @@ def decode_video_frames_torchcodec(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    is_within_tol = min_ <= tolerance_s
     assert is_within_tol.all(), (
         f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
         "It means that the closest frame that can be loaded from the video is too far away in time."

@@ -18,12 +18,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJ_ROOT}"
 
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CONDA_PREFIX"
+export CUDAToolkit_ROOT="$CONDA_PREFIX"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
 POLICY="internvla_a1_5"
-VLM_MODEL_PATH="${VLM_MODEL_PATH:-/path/to/qwen3.5-2b}"
-DATASET_ROOT="${DATASET_ROOT:-/path/to/Egodex-LerobotV3/extra}"
-DATASET_ROOT="${DATASET_ROOT%/}"
-STATS_DIR="${STATS_DIR:-${DATASET_ROOT}/synthetic_embodiment_stats}"
-EMBODIMENTS="${EMBODIMENTS:-[\"franka\"]}"
+VLM_MODEL_PATH="${VLM_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b}"
+DATASET_ROOT="${DATASET_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego}"
+STATS_DIR="${STATS_DIR:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/stats/egodex_egoverse}"
+# EMBODIMENTS="${EMBODIMENTS:-[\"piper\",\"arx_l5\",\"human_eef\"]}"
+EMBODIMENTS="${EMBODIMENTS:-[\"human_eef\"]}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
 BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-12}"
 
@@ -40,19 +46,17 @@ fi
 
 # Dataset discovery belongs here, not inside SyntheticEmbodimentDataset.
 # repo_id values are paths relative to DATASET_ROOT, as expected by the factory.
+DATASET_REPO_ID="${DATASET_REPO_ID:-}"
 DATASET_REPO_ID="$(
-  find -L "${DATASET_ROOT}" -type d -name data 2>/dev/null \
-    | while read -r data_dir; do
-        dataset_dir="$(dirname "${data_dir}")"
-        if [[ -d "${dataset_dir}/meta" \
-              && -d "${dataset_dir}/videos" \
-              && -f "${dataset_dir}/meta/annotations/action.parquet" ]]; then
-          echo "${dataset_dir#"${DATASET_ROOT}"/}"
-        fi
-      done \
-    | shuf "${SHUF_ARGS[@]}" \
-    | tr '\n' ' ' \
-    | xargs
+  {
+    find -L  ${DATASET_ROOT} -type d -name data 2>/dev/null \
+      | while read -r d; do
+          root="$(dirname "$d")"
+          if [[ -d "$root/meta" && -d "$root/videos" ]]; then
+            echo "${root#data/}"
+          fi
+        done
+  } | shuf "${SHUF_ARGS[@]}" | tr '\n' ' ' | xargs
 )"
 
 if [[ -z "${DATASET_REPO_ID}" ]]; then
@@ -73,7 +77,7 @@ ARGS=(
   src/lerobot/scripts/lerobot_train.py
 
   --output_dir="${OUTPUT_DIR}"
-  --num_workers=8
+  --num_workers=12
   --job_name="${JOB_NAME}"
 
   --policy.type="${POLICY}"
@@ -96,7 +100,7 @@ ARGS=(
   --policy.video_loss_only=false
   --policy.video_loss_weight=1
   --policy.action_loss_only=true
-  --policy.freeze_learnable_tokens=false
+  --policy.freeze_learnable_tokens=true
   --policy.num_learnable_tokens=50
 
   --dataset.type=synthetic_embodiment
@@ -112,7 +116,7 @@ ARGS=(
   --seed=42
   --batch_size="${BATCH_SIZE_PER_DEVICE}"
   --steps=200000
-  --save_freq=20000
+  --save_freq=40000
   --log_freq=100
 
   --wandb.enable=true

@@ -28,6 +28,7 @@ from torch.optim import Optimizer
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.configuration_synthetic_embodiment import SyntheticEmbodimentDatasetConfig
 from lerobot.datasets.factory import make_dataset, make_dataloader
 from lerobot.datasets.utils import cycle
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -50,6 +51,25 @@ from lerobot.utils.utils import (
     init_logging,
     gather_object, 
 )
+
+SYNTHETIC_INPUT_LOG_FREQ = 200
+
+
+def log_synthetic_input(step: int, batch: dict[str, Any], tokenizer: Any) -> None:
+    """Log the first sample exactly as it enters the synthetic action policy."""
+    prompt_mask = (
+        batch["observation.attention_mask"][0].bool()
+        & (batch["VQA.labels"][0] == -100)
+    )
+    prompt_ids = batch["observation.input_ids"][0][prompt_mask].detach().cpu().tolist()
+    prompt = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+    logging.info(
+        "[synthetic input] step=%d rank=0 sample=0\n"
+        "prompt: %s\n",
+        step,
+        prompt,
+    )
+
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -355,6 +375,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Start offline training on a fixed dataset")
         training_start_time = time.perf_counter()
 
+    input_tokenizer = None
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -376,6 +397,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # increment `step` here.
         step += 1
         train_tracker.step()
+        if (
+            is_main_process
+            and isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
+            and step % SYNTHETIC_INPUT_LOG_FREQ == 0
+        ):
+            if input_tokenizer is None:
+                from transformers.models.qwen3_5 import Qwen3_5Tokenizer
+
+                input_tokenizer = Qwen3_5Tokenizer.from_pretrained(
+                    cfg.policy.vlm_model_name_or_path
+                )
+            log_synthetic_input(step, batch, input_tokenizer)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
 

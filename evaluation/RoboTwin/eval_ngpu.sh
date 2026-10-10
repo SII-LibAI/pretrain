@@ -27,10 +27,16 @@ TASK_END="${5:-${TASK_END:-49}}"
 NUM_EPISODES="${6:-${NUM_EPISODES:-100}}"
 
 ACTION_MODE="${ACTION_MODE:-abs}"
-INFER_HORIZON="${INFER_HORIZON:-30}"
+INFER_HORIZON="${INFER_HORIZON:-12}"
 INFERENCE_BACKEND="${INFERENCE_BACKEND:-standard}"
 DTYPE="${DTYPE:-bfloat16}"
 FORCE_RERUN="${FORCE_RERUN:-false}"
+BURNER_ENABLED="${BURNER_ENABLED:-false}"
+BURNER_COMMAND="${BURNER_COMMAND:-python \"${SCRIPT_DIR}/gpu_burner.py\"}"
+BURNER_TRIGGER_UTIL="${BURNER_TRIGGER_UTIL:-60}"
+BURNER_GRACE_SECONDS="${BURNER_GRACE_SECONDS:-120}"
+BURNER_POLL_SECONDS="${BURNER_POLL_SECONDS:-30}"
+BURNER_LOW_SAMPLES="${BURNER_LOW_SAMPLES:-4}"
 
 if (( TASK_START < 0 || TASK_END < TASK_START || TASK_END > 49 )); then
     echo "ERROR: invalid task range ${TASK_START}..${TASK_END}; valid range is 0..49" >&2
@@ -170,6 +176,73 @@ task_is_complete() {
     return 1
 }
 
+monitor_gpu_and_run_burner() {
+    local worker_pid="$1"
+    local gpu="$2"
+    local burner_log="${LOG_ROOT}/gpu_${gpu}_burner.log"
+    local burner_pid=""
+    local low_samples=0
+    local utilization
+    local grace_deadline=$((SECONDS + BURNER_GRACE_SECONDS))
+
+    burner_is_running() {
+        [[ -n "${burner_pid}" ]] && {
+            kill -0 -- "-${burner_pid}" 2>/dev/null || kill -0 "${burner_pid}" 2>/dev/null
+        }
+    }
+
+    stop_burner() {
+        if burner_is_running; then
+            kill -- "-${burner_pid}" >/dev/null 2>&1 || kill "${burner_pid}" >/dev/null 2>&1 || true
+            wait "${burner_pid}" 2>/dev/null || true
+        fi
+    }
+
+    trap 'stop_burner; exit 0' INT TERM
+    trap stop_burner EXIT
+
+    while (( SECONDS < grace_deadline )); do
+        if ! kill -0 "${worker_pid}" 2>/dev/null; then
+            return
+        fi
+        sleep "${BURNER_POLL_SECONDS}"
+    done
+
+    while kill -0 "${worker_pid}" 2>/dev/null; do
+        if [[ -n "${burner_pid}" ]]; then
+            if burner_is_running; then
+                sleep "${BURNER_POLL_SECONDS}"
+                continue
+            fi
+            wait "${burner_pid}" 2>/dev/null || true
+            printf '%s burner exited; monitoring gpu=%s again\n' "$(date -Is)" "${gpu}" >>"${burner_log}"
+            burner_pid=""
+            low_samples=0
+        fi
+
+        if utilization="$(nvidia-smi --id="${gpu}" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null)"; then
+            utilization="${utilization//[[:space:]]/}"
+            if [[ "${utilization}" =~ ^[0-9]+$ ]] && (( utilization < BURNER_TRIGGER_UTIL )); then
+                low_samples=$((low_samples + 1))
+            else
+                low_samples=0
+            fi
+        else
+            low_samples=0
+        fi
+
+        if (( low_samples >= BURNER_LOW_SAMPLES )); then
+            printf '%s starting burner gpu=%s utilization=%s%% command=%q\n' \
+                "$(date -Is)" "${gpu}" "${utilization}" "${BURNER_COMMAND}" | tee -a "${burner_log}"
+            CUDA_VISIBLE_DEVICES="${gpu}" setsid bash -c "exec ${BURNER_COMMAND}" >>"${burner_log}" 2>&1 &
+            burner_pid="$!"
+            low_samples=0
+        fi
+
+        sleep "${BURNER_POLL_SECONDS}"
+    done
+}
+
 worker_loop() {
     local worker_idx="$1"
     local gpu="$2"
@@ -227,10 +300,20 @@ echo "ACTION_MODE       = ${ACTION_MODE}"
 echo "INFER_HORIZON     = ${INFER_HORIZON}"
 echo "INFERENCE_BACKEND = ${INFERENCE_BACKEND}"
 echo "DTYPE             = ${DTYPE}"
+echo "BURNER_ENABLED    = ${BURNER_ENABLED}"
+if [[ "${BURNER_ENABLED}" == "true" ]]; then
+    echo "BURNER_TRIGGER    = <${BURNER_TRIGGER_UTIL}% for ${BURNER_LOW_SAMPLES} samples"
+    echo "BURNER_TIMING     = grace=${BURNER_GRACE_SECONDS}s poll=${BURNER_POLL_SECONDS}s"
+fi
 
 for worker_idx in "${!GPU_ARR[@]}"; do
     worker_loop "${worker_idx}" "${GPU_ARR[$worker_idx]}" &
-    PIDS+=("$!")
+    worker_pid="$!"
+    PIDS+=("${worker_pid}")
+    if [[ "${BURNER_ENABLED}" == "true" ]]; then
+        monitor_gpu_and_run_burner "${worker_pid}" "${GPU_ARR[$worker_idx]}" &
+        PIDS+=("$!")
+    fi
 done
 
 for pid in "${PIDS[@]}"; do

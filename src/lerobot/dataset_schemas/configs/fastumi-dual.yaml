@@ -1,13 +1,18 @@
-# fast umi single
-robot_type: fastumi-dual
-action_mask_spec: [3,-5,3,-5]
+# fast umi
+robot_type: fastumi_dual
+action_mask_spec: [3,-4,3,-4]
+action_reorder:
+  - [0, 6, 0, 6]      # left_joint: src[0:6] -> dst[0:6]
+  - [6, 7, 7, 8]      # left_gripper: src[6:7] -> dst[7:8] (gap at index 6)
+  - [7, 13, 8, 14]    # right_joint: src[7:13] -> dst[8:14]
+  - [13, 14, 15, 16]  # right_gripper: src[13:14] -> dst[15:16] (gap at indices 15)
 feature_mapping:
   observation.state:
     - observation.state
   action:
     - action
 image_mapping:
-  observation.images.robot_0_image: observation.images.image0
-  observation.images.robot_1_image: observation.images.image1
+  observation.images.left_camera_rgb_image: observation.images.image0
+  observation.images.right_camera_rgb_image: observation.images.image1
 action_mode: end_effector
 description: "fast umi dual"

@@ -97,3 +97,10 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+"""
+python /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/evaluation/LIBERO-plus/aggregate_results.py  \
+    --root /inspire/qb-ilm/project/embodied-basic-model/zhangjianing-253108140206/evaluation/liberoplus/egopretrain
+
+
+"""

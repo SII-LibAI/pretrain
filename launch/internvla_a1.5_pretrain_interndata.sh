@@ -74,7 +74,7 @@ VLM_MODEL_PATH="${VLM_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhan
 
 # 2. dataset config
 
-SMOKE_NUM_DATASETS="${SMOKE_NUM_DATASETS:-}"
+SMOKE_NUM_DATASETS="${SMOKE_NUM_DATASETS:-4}"
 SHUF_ARGS=()
 if [[ -n "$SMOKE_NUM_DATASETS" ]]; then
   SHUF_ARGS=(-n "$SMOKE_NUM_DATASETS")
@@ -82,7 +82,7 @@ fi
 
 DATASET_REPO_ID="$(
   {
-    find -L data/a1 -type d -name data 2>/dev/null \
+    find -L data/umi -type d -name data 2>/dev/null \
       | while read -r d; do
           root="$(dirname "$d")"
           if [[ -d "$root/meta" && -d "$root/videos" ]]; then
@@ -107,7 +107,7 @@ BATCH_SIZE_PER_DEVICE=12
 
 # 3. output config
 BASE_OUTPUT_DIR="outputs/${POLICY}"
-DATASET_NAME="a1"
+DATASET_NAME="umi"
 JOB_NAME="$(date +'%Y_%m_%d_%H_%M_%S')-${POLICY}-${DATASET_NAME}-${ACTION_TYPE}-pretrain"
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/${JOB_NAME}"
 
@@ -163,7 +163,7 @@ ARGS=(
     --dataset.dist_loading=true
     --dataset.tokenize_state=true
     --dataset.use_fast_action_tokens=false
-    --dataset.weight_rules_path=${PROJ_ROOT}/configs/weight_rules_pretrain.yaml # pretrain data mix weight rules
+    # --dataset.weight_rules_path=${PROJ_ROOT}/configs/weight_rules_pretrain.yaml # pretrain data mix weight rules
     --dataset.max_prompt_length=650
     --dataset.video_backend=pyav
     # ---- Optional external VQA data ----

@@ -32,10 +32,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # ---------------- User-configurable defaults ----------------
-CONDA_ROOT="${CONDA_ROOT:-$HOME/miniconda3}"
-SERVER_ENV="${SERVER_ENV:-lerobot_lab}"
-CLIENT_ENV="${CLIENT_ENV:-libero_plus}"
-
+CONDA_ROOT="${CONDA_ROOT:-/root/miniconda3}"
+SERVER_ENV="${SERVER_ENV:-pretrain}"
+CLIENT_ENV="${CLIENT_ENV:-liberoplus}"
+export NVCC_PREPEND_FLAGS=""
 HOST="${HOST:-127.0.0.1}"
 BASE_PORT="${BASE_PORT:-5774}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-1}"
@@ -73,7 +73,7 @@ INFERENCE_BACKEND="${INFERENCE_BACKEND:-standard}"
 STATS_KEY_MODE="${STATS_KEY_MODE:-suite}"
 ROBOT_TYPE_MODE="${ROBOT_TYPE_MODE:-suite}"
 
-EVAL_LOG_DIR="${EVAL_LOG_DIR:-}"
+EVAL_LOG_DIR="${EVAL_LOG_DIR:-/inspire/qb-ilm/project/embodied-basic-model/zhangjianing-253108140206/evaluation/liberoplus/egopretrain}"
 
 if [[ -z "${CKPT_PATH}" ]]; then
   echo "[ERROR] CKPT_PATH is required." >&2
@@ -293,6 +293,11 @@ run_worker() {
       source "${CONDA_ROOT}/etc/profile.d/conda.sh"
       conda activate "${SERVER_ENV}"
       cd "${PROJ_ROOT}"
+      export CUDA_HOME="$CONDA_PREFIX"
+      export CUDA_PATH="$CONDA_PREFIX"
+      export CUDAToolkit_ROOT="$CONDA_PREFIX"
+      export PATH="$CUDA_HOME/bin:$PATH"
+      export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
       PYTHONPATH="${PROJ_ROOT}:${PROJ_ROOT}/src:${PYTHONPATH:-}" \
       CUDA_VISIBLE_DEVICES="${gpu_id}" exec python evaluation/LIBERO/policy_server/server_policy.py \
         --ckpt_path "${CKPT_PATH}" \
@@ -312,36 +317,36 @@ run_worker() {
     local server_pid=$!
     echo "${server_pid}" >> "${PIDS_FILE}"
 
-    if ! (
-      source "${CONDA_ROOT}/etc/profile.d/conda.sh"
-      conda activate "${SERVER_ENV}"
-      cd "${PROJ_ROOT}"
-      PYTHONPATH="${PROJ_ROOT}:${PROJ_ROOT}/src:${PYTHONPATH:-}" python - <<PY
-import time, sys
-from evaluation.LIBERO.policy_server.tools.websocket_policy_client import WebsocketClientPolicy
+#     if ! (
+#       source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+#       conda activate "${SERVER_ENV}"
+#       cd "${PROJ_ROOT}"
+#       PYTHONPATH="${PROJ_ROOT}:${PROJ_ROOT}/src:${PYTHONPATH:-}" python - <<PY
+# import time, sys
+# from evaluation.LIBERO.policy_server.tools.websocket_policy_client import WebsocketClientPolicy
 
-host = "${HOST}"
-port = int("${port}")
-timeout = int("${SERVER_READY_TIMEOUT_SEC}")
-deadline = time.time() + timeout
-while time.time() < deadline:
-    try:
-        client = WebsocketClientPolicy(host=host, port=port)
-        resp = client.predict_action({"type": "ping", "request_id": "healthcheck"})
-        if resp.get("ok", False):
-            print("server ready")
-            sys.exit(0)
-    except Exception:
-        time.sleep(1)
-sys.exit(f"server healthcheck failed after {timeout}s")
-PY
-    ) >>"${worker_log}" 2>&1; then
-      echo "[gpu=${gpu_id}] [${suite} ${start}-${end}] server failed to come up; skipping" | tee -a "${worker_log}" >&2
-      failed=1
-      kill "${server_pid}" >/dev/null 2>&1 || true
-      wait "${server_pid}" 2>/dev/null || true
-      continue
-    fi
+# host = "${HOST}"
+# port = int("${port}")
+# timeout = int("${SERVER_READY_TIMEOUT_SEC}")
+# deadline = time.time() + timeout
+# while time.time() < deadline:
+#     try:
+#         client = WebsocketClientPolicy(host=host, port=port)
+#         resp = client.predict_action({"type": "ping", "request_id": "healthcheck"})
+#         if resp.get("ok", False):
+#             print("server ready")
+#             sys.exit(0)
+#     except Exception:
+#         time.sleep(1)
+# sys.exit(f"server healthcheck failed after {timeout}s")
+# PY
+#     ) >>"${worker_log}" 2>&1; then
+#       echo "[gpu=${gpu_id}] [${suite} ${start}-${end}] server failed to come up; skipping" | tee -a "${worker_log}" >&2
+#       failed=1
+#       kill "${server_pid}" >/dev/null 2>&1 || true
+#       wait "${server_pid}" 2>/dev/null || true
+#       continue
+#     fi
 
     echo "==== [gpu=${gpu_id}] [${suite} ${start}-${end}] starting ====" | tee -a "${worker_log}"
     if ! (

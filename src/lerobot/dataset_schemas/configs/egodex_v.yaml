@@ -10,6 +10,32 @@
     observation.image: observation.images.image0
   description: "EgoDex source video schema (not an embodiment action schema)"
 
+- robot_type: egodex_synthetic_human_eef
+  state_dim: 16
+  action_dim: 16
+  action_mode: end_effector
+  # EEF state and future targets are both absolute. Negative entries are left
+  # unchanged by DeltaActionTransformFn even when the dataset uses delta mode.
+  action_mask_spec: [-16]
+  # action.parquet stores right first; the model-facing layout is left first.
+  action_reorder: &human_eef_reorder
+    - [8, 16, 0, 8]
+    - [0, 8, 8, 16]
+  state_reorder: *human_eef_reorder
+  action_layout:
+    - {name: left_eef_position_absolute, size: 3}
+    - {name: left_eef_quaternion_xyzw_absolute, size: 4}
+    - {name: left_grasp_absolute, size: 1}
+    - {name: right_eef_position_absolute, size: 3}
+    - {name: right_eef_quaternion_xyzw_absolute, size: 4}
+    - {name: right_grasp_absolute, size: 1}
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.image: observation.images.image0
+  description: "Absolute dual-hand human EEF pose and grasp"
+
 - robot_type: egodex_synthetic_piper
   state_dim: 16
   action_dim: 16
@@ -107,9 +133,11 @@
   action_dim: 14
   action_mode: joint
   action_mask_spec: [14]
+  # Raw annotations are right[7] + left[7]. Keep a fixed 8-slot block per arm:
+  # left[7] + zero[1] + right[7] + zero[1].
   action_reorder: &xarm7_reorder
     - [7, 14, 0, 7]
-    - [0, 7, 7, 14]
+    - [0, 7, 8, 15]
   state_reorder: *xarm7_reorder
   action_layout:
     - {name: left_arm, size: 7}
@@ -119,16 +147,18 @@
     action: [action]
   image_mapping:
     observation.image: observation.images.image0
-  description: "Dual xArm7"
+  description: "Dual xArm7 in fixed 16-slot bimanual layout"
 
 - robot_type: egodex_synthetic_rm75
   state_dim: 14
   action_dim: 14
   action_mode: joint
   action_mask_spec: [14]
+  # Raw annotations are right[7] + left[7]. Keep a fixed 8-slot block per arm:
+  # left[7] + zero[1] + right[7] + zero[1].
   action_reorder: &rm75_reorder
     - [7, 14, 0, 7]
-    - [0, 7, 7, 14]
+    - [0, 7, 8, 15]
   state_reorder: *rm75_reorder
   action_layout:
     - {name: left_arm, size: 7}
@@ -138,16 +168,18 @@
     action: [action]
   image_mapping:
     observation.image: observation.images.image0
-  description: "Dual RM75"
+  description: "Dual RM75 in fixed 16-slot bimanual layout"
 
 - robot_type: egodex_synthetic_ur7e
   state_dim: 12
   action_dim: 12
   action_mode: joint
   action_mask_spec: [12]
+  # Raw annotations are right[6] + left[6]. Reserve two slots after each arm:
+  # left[6] + zero[2] + right[6] + zero[2].
   action_reorder: &ur7e_reorder
     - [6, 12, 0, 6]
-    - [0, 6, 6, 12]
+    - [0, 6, 8, 14]
   state_reorder: *ur7e_reorder
   action_layout:
     - {name: left_arm, size: 6}
@@ -157,7 +189,7 @@
     action: [action]
   image_mapping:
     observation.image: observation.images.image0
-  description: "Dual UR7e"
+  description: "Dual UR7e in fixed 16-slot bimanual layout"
 
 - robot_type: egodex_synthetic_ur7e_wuji
   state_dim: 52

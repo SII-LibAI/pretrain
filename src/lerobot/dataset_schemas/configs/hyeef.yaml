@@ -1,0 +1,14 @@
+# fast umi
+robot_type: Hunyuan_eef
+action_mask_spec: [3,-5,3,-5]
+feature_mapping:
+  observation.state:
+    - observation.state
+  action:
+    - action
+image_mapping:
+  observation.images.cam_high: observation.images.image0
+  observation.images.cam_left_wrist: observation.images.image1
+  observation.images.cam_right_wrist: observation.images.image2
+action_mode: end_effector
+description: "hunyuandata"

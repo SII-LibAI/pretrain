@@ -35,14 +35,36 @@ Arguments:
 Run one independent RoboTwin task per GPU:
 
 ```bash
-GPUS=0,1,2,3 \
+
+GPUS=0 \
 INFERENCE_BACKEND=standard \
 bash evaluation/RoboTwin/eval_ngpu.sh \
-  /inspire/hdd2/project/generative-large-model/zhangjianing-253108140206/pretrain/outputs/internvla_a1_5/2026_09_12_15_23_06-internvla_a1_5-robotwin-abs-a15_pretrain-finetune/checkpoints/120000/pretrained_model \
-  outputs/eval-robotwin-randomized \
+  /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/internvla_a1_5/2026_10_02_17_54_51-internvla_a1_5-robotwin-abs-pretrain-ego=onlyeef-robotwin-finetune/checkpoints/120000/pretrained_model \
+  /inspire/qb-ilm/project/embodied-basic-model/zhangjianing-253108140206/evaluation/RoboTwin/egopretrain-onlyeef-0 \
   demo_randomized \
   0 49 100
 ```
+'''bash
+
+  bash -lc '
+  source /root/miniconda3/etc/profile.d/conda.sh
+  conda activate pretrain
+
+  cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
+  BURNER_ENABLED=true \
+  BURNER_TRIGGER_UTIL=60 \
+  BURNER_GRACE_SECONDS=120 \
+  BURNER_POLL_SECONDS=25 \
+  BURNER_LOW_SAMPLES=3 \
+  GPUS=0,1,2,3,4,5,6,7 \
+  INFERENCE_BACKEND=standard \
+  bash evaluation/RoboTwin/eval_ngpu.sh \
+  /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/internvla_a1_5/2026_10_02_17_54_51-internvla_a1_5-robotwin-abs-pretrain-ego=onlyeef-robotwin-finetune/checkpoints/120000/pretrained_model \
+  /inspire/qb-ilm/project/embodied-basic-model/zhangjianing-253108140206/evaluation/RoboTwin/egopretrain-onlyeef \
+  demo_randomized \
+  0 49 100  
+  '
+'''
 
 The last three arguments are the inclusive task range and the required number
 of episodes per task. The scheduler considers a task complete when

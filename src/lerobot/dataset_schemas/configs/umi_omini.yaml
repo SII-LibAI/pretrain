@@ -1,0 +1,13 @@
+# Franka Emika Panda robot (A1 old format)
+robot_type: genrobot_das_bimanual
+action_mask_spec: [3,-5,3,-5]
+feature_mapping:
+  observation.state:
+      - observation.state
+  action:
+      - action
+image_mapping:
+  observation.images.left: observation.images.image0
+  observation.images.right: observation.images.image1
+action_mode: end_effector
+description: "umi_omini"

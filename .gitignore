@@ -47,7 +47,7 @@ develop-eggs/
 MANIFEST
 lib/
 lib64/
-
+datasets/
 # PyInstaller
 *.manifest
 *.spec
@@ -64,7 +64,7 @@ __pycache__/
 .pyre/
 .pytype/
 cython_debug/
-
+third_pary/
 ### Testing & Coverage ###
 htmlcov/
 .tox/

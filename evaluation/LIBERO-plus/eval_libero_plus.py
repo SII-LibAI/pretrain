@@ -282,7 +282,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--eval_log_dir", type=str, default="outputs/sim_eval/libero_plus")
-    parser.add_argument("--save_videos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save_videos", default=True)
     parser.add_argument(
         "--no_rotate_images",
         action="store_true",

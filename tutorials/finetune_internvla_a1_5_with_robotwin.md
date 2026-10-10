@@ -50,10 +50,10 @@ InternVLA-A1.5 fine-tuning uses relative `delta` actions when `ACTION_TYPE=delta
 
 ```bash
 DATASET_REPO_ID="$(
-  find -L "data/robotwin" -mindepth 2 -maxdepth 2 -type d -name "aloha-agilex*" 2>/dev/null \
+  find -L "$(pwd)/data/umi/hunyuan" -mindepth 1 -maxdepth 2 -type d 2>/dev/null \
     | while read -r d; do
-        if [[ -d "$d/meta" && -d "$d/videos" ]]; then
-          echo "${d#data/}"
+        if [[ -d "$d/meta" && -d "$d/data" ]]; then
+          realpath "$d"
         fi
       done \
     | sort -u
@@ -66,7 +66,8 @@ echo "DATASET_REPO_ID: ${DATASET_REPO_ID}"
 python util_scripts/compute_norm_stats_multi.py \
   --action_mode delta \
   --chunk_size 50 \
-  --repo_ids ${DATASET_REPO_ID}
+  --repo_ids ${DATASET_REPO_ID} \
+  --num_workers 20
 ```
 
 The resulting statistics are saved under `${HF_HOME}/lerobot/stats/...`. The RoboTwin fine-tuning script expects:
