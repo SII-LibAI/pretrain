@@ -391,29 +391,37 @@ class SyntheticEmbodimentDataset(Dataset):
                 compose,
             )
 
-            chat_transform_type = None
-            if any(type(t).__name__ == "InternVLAA15ChatProcessorTransformFn" for t in source_transforms):
-                from lerobot.policies.internvla_a1_5.transform_internvla_a1_5 import (
-                    InternVLAA15ChatProcessorTransformFn,
-                )
+            chat_transform_names = {
+                "InternVLAA15ChatProcessorTransformFn",
+                "WSA15ChatProcessorTransformFn",
+            }
 
-                chat_transform_type = InternVLAA15ChatProcessorTransformFn
-
+            uses_semantic_canonicalizer = any(
+                type(transform).__name__ == "CanonicalStateActionTransformFn"
+                for transform in source_transforms
+            )
             pose_types = (
                 DeltaActionTransformFn,
                 NormalizeTransformFn,
                 PadStateAndActionTransformFn,
                 ReorderStateActionTransform,
             )
-            pose_sources = []
-            for transform_type in pose_types:
-                matches = [t for t in source_transforms if isinstance(t, transform_type)]
-                if len(matches) != 1:
-                    raise ValueError(f"Expected one {transform_type.__name__} in dataset transforms")
-                pose_sources.append(matches[0])
-            remaining_transforms = [
-                t for t in source_transforms if not isinstance(t, pose_types)
-            ]
+            if uses_semantic_canonicalizer:
+                # WSA1.5 canonicalization is schema-aware and must remain after
+                # ComposeFieldsTransform.  It replaces the old
+                # delta/normalize/pad/reorder chain as one atomic codec.
+                pose_sources = []
+                remaining_transforms = source_transforms
+            else:
+                pose_sources = []
+                for transform_type in pose_types:
+                    matches = [t for t in source_transforms if isinstance(t, transform_type)]
+                    if len(matches) != 1:
+                        raise ValueError(f"Expected one {transform_type.__name__} in dataset transforms")
+                    pose_sources.append(matches[0])
+                remaining_transforms = [
+                    t for t in source_transforms if not isinstance(t, pose_types)
+                ]
             self._pose_transforms = []
             self._transforms = []
             for spec, schema in zip(self.annotations.specs, self.embodiment_schemas):
@@ -429,24 +437,27 @@ class SyntheticEmbodimentDataset(Dataset):
                     },
                 )
                 view = SyntheticDatasetHydrationView(self, body_meta)
-                delta, normalize, pad, reorder = pose_sources
-                self._pose_transforms.append(
-                    compose(
-                        [
-                            delta.hydrate(view),
-                            normalize.hydrate(view),
-                            replace(
-                                pad,
-                                max_state_dim=max_state_dim,
-                                max_action_dim=max_action_dim,
-                            ),
-                            reorder.hydrate(view),
-                        ]
+                if uses_semantic_canonicalizer:
+                    self._pose_transforms.append(_identity)
+                else:
+                    delta, normalize, pad, reorder = pose_sources
+                    self._pose_transforms.append(
+                        compose(
+                            [
+                                delta.hydrate(view),
+                                normalize.hydrate(view),
+                                replace(
+                                    pad,
+                                    max_state_dim=max_state_dim,
+                                    max_action_dim=max_action_dim,
+                                ),
+                                reorder.hydrate(view),
+                            ]
+                        )
                     )
-                )
                 hydrated = []
                 for transform in remaining_transforms:
-                    if chat_transform_type is not None and isinstance(transform, chat_transform_type):
+                    if type(transform).__name__ in chat_transform_names:
                         body_transform = copy(transform)
                         body_transform.action_mode = schema.action_mode
                     else:

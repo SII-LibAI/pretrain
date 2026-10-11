@@ -48,6 +48,8 @@ MANIFEST
 lib/
 lib64/
 datasets/
+!src/lerobot/datasets/
+!src/lerobot/datasets/wsa1_5.py
 # PyInstaller
 *.manifest
 *.spec

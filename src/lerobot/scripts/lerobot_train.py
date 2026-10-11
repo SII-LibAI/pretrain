@@ -49,7 +49,7 @@ from lerobot.utils.utils import (
     format_big_number,
     has_method,
     init_logging,
-    gather_object, 
+    gather_object,
 )
 
 SYNTHETIC_INPUT_LOG_FREQ = 200
@@ -146,6 +146,8 @@ def update_policy(
         train_metrics.loss_fast = output_dict["loss_fast"]
     if "loss_subtask" in output_dict:
         train_metrics.loss_subtask = output_dict["loss_subtask"]
+    if "loss_physical" in output_dict:
+        train_metrics.loss_physical = output_dict["loss_physical"]
     train_metrics.grad_norm = grad_norm.item()
     group_lrs = {
         group["name"]: group["lr"]
@@ -330,7 +332,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     policy.train()
 
-    if cfg.policy.type in {"internvla_a1_5", "wsa_pretrain"}:
+    if cfg.policy.type in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}:
         train_metrics = {
             "loss": AverageMeter("loss", ":.3f"),
             "loss_action": AverageMeter("loss_action", ":.3f"),
@@ -352,12 +354,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics["loss_vqa"] = AverageMeter("loss_vqa", ":.3f")
         train_metrics["loss_action"] = AverageMeter("loss_action", ":.3f")
     
-    if cfg.policy.type in {"internvla_a1_5", "wsa_pretrain"}:
+    if cfg.policy.type in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}:
         train_metrics["loss_video"] = AverageMeter("loss_video", ":.3f")
 
-    if cfg.policy.type in {"internvla_a1_5", "wsa_pretrain"}:
+    if cfg.policy.type in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}:
         train_metrics["loss_fast"] = AverageMeter("loss_fast", ":.3f")
         train_metrics["loss_subtask"] = AverageMeter("loss_subtask", ":.3f")
+    if cfg.policy.type == "wsa1_5":
+        train_metrics["loss_physical"] = AverageMeter("loss_physical", ":.3f")
 
 
     # Use effective batch size for proper epoch calculation in distributed training

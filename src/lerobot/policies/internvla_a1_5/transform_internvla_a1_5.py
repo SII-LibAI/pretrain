@@ -78,6 +78,7 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
     action_token_min: int = 248077
     action_token_max: int = 250124
     mode: str = "train"
+    eval_output_schema: str = "<Subtask, Action>"
 
     action_mode: str = "joint"
 
@@ -139,7 +140,7 @@ class InternVLAA15ChatProcessorTransformFn(DataTransformFn):
             label_mode = LABEL_MODE_NONE
         if self.mode == "eval":
             label_mode = LABEL_MODE_NONE
-            user_text = user_text + "; Output: <Subtask, Action>"
+            user_text = user_text + f"; Output: {self.eval_output_schema}"
 
         # Build assistant text
         if label_mode == LABEL_MODE_BOTH:

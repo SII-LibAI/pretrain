@@ -17,10 +17,10 @@ import re
 import logging
 from pathlib import Path
 from collections import defaultdict
-from omegaconf import OmegaConf, DictConfig
 
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf, DictConfig
 from torch.utils.data._utils.collate import default_collate
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -37,10 +37,10 @@ from lerobot.datasets.utils import load_json, cast_stats_to_numpy
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.synthetic_embodiment import SyntheticEmbodimentDataset
 from lerobot.datasets.transformed_dataset import (
-    TransformedLeRobotDataset, 
-    TransformedStreamingLeRobotDataset, 
-    MultiLeRobotDataset, 
-    MultiStreamingLeRobotDataset, 
+    TransformedLeRobotDataset,
+    TransformedStreamingLeRobotDataset,
+    MultiLeRobotDataset,
+    MultiStreamingLeRobotDataset,
 )
 from lerobot.datasets.vqa_dataset import (
     VQADataset,
@@ -317,7 +317,20 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         
         if key in image_keys and hasattr(cfg, "image_delta_indices") and cfg.image_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.image_delta_indices]
+            # WSA1.5 obtains its future world targets from supplemental motion
+            # streams; ordinary RGB cameras remain current-observation inputs.
+            indices = [0] if getattr(cfg, "supplemental_video_keys", ()) else cfg.image_delta_indices
+            delta_timestamps[key] = [i / ds_meta.fps for i in indices]
+
+    # WSA1.5 supervision streams are intentionally not camera inputs in the
+    # robot schema. Query their future frames without exposing them to the VLM.
+    supplemental_video_keys = getattr(cfg, "supplemental_video_keys", ())
+    image_delta_indices = getattr(cfg, "image_delta_indices", None)
+    if image_delta_indices is not None:
+        for key in supplemental_video_keys:
+            feature = ds_meta.features.get(key)
+            if feature is not None and feature.get("dtype") == "video":
+                delta_timestamps[key] = [index / ds_meta.fps for index in image_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -505,7 +518,7 @@ def make_dataset(cfg: TrainPipelineConfig):
         LeRobotDataset | MultiLeRobotDataset
     """
     wsa_pretrain_pi05_image_aug = (
-        getattr(cfg.policy, "type", None) == "wsa_pretrain"
+        getattr(cfg.policy, "type", None) in {"wsa1_5", "wsa_pretrain"}
         and cfg.dataset.image_transforms.enable
         and cfg.dataset.image_transforms.preset in {"pi05", "pi0.5", "pi05_style"}
     )
@@ -640,7 +653,7 @@ def make_dataloader(
     num_workers = cfg.num_workers
     prefetch = 2 if num_workers > 0 else None
     use_mm_collate = (
-        getattr(cfg.policy, "type", None) == "internvla_a1_5"
+        getattr(cfg.policy, "type", None) in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}
         and bool(getattr(cfg.policy, "enable_vqa_loss", False))
     )
     collate_fn = _multimodal_collate # if use_mm_collate else None
