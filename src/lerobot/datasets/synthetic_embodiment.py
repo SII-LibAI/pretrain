@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -130,27 +131,9 @@ class SyntheticActionTable:
         """Compatibility path for the offline stats tool; training does not call this."""
         if self._eager_data is not None:
             return self._eager_data
-        columns = ["index", "episode_index", "frame_index"]
-        columns.extend(key for spec in self.specs for key in spec.value_keys)
-        columns.extend(key for spec in self.specs for key in spec.valid_keys)
-        table = self._parquet().read(columns=list(dict.fromkeys(columns)))
-        values = []
-        valid = []
-        for spec in self.specs:
-            components = [_feature_column_to_numpy(table[key]) for key in spec.value_keys]
-            body_values = np.concatenate(components, axis=-1)
-            if body_values.shape[1] != spec.dim:
-                raise ValueError(
-                    f"{self.path}: concatenated values for {spec.name!r} have dimension "
-                    f"{body_values.shape[1]}, expected {spec.dim}"
-                )
-            body_valid = np.logical_and.reduce(
-                [_scalar_column_to_numpy(table[key], np.bool_) for key in spec.valid_keys]
-            )
-            if not np.isfinite(body_values[body_valid]).all():
-                raise ValueError(f"{self.path}: valid values for {spec.name!r} are not finite")
-            values.append(body_values)
-            valid.append(body_valid)
+        table = self._parquet().read(columns=["index", "episode_index", "frame_index"])
+        values = [self.read_values(body_id, 0, self.num_rows) for body_id in range(len(self.specs))]
+        valid = [self.read_valid(body_id, 0, self.num_rows) for body_id in range(len(self.specs))]
         self._eager_data = {
             "indices": _scalar_column_to_numpy(table["index"], np.int64),
             "episode_indices": _scalar_column_to_numpy(table["episode_index"], np.int64),
@@ -255,6 +238,29 @@ class SyntheticActionTable:
             )
         return result
 
+    def read_valid(self, body_id: int, start: int, stop: int) -> np.ndarray:
+        """Read a validity slice from action.parquet."""
+
+        spec = self.specs[body_id]
+        row_group = int(np.searchsorted(self.row_group_offsets, start, side="right") - 1)
+        pieces = []
+        cursor = start
+        while cursor < stop:
+            group_start = int(self.row_group_offsets[row_group])
+            group_stop = int(self.row_group_offsets[row_group + 1])
+            table = self._parquet().read_row_group(
+                row_group, columns=list(spec.valid_keys)
+            )
+            local_start = cursor - group_start
+            local_stop = min(stop, group_stop) - group_start
+            valid = np.logical_and.reduce(
+                [_scalar_column_to_numpy(table[key], np.bool_) for key in spec.valid_keys]
+            )
+            pieces.append(valid[local_start:local_stop])
+            cursor = group_start + local_stop
+            row_group += 1
+        return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+
 
 class SyntheticDatasetMetadataView:
     """Expose episode ranges after invalid anchors have been removed."""
@@ -324,6 +330,7 @@ class SyntheticEmbodimentDataset(Dataset):
         embodiments: Sequence[str] | None = None,
         row_group_cache_size: int = 0,
         transforms: Sequence[DataTransformFn] | None = None,
+        require_wsa15_layout: bool = False,
     ) -> None:
         if chunk_size < 1:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
@@ -345,15 +352,62 @@ class SyntheticEmbodimentDataset(Dataset):
         )
         schema_prefix = embodiment_schema_prefix(base_dataset.meta.robot_type)
         self.embodiment_schemas = load_embodiment_schemas(self.annotations.specs, schema_prefix)
+
+        if require_wsa15_layout:
+            from lerobot.datasets.wsa1_5 import validate_wsa15_action_layout
+
+            compatible_names = []
+            rejected = []
+            for spec, schema in zip(
+                self.annotations.specs, self.embodiment_schemas, strict=True
+            ):
+                try:
+                    required_state = _reorder_output_dim(schema.state_reorder, spec.dim)
+                    required_action = _reorder_output_dim(schema.action_reorder, spec.dim)
+                    if required_state > max_state_dim or required_action > max_action_dim:
+                        raise ValueError(
+                            f"requires state/action {required_state}/{required_action}, "
+                            f"configured {max_state_dim}/{max_action_dim}"
+                        )
+                    validate_wsa15_action_layout(list(schema.action_layout))
+                except ValueError as error:
+                    rejected.append(f"{spec.name}: {error}")
+                else:
+                    compatible_names.append(spec.name)
+
+            if rejected and embodiments is not None:
+                raise ValueError(
+                    "Explicit synthetic embodiments are incompatible with WSA1.5: "
+                    + "; ".join(rejected)
+                )
+            if embodiments is None and rejected:
+                logging.info(
+                    "WSA1.5 excluded incompatible synthetic embodiments: %s",
+                    "; ".join(rejected),
+                )
+                if not compatible_names:
+                    raise ValueError("No WSA1.5-compatible synthetic embodiments were discovered")
+                self.annotations = SyntheticActionTable.from_parquet(
+                    annotation_path,
+                    compatible_names,
+                    row_group_cache_size=row_group_cache_size,
+                )
+                self.embodiment_schemas = load_embodiment_schemas(
+                    self.annotations.specs, schema_prefix
+                )
         self.embodiment_stats = load_embodiment_stats(stats_dir, self.annotations.specs)
 
         required_state_dim = max(
             _reorder_output_dim(schema.state_reorder, spec.dim)
-            for spec, schema in zip(self.annotations.specs, self.embodiment_schemas)
+            for spec, schema in zip(
+                self.annotations.specs, self.embodiment_schemas, strict=True
+            )
         )
         required_action_dim = max(
             _reorder_output_dim(schema.action_reorder, spec.dim)
-            for spec, schema in zip(self.annotations.specs, self.embodiment_schemas)
+            for spec, schema in zip(
+                self.annotations.specs, self.embodiment_schemas, strict=True
+            )
         )
         if required_state_dim > max_state_dim or required_action_dim > max_action_dim:
             raise ValueError(
@@ -362,7 +416,7 @@ class SyntheticEmbodimentDataset(Dataset):
                 f"configured state/action={max_state_dim}/{max_action_dim}"
             )
 
-        self._rows, self._candidate_masks, episodes = _build_streaming_index(
+        self._rows, self._candidate_masks, episodes = _build_valid_frame_index(
             self.annotations,
             chunk_size,
             base_dataset=base_dataset,
@@ -424,7 +478,9 @@ class SyntheticEmbodimentDataset(Dataset):
                 ]
             self._pose_transforms = []
             self._transforms = []
-            for spec, schema in zip(self.annotations.specs, self.embodiment_schemas):
+            for spec, schema in zip(
+                self.annotations.specs, self.embodiment_schemas, strict=True
+            ):
                 stats = self.embodiment_stats[spec.name]
                 body_meta = SyntheticDatasetMetadataView(
                     base_dataset.meta,
@@ -524,7 +580,7 @@ class SyntheticEmbodimentDataset(Dataset):
         )
         sample["task"] = (
             f"Current robot embodiment: {spec.name}; task: {sample['task']}; "
-            # f"action layout: {layout}"
+            f"action layout: {layout}"
         )
         sample["synthetic_embodiment"] = spec.name
         sample = self._transforms[body_id](sample)
@@ -537,7 +593,7 @@ def discover_embodiments(
     parquet: pq.ParquetFile,
     embodiments: Sequence[str] | None = None,
 ) -> tuple[EmbodimentSpec, ...]:
-    """Discover ``action.<name>`` and paired ``_valid`` fields."""
+    """Discover robot actions plus the optional native human EEF representation."""
     schema = parquet.schema_arrow
     field_names = set(schema.names)
     discovered = sorted(
@@ -704,13 +760,15 @@ def _row_group_valid_matrix(
     table: pa.Table,
     specs: Sequence[EmbodimentSpec],
 ) -> np.ndarray:
-    columns = []
-    for spec in specs:
-        body_valid = np.logical_and.reduce(
-            [_scalar_column_to_numpy(table[key], np.bool_) for key in spec.valid_keys]
-        )
-        columns.append(body_valid)
-    return np.stack(columns, axis=-1)
+    return np.stack(
+        [
+            np.logical_and.reduce(
+                [_scalar_column_to_numpy(table[key], np.bool_) for key in spec.valid_keys]
+            )
+            for spec in specs
+        ],
+        axis=-1,
+    )
 
 
 def _validate_stream_rows(
@@ -758,7 +816,11 @@ def _scan_candidate_masks(
         )
 
     masks = np.zeros(len(table), dtype=_candidate_mask_dtype(len(table.specs)))
-    valid_keys = list(dict.fromkeys(key for spec in table.specs for key in spec.valid_keys))
+    valid_keys = list(
+        dict.fromkeys(
+            key for spec in table.specs for key in spec.valid_keys
+        )
+    )
     columns = ["index", "episode_index", "frame_index", *valid_keys]
     tail_episode = np.empty(0, dtype=np.int64)
     tail_frame = np.empty(0, dtype=np.int64)
@@ -845,7 +907,7 @@ def _episodes_from_candidate_masks(
         boundaries = np.flatnonzero(np.diff(eligible_episodes) != 0) + 1
         run_starts = np.concatenate(([0], boundaries))
         run_stops = np.concatenate((boundaries, [len(eligible_episodes)]))
-        for run_start, run_stop in zip(run_starts, run_stops):
+        for run_start, run_stop in zip(run_starts, run_stops, strict=True):
             episode = int(eligible_episodes[run_start])
             count = int(run_stop - run_start)
             if current_episode == episode:
@@ -865,12 +927,18 @@ def _episodes_from_candidate_masks(
     }
 
 
-def _build_streaming_index(
+def _build_valid_frame_index(
     table: SyntheticActionTable,
     chunk_size: int,
     *,
     base_dataset=None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, list[int]]]:
+    """Index eligible anchors and their valid embodiment choices by source row.
+
+    Only metadata and validity columns are scanned during construction; action
+    vectors are read lazily for the representation chosen by ``__getitem__``.
+    """
+
     full_masks = _scan_candidate_masks(table, chunk_size, base_dataset=base_dataset)
     episodes = _episodes_from_candidate_masks(table, full_masks)
     eligible_count = int(np.count_nonzero(full_masks))
@@ -898,7 +966,7 @@ def _build_candidate_masks(table: SyntheticActionTable, chunk_size: int) -> np.n
     ends = np.concatenate((boundaries, [len(table.indices)]))
     window = chunk_size + 1
 
-    for start, end in zip(starts, ends):
+    for start, end in zip(starts, ends, strict=True):
         if end - start < window:
             continue
         for body_id, body_valid in enumerate(table.valid):
@@ -941,7 +1009,7 @@ def _validate_annotation_rows(
     segment_episodes = episode_indices[starts]
     if len(np.unique(segment_episodes)) != len(segment_episodes):
         raise ValueError(f"Episode rows must be contiguous: {path}")
-    for start, end in zip(starts, ends):
+    for start, end in zip(starts, ends, strict=True):
         if not np.array_equal(np.diff(frame_indices[start:end]), np.ones(end - start - 1, dtype=np.int64)):
             raise ValueError(f"Frame indices must be contiguous within every episode: {path}")
 

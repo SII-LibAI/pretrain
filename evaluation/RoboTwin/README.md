@@ -32,7 +32,7 @@ Arguments:
 
 ## Multi-GPU and resumable evaluation
 
-Run one independent RoboTwin task per GPU:
+By default, run one independent RoboTwin task per GPU:
 
 ```bash
 
@@ -73,6 +73,25 @@ episode from 1 through the requested count. Completed tasks are skipped when
 the same command is run again. An interrupted, partially completed task is
 restarted, while completed tasks are preserved. Set `FORCE_RERUN=true` to
 evaluate every requested task again.
+
+To run multiple independent evaluation jobs on each GPU, set
+`JOBS_PER_GPU`. For example, the following starts two workers on every GPU,
+for a total of 16 workers:
+
+```bash
+JOBS_PER_GPU=2 \
+GPUS=0,1,2,3,4,5,6,7 \
+bash evaluation/RoboTwin/eval_ngpu.sh \
+  /path/to/checkpoint/pretrained_model \
+  outputs/robotwin/my_run \
+  demo_randomized \
+  0 49 100
+```
+
+Every worker loads an independent model and simulator process. Therefore,
+`JOBS_PER_GPU=2` uses roughly twice the model/runtime GPU memory of the default.
+The task queue, output directories, logs, and resume markers remain unique per
+task. Start with two jobs per GPU and increase it only if memory remains safe.
 
 Select a policy with the `POLICY_TYPE` environment variable:
 

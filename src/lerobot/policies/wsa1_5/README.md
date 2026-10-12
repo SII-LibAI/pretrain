@@ -1,327 +1,412 @@
-# WSA1.5 模型架构与接口说明
+# WSA1.5 数据流说明
 
-本文对应 `src/lerobot/policies/wsa1_5` 的当前实现，以实际代码路径为准，供模型结构和数据接口审阅。
+本文说明当前 WSA1.5 的 LeRobotV3 数据入口、机器人/人类数据分流、补充标注格式、有效帧规则以及最终监督字段。当前阶段只整理数据流；`policy` 的网络实现不属于本次改动。
 
-## 1. 设计依据与结论
+## 0. 如何阅读代码
 
-WSA1.5 保留 InternVLA-A1.5 的 LeRobot Policy 接口，内部参考三部分实现：
+建议从单个样本开始，再看多数据集训练。阅读顺序如下；先跟随表中的入口函数，遇到具体数据问题时再进入底层辅助函数。
 
-- [Qwen-RobotManip 技术报告](https://arxiv.org/abs/2606.17846)及[官方代码](https://github.com/QwenLM/Qwen-RobotManip)：采用“不同本体写入固定语义位置 + 逐维有效掩码”的原则，而不是按原始维度做尾部 padding。本项目根据自己的本体改成 32 维，不照搬其 80 维表。
-- [WSA 技术报告](https://arxiv.org/abs/2607.03941)及[官方代码](https://github.com/zaleni/WSA)：参考 WSA-B 的理解/规划/动作三专家结构，以及 WSA-L 的未来视频和 Future-3D query 设计。
-- 本仓库 `internvla_a1_5`：复用 Qwen3.5-2B 多模态上下文、WAN2.2 世界解码器、flow-matching 动作生成和已有 Policy API。
-
-当前有两个明确边界：
-
-1. memory 机制暂时留空。代码会移除 `language_memory`，不把未定义的记忆内容送入模型。
-2. 当前数据只有 `motion_mask` 和 `motion_mask_ids`，没有 WSA-L 的 DA3 多层 3D teacher 特征。因此目前是两组 query 联合条件化 WAN，而不是完整复刻 WSA-L 的独立 3D 蒸馏头。
-
-## 2. 总体模型架构
-
-```text
-当前多视角 RGB + 任务指令
-             |
-             v
- Qwen3.5-2B 多模态上下文专家 ---- context tokens [B,L,Hq]
-             |                              |
-             | full-attention 层联合 Q/K/V  |
-             |                              |
-  +----------+-------------------+----------+
-  |                              |          |
-  v                              v          v
-规划专家（全深度）                 动作专家（全深度）
-[16 subtask queries]             [2 state tokens]
-[64 future-2D queries]           [2T noisy-action tokens + time]
-[144 future-3D queries]                    |
-  |              |                         v
-  |              |                 flow velocity [B,T,32]
-  |              |
-  |              +--> 208 future outputs --> 分支适配器 --> WAN2.2
-  |                                                     |
-  v                                                     v
-subtask logits [B,16,V]                 motion canvas [B,Tv,3,224,448]
-```
-
-### 2.1 三个专家
-
-- **上下文专家**：预训练 Qwen3.5-2B，编码当前图像和任务文本；视觉编码使用 Qwen3.5-2B 自身的多模态视觉路径。
-- **规划专家**：与 action expert 同配置、同层数的 `Qwen3_5TextModel`，拥有独立 Transformer 参数。它没有词嵌入层，直接接收可学习 query。
-- **动作专家**：复用 InternVLA-A1.5 action expert 骨干，输入当前状态、带噪动作和 flow 时间。
-
-在 Qwen3.5 的 `full_attention` 层，三个专家的 Q/K/V 会拼接后按显式依赖图联合计算。`linear_attention` 层具有各自的递归状态，三个分支分别计算，并在下一个 full-attention 层再次交换信息。这是全深度 Mixture-of-Transformers，不是在 Qwen 后附加两层浅 Transformer。
-
-### 2.2 token 序列和默认长度
-
-```text
-context : [image/text context]
-planning: [subtask x16 | future-2D x64 | future-3D x144]
-action  : [left state | right state | (t0,left) | (t0,right) | ...]
-```
-
-默认动作 horizon `T=50`，action branch 长度为 `2 + 2T = 102`。planning branch 长度为 `16 + 64 + 144 = 224`，其中送给 WAN 的未来 query 为 `64 + 144 = 208`。
-
-## 3. 32 维跨本体状态/动作空间
-
-### 3.1 固定语义槽位
-
-平坦向量为 `[left 16 | right 16]`，左右完全对称。左右夹爪均为 2 维，EEF 朝向均使用数据中的 `xyzw` 四元数。
-
-| 索引（左闭右开） | 维数 | 语义 |
-|---|---:|---|
-| `[0,7)` | 7 | 左臂关节 |
-| `[7,10)` | 3 | 左 EEF `xyz` |
-| `[10,14)` | 4 | 左 EEF 四元数 `xyzw` |
-| `[14,16)` | 2 | 左夹爪 |
-| `[16,23)` | 7 | 右臂关节 |
-| `[23,26)` | 3 | 右 EEF `xyz` |
-| `[26,30)` | 4 | 右 EEF 四元数 `xyzw` |
-| `[30,32)` | 2 | 右夹爪 |
-
-不再保留灵巧手槽位、reserved 槽位或隐式扩展区。schema 中出现 `hand` 语义块会直接报错，避免手指维度被静默截断或误映射。
-
-### 3.2 数值语义
-
-- 关节和夹爪状态是当前绝对值；关节和夹爪动作是未来绝对目标。
-- EEF 状态是当前绝对 `xyz + quaternion_xyzw`。四元数会归一化，并统一到 `w >= 0` 的半球，减少 `q` 和 `-q` 双覆盖造成的不连续。
-- EEF 动作是相对当前状态的 `delta_xyz + delta_quaternion_xyzw`。编码使用 `R_delta = R_target @ R_current.T`，解码使用 `R_target = R_delta @ R_current`。
-- 有 `observation.camera_extrinsics` 时，EEF delta 转到参考相机坐标系；无标定时退化为基座坐标系，并输出 `wsa.camera_frame_valid=false`。
-
-### 3.3 语义映射不是 padding
-
-`CanonicalStateActionTransformFn` 根据 schema 的 `action_layout`、`action_reorder` 和 `state_reorder` 把语义块放入固定位置。未使用槽位虽然数值为 0，但 mask 为 `False`，不会进入动作损失。缺失 layout、未知语义或容量超限均直接报错。
-
-| 本体类型 | 映射方式 |
-|---|---|
-| 双 Piper | 每侧 6 个臂关节写入 joint 前 6 维，2 维并联夹爪写入 gripper |
-| 双 Franka | 每侧 7 个臂关节和 2 维夹爪写入对应槽位 |
-| Human EEF | 每侧 `xyz + quaternion_xyzw + grasp`；单维 grasp 占夹爪第 1 维，第 2 维无效 |
-| 灵巧手 | 当前不支持，显式报错而非截断或 padding |
-
-数据变换输出：
-
-```text
-wsa.state_valid_mask  bool[32]
-wsa.action_valid_mask bool[32]
-```
-
-模型将 `[B,32]` 状态变成左右两个 16D token，将 `[B,T,32]` 动作变成 `2T` 个 16D token。动作头再做严格逆变换，不会把整个 32D 向量压成一个 token。
-
-## 4. 输入定义
-
-### 4.1 推理输入
-
-| 键 | 形状 | 含义 |
+| 顺序 | 文件与入口 | 需要确认的事情 |
 |---|---|---|
-| `observation.images.pixel_values` | Qwen processor 格式 | 当前时刻多视角 RGB patch |
-| `observation.images.image_grid_thw` | `[Nimg,3]` | Qwen 视觉网格 |
-| `observation.images.input_ids` | `[B,L]` | 图像占位符和当前任务指令 |
-| `observation.images.attention_mask` | `[B,L]` | 上下文有效 token |
-| `observation.state` | `[B,32]` | 规范语义状态 |
-| `wsa.state_valid_mask` | `[B,32]` | 状态有效维 |
-| `wsa.action_valid_mask` | `[B,32]` | 当前本体可输出的动作维 |
+| 1 | [`inspect_wsa1_5_dataflow.py`](../../../../util_scripts/inspect_wsa1_5_dataflow.py)：`main` → `build_dataflow_dataset` → `summarize_sample` | 一个数据集如何创建、一个随机样本最终有哪些字段与 shape |
+| 2 | [`datasets/wsa1_5.py`](../../datasets/wsa1_5.py)：`is_wsa15_human_robot_type` → `resolve_wsa15_delta_timestamps` → `resolve_wsa15_video_key_mapping` | 如何分流 robot/human；哪些时间偏移被查询；逻辑视频键如何找到存储文件 |
+| 3 | 同文件：`wrap_wsa15_dataset` | robot 包装为 `TransformedLeRobotDataset`；human 包装为 `SyntheticEmbodimentDataset` |
+| 4 | [`synthetic_embodiment.py`](../../datasets/synthetic_embodiment.py)：`SyntheticEmbodimentDataset.__init__` → `__getitem__` | human 如何筛选有效窗口、随机选择 EEF/本体、替换 state/action |
+| 5 | [`datasets/wsa1_5.py`](../../datasets/wsa1_5.py)：`build_wsa15_data_transforms` | 所有样本经过哪些转换，以及转换的严格执行顺序 |
+| 6 | 同文件：`CanonicalStateActionTransformFn`、`LoadWSA15PhysicalAnnotationsFn`、`PrepareWSA15MotionTargetsFn` | 动作槽如何填写、subtask 如何按帧匹配、缺失目标如何产生有效位 |
+| 7 | [`factory.py`](../../datasets/factory.py)：`make_dataset` → `_build_single_dataset` → `make_dataloader` | 多数据集如何复用以上链路、合并样本、随机抽帧和组成 batch |
 
-“当前观测”分两路：RGB 进入 Qwen 上下文专家，本体状态进入动作专家；两路在 full-attention 层交互。
+### 0.1 先看两条调用链
 
-### 4.2 memory 当前状态
-
-架构上保留“观测 + 指令 + memory”的扩展位置，但 memory 的数据定义、检索规则、时序编码和训练目标尚未确定。当前实现：
-
-- 不创建静态 memory learnable token；
-- 不读取 `pose.parquet` 并把 pose 串成文本；
-- `WSA15ChatProcessorTransformFn` 删除 `language_memory`，不送入 Qwen。
-
-所以本版真正的 context 是“当前图像 + 当前指令”。memory schema 定稿后可增加独立编码和注意力依赖，而不改变 Policy 外部接口。
-
-### 4.3 训练附加输入
-
-| 键 | 形状 | 含义 |
-|---|---|---|
-| `action` | `[B,T,32]` | 规范动作块，默认 `T=50` |
-| `wsa.subtask_token_ids` | `[B,16]` | 离散子任务 BPE 目标，忽略位为 `-100` |
-| `wsa.subtask_token_mask` | `[B,16]` | 子任务有效位置 |
-| `observation.video_frames` | `[B,Tv,3,224,448]` | 左半 `motion_mask`，右半 `motion_mask_ids` |
-| `world_target_valid` | `[B]` | 是否存在世界监督 |
-| `VQA.labels` | `[B,L]` | 可选 VQA next-token 监督 |
-
-`sidecar.json` 的 `subtask_text` 只构造子任务标签；chat processor 会在处理上下文前移除该字段，防止答案泄漏。
-
-## 5. learnable token 的作用和数量
-
-learnable token 是训练参数，不是预先写好的文本，也不是未来图像像素。它们在每个 batch 中以相同初值出现，通过注意力主动查询当前图像、指令、状态和动作；经过规划专家后，才成为与当前样本相关的规划表示。
-
-| query 组 | 默认数量 | 作用 |
-|---|---:|---|
-| `subtask_queries` | 16 | 固定槽位的离散子任务预测 |
-| `future_2d_queries` | 64 | 2D 物体、区域和跟踪规划瓶颈；数量可看作 `8x8` 容量，但代码不把它硬绑定到像素网格 |
-| `future_3d_queries` | 144 | 3D 变化规划瓶颈；采用 WSA-L 默认的每视角 `144=12x12` query 数 |
-
-总计 224 个 planning token。三组 query 拥有独立参数；2D/3D 还分别使用输入投影 `future_*_in_proj` 和 WAN 条件投影 `future_*_to_world`，不是只在名称上分组。`future_query_init_std` 默认为 `0.02`。
-
-## 6. 2D/3D 未来预测如何生成
-
-### 6.1 WSA-L 原实现的关键机制
-
-WSA-L 的未来视频和未来 3D 是两类不同输出：
-
-- **未来视频**：画面进入 WAN VAE latent 空间。训练时对未来 latent 加噪并做 flow matching，第 1 帧作为固定条件；视频专家处理密集时空 latent token，并非用少量 query 直接回归所有像素。
-- **Future-3D**：默认每视角使用 144 个 3D query。WSA-L 默认 2 个视角，所以共有 288 个；query 在 MoT 中与视频和动作交互，再由 Perceiver 式输出 query 展开成每视角 1296 个特征，对齐 DA3 teacher 的多层 3D 特征，使用 cosine 与 layer-normalized MSE 监督。
-
-因此 learnable query 是检索、压缩未来结构的中间载体，不是视频或 3D 点本身。
-
-### 6.2 本仓库的适配实现
-
-当前世界目标是一张左右拼接的 canvas：
+纯数据审阅入口：
 
 ```text
-left  half: motion_mask      [B,Tv,3,224,224]  # 栅格化 Delta-X/Delta-Y/Delta-Z
-right half: motion_mask_ids  [B,Tv,3,224,224]  # 2D 实例/跟踪 ID 图
-packed    : motion_canvas    [B,Tv,3,224,448]
+launch/wsa1_5_test_dataflow.sh
+  -> inspect_wsa1_5_dataflow.main
+     -> build_dataflow_dataset
+        -> 读取 LeRobotDatasetMetadata
+        -> resolve_wsa15_delta_timestamps / resolve_wsa15_video_key_mapping
+        -> 创建 LeRobotDataset
+        -> build_wsa15_data_transforms
+        -> wrap_wsa15_dataset
+     -> 随机有效 sample
+     -> summarize_sample
 ```
 
-默认 `num_video_frames=4`，再加第 0 条件帧，因此 `Tv=5`。数据变换把第 0 帧设为空白固定条件，未来帧由 WAN 在 VAE latent 空间做 flow denoising 后解码。
+训练入口：
 
 ```text
-64 learnable 2D queries ---+
-                            +--> planning expert --> [B,208,H]
-144 learnable 3D queries --+             |
-                                         v
-                              2D/3D 独立 world adapter
-                                         |
-                                         v
-                               WAN cross-attention context
-                                         |
-                  noisy future VAE latent + fixed condition frame
-                                         |
-                                         v
-                         flow denoising --> VAE decode --> canvas
+factory.make_dataset
+  -> 每个 repo: _build_single_dataset
+     -> 同一套时间查询 / 视频映射 / wrap_wsa15_dataset
+     -> 同一套 build_wsa15_data_transforms
+        + 文本与图像 processor
+        + UnifyWSA15InputsFn
+  -> 多 repo: MultiLeRobotDataset
+  -> make_dataloader
+  -> batch
 ```
 
-2D query 的设计目标是汇总物体身份、区域和像平面运动；3D query 的设计目标是汇总动作条件下的未来 `Delta-XYZ`。当前代码已经分离两组 query 的参数、投影和注意力路径，但最终仍由同一个 WAN 联合生成左右 canvas，像素损失也是联合的。因此“2D query 只决定右半、3D query 只决定左半”目前不是硬约束。后续若加入 DA3 teacher，应再增加独立 Future-3D 蒸馏头。
+共享的基础转换与来源包装都定义在 `datasets/wsa1_5.py`。检查脚本保留解码后的 RGB、原始 subtask 文本和监督有效位；训练配置在这些转换之后添加 tokenizer 和最终 batch 字段整理。
 
-## 7. 显式注意力依赖
+### 0.2 区分“创建数据集”和“取一个样本”
 
-| Query 组 | 允许读取的 Key 组 |
+这两部分职责不同，阅读时不要把它们混在一起：
+
+- **创建时**：读 metadata，建立时间查询，扫描 human validity，加载 schema/stats，并调用各 transform 的 `hydrate(dataset)`，将数据源配置绑定到转换器。
+- **取样时**：`__getitem__` 获取当前帧和动作目标；human 随机选择一种有效动作表示；随后依次执行各 transform 的 `__call__(sample)`。
+
+`TransformedLeRobotDataset.from_base` 在创建时 hydrate，`TransformedLeRobotDataset.__getitem__` 在取样时执行转换。Human 则在创建时为每种动作表示分别 hydrate，在取样时执行所选表示的转换链。
+
+### 0.3 Human 分支需要继续往下读的函数
+
+在 `synthetic_embodiment.py` 中按以下依赖继续读：
+
+```text
+SyntheticEmbodimentDataset.__init__
+  -> SyntheticActionTable.from_parquet
+     -> discover_embodiments            # 找本体动作列和 human_eef 原生列
+  -> load_embodiment_schemas / load_embodiment_stats
+  -> _build_valid_frame_index
+     -> _scan_candidate_masks           # 校验对齐、跨 episode、完整有效窗口
+  -> 为每个本体 hydrate transforms
+
+SyntheticEmbodimentDataset.__getitem__
+  -> _rows[idx]                          # dataset 序号映射到源数据行
+  -> 当前帧的 candidate embodiments
+  -> 随机选择 body_id
+  -> SyntheticActionTable.read_values    # 只读取所选表示的 t..t+H
+  -> 当前 image，state=q[t]，action=q[t+1:t+H+1]
+  -> 所选表示的 transforms
+```
+
+`_rows` 保存有效源帧；`_candidate_masks` 保存每帧可选动作表示的位集合。读取训练数据时只扫描索引/valid 列来建索引，动作向量在真正取样时按 parquet row group 读取。
+
+### 0.4 跟踪一个样本时看哪些值
+
+以 human `franka` 为例，先观察 `index/episode_index/frame_index` 与 `synthetic_embodiment`，再观察 schema 的 `action_reorder` 和 `action_layout`。其原始 18D 双臂动作会写入左右 joint/gripper 槽，得到 `[H,32]`，EEF 空槽的 `wsa.action_valid_mask` 为 false。
+
+随后确认 subtask valid 与两组 motion valid，最后检查 batch 是否仍有这些有效位。归一化的数学细节集中在 `CanonicalStateActionTransformFn.__call__`；最初阅读只需掌握“原始值 → schema 重排/归一化 → 固定语义槽 + mask”即可。
+
+当前监督来自 subtask 与两个 motion 视频流，已移除单独的 pose 读取模块。原始数据中的 `pose.parquet` 可以保留，它不参与这条加载链路。
+
+## 1. 训练样本契约
+
+每个样本必须提供：
+
+| 用途 | 字段 | 是否必需 | 说明 |
+|---|---|---:|---|
+| 输入 | 当前 RGB image | 是 | 由 source schema 的 `image_mapping` 映射 |
+| 输入 | `observation.state` | 是 | robot 来自主 parquet；human 由补充动作表示在时刻 `t` 的值替换 |
+| 监督 | `action` | 是 | robot 来自主 parquet；human 来自补充 `action.parquet` |
+| 监督 | subtask | 否 | 来自 `meta/sidecar.json`；缺失时关闭 subtask loss |
+| 监督 | `motion_mask` | 否 | 未来 2D 图；缺失时关闭该 loss |
+| 监督 | `motion_mask_ids` | 否 | 未来 3D/ID 图；缺失时关闭该 loss |
+
+LeRobotV3 原生的 image、state、action 是数据集必须项。subtask、`motion_mask` 和 `motion_mask_ids` 是补充标注，三者分别带独立有效位，互不依赖。
+
+数据层不会因为某个可选标注缺失而伪造有效目标，也不会用最后一帧填满未来监督。
+
+## 2. 数据源分类
+
+唯一分类依据是 `meta/info.json` 中的 `robot_type`：
+
+```text
+"ego" in robot_type.lower()  -> human
+其他                            -> robot
+```
+
+入口实现在 `src/lerobot/datasets/wsa1_5.py`：
+
+- `is_wsa15_human_robot_type`
+- `wsa15_source_kind`
+- `resolve_wsa15_delta_timestamps`
+
+`factory.py` 通过 dataset 配置的 `dataflow="wsa1_5"` 启用该规则，不再 import policy 类来识别数据流。
+
+## 3. 两条基础加载路径
+
+### 3.1 Robot：标准 LeRobotV3
+
+机器人数据完全使用标准 `LeRobotDataset`：
+
+```text
+主 parquet: observation.state[t]
+主 parquet: action[t : t + H]
+当前 RGB:   image[t]
+```
+
+其中 `H=chunk_size`。动作查询索引为 `0..H-1`，因此 action tensor 为 `[H, D_raw]`。
+
+如果 `action_mode=delta`，是否求差以及哪些维度保持绝对量，只由该 `robot_type` 的 dataset schema 中 `action_mask_spec` 决定。数据层不会根据字段名自行转换 EEF，也不会把四元数改成欧拉角或旋转向量。
+
+### 3.2 Human：LeRobotV3 媒体 + 补充动作表
+
+人类数据仍用标准 `LeRobotDataset` 解码当前 RGB、索引和可选 motion 视频，但不使用主 parquet 中的 state/action 数值。`SyntheticEmbodimentDataset` 从配置指定的补充动作表读取：
+
+```text
+state  = q[t]
+action = q[t+1 : t+H+1]
+```
+
+默认补充动作路径为：
+
+```text
+meta/annotations/action.parquet
+```
+
+demo 使用的是这个路径。若实际数据放在 `meta/action.parquet`，必须显式设置：
+
+```text
+dataset.human_action_file=meta/action.parquet
+```
+
+代码不进行第二路径猜测，避免误读旧文件。
+
+## 4. Human 补充动作格式
+
+### 4.1 本体合成动作
+
+每种本体由一对列描述：
+
+```text
+action.<embodiment>        fixed-size vector [D]
+action.<embodiment>_valid  bool
+```
+
+动作表还必须包含逐行对齐字段：
+
+```text
+index
+episode_index
+frame_index
+```
+
+加载器会校验这些索引与 LeRobotV3 主数据逐行一致。
+
+### 4.2 原生 human EEF 动作
+
+`human_eef` 不是从 `pose.parquet` 推导，而是只从 action parquet 的以下列读取：
+
+```text
+human_eef.right.pos       [3]
+human_eef.right.rot       [4], quaternion xyzw
+human_eef.right.grasp     [1]
+human_eef.right.valid     bool
+human_eef.left.pos        [3]
+human_eef.left.rot        [4], quaternion xyzw
+human_eef.left.grasp      [1]
+human_eef.left.valid      bool
+```
+
+左右两侧都有效时该帧的 `human_eef` 才有效。任意一列出现但格式不完整会直接报错；不会退化成其它表示。
+
+## 5. 有效帧与随机抽样
+
+对 human 数据，anchor `t` 只有满足以下条件才进入 dataset 索引：
+
+1. `t..t+H` 位于同一 episode；
+2. `frame_index` 连续；
+3. 至少一种动作表示在整个 `t..t+H` 窗口全部有效。
+
+因此无效 anchor 在构建索引时就被移除，不进入 loss。`__getitem__` 会在当前 anchor 的所有有效动作表示中随机选择一种：可以是 `human_eef`，也可以是某个合成本体。
+
+训练时 `DataLoader(shuffle=True)` 再从全部有效 anchor 中随机取帧。两层随机性的含义不同：
+
+- shuffle 随机选择有效时间帧；
+- dataset 随机选择该帧使用的有效 EEF/本体动作表示。
+
+## 6. dataset schema 的职责
+
+source schema 描述原始相机字段；具体动作表示的 schema 描述动作语义。Human 在随机选择动作表示后，会使用对应的 `egodex_synthetic_*` 或 `egoverse_synthetic_*` schema。
+
+| schema 字段 | 职责 |
 |---|---|
-| context | context，保持 Qwen 因果掩码 |
-| subtask | context + subtask |
-| future 2D | context + subtask + future 2D + future 3D |
-| future 3D | context + subtask + future 3D + action |
-| state | context + subtask + future 3D + state |
-| action | context + subtask + future 3D + state + action |
+| `feature_mapping` | 将原始 state/action 字段组合为标准字段 |
+| `image_mapping` | 将真实相机名映射到统一图像槽 |
+| `action_mask_spec` | `delta` 模式下决定哪些维求差、哪些维保持 absolute |
+| `state_reorder` / `action_reorder` | 从数据原始顺序重排到语义顺序 |
+| `action_layout` | 将各语义块写入固定动作槽 |
 
-子任务作为高层规划条件；2D 可以查询 3D；3D 与动作双向交换；动作不直接读取 future-2D；context 不读取未来或动作 token，防止目标反向泄漏。`knowledge_insulation=true` 时，规划/动作分支读到的 context K/V 会 `detach`。
+### 6.1 WSA1.5 的 32D 语义槽
 
-## 8. 输出与损失
+WSA1.5 不按原始向量长度做尾部 padding，而是写入固定语义位置：
 
-### 8.1 离散子任务
-
-16 个 subtask 输出经 `subtask_to_qwen` 对齐到 Qwen hidden size，再复用 Qwen `lm_head`：
-
-```text
-subtask_logits [B,16,vocab_size]
-```
-
-这是固定槽位的并行离散预测，不是自回归文本生成。
-
-### 8.2 动作 flow matching
-
-```text
-x_t = t * noise + (1-t) * action
-target_velocity    = noise - action
-predicted_velocity = model(...)             # [B,T,32]
-```
-
-flow MSE 只在 `wsa.action_valid_mask=True` 且属于机器人样本的维度上聚合。推理从高斯噪声开始，默认用 10 步 Euler 从 `t=1` 积分到 `t=0`，再由 codec 逆映射回环境的原始动作顺序和维度。EEF 路径结合当前位姿，把相对 `xyz + quaternion` 恢复成未来绝对位姿。
-
-### 8.3 总损失
-
-```text
-L = L_action
-  + lambda_vqa * L_vqa
-  + subtask_loss_weight * L_subtask
-  + video_loss_weight * L_world
-```
-
-- `L_action`：有效动作维的 flow-matching MSE。
-- `L_vqa`：可选 Qwen next-token CE。
-- `L_subtask`：有效子任务槽位的 CE。
-- `L_world`：仅对 `world_target_valid=True` 的样本计算 WAN flow-matching loss。
-
-## 9. Policy 公共接口
-
-| 方法 | 返回值 |
+| 范围 | 语义 |
 |---|---|
-| `select_action(batch)` | 单步原始本体动作 `[B,Draw]`，使用 action queue |
-| `predict_action_chunk(batch)` | 原始本体动作块 `[B,T,Draw]` |
-| `predict_action_chunk_with_video(batch, steps)` | `(actions, motion_canvas)` |
-| `predict_action_chunk_with_world(batch, steps)` | `(actions, world_dict)` |
-| `forward(batch)` | `(total_loss, loss_dict)` |
+| `[0,7)` | left arm joints |
+| `[7,10)` | left EEF xyz |
+| `[10,14)` | left EEF quaternion xyzw |
+| `[14,16)` | left gripper，最多 2D |
+| `[16,23)` | right arm joints |
+| `[23,26)` | right EEF xyz |
+| `[26,30)` | right EEF quaternion xyzw |
+| `[30,32)` | right gripper，最多 2D |
 
-`world_dict` 内容：
-
-```text
-subtask_token_ids [B,16]
-subtask_logits    [B,16,V]
-future_2d_queries [B,64,H]
-future_3d_queries [B,144,H]
-motion_mask       [B,Tv,3,224,224]
-motion_mask_ids   [B,Tv,3,224,224]
-motion_canvas     [B,Tv,3,224,448]
-```
-
-## 10. 数据处理顺序
+输出同时包含：
 
 ```text
-PrepareWSA15MotionTargetsFn
--> Resize/remap current RGB
--> Compose raw state/action fields
--> CanonicalStateActionTransformFn (semantic 32D + masks + inverse codec)
--> LoadWSA15PhysicalAnnotationsFn (subtask only; memory remains empty)
--> WSA15ChatProcessorTransformFn (Qwen context + fixed subtask labels)
--> UnifyWSA15InputsFn
+wsa.state_valid_mask       [32]
+wsa.action_valid_mask      [32]
+wsa.action_decode_matrix   [32, 32]
+wsa.action_decode_bias     [32]
+wsa.action_raw_dim         scalar
 ```
 
-主路径不再使用通用 `PadStateAndActionTransformFn`，也不运行产生 gap padding 的通用 reorder。关节绝对/EEF 相对的混合语义由专用 codec 实现，因此不再叠加通用 `DeltaActionTransformFn`。
+空槽永远不会作为有效动作监督。灵巧手 schema 会被 WSA1.5 明确排除，不会静默截断。
 
-## 11. 关键配置
+### 6.2 abs 与 delta
 
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `vlm_model_name_or_path` | Qwen3.5-2B 路径 | 上下文视觉语言主干 |
-| `max_state_dim` | 32 | 固定语义状态维度 |
-| `max_action_dim` | 32 | 固定语义动作维度 |
-| `num_subtask_tokens` | 16 | 子任务 query 数 |
-| `num_future_2d_tokens` | 64 | 未来 2D query 数 |
-| `num_future_3d_tokens` | 144 | 单视角未来 3D query 数 |
-| `future_query_init_std` | 0.02 | 2D/3D query 初始化标准差 |
-| `chunk_size` | 50 | 动作 horizon |
-| `num_inference_steps` | 10 | 动作 Euler 步数 |
-| `num_video_frames` | 4 | 未来帧数；world tensor 另含第 0 条件帧 |
-| `subtask_loss_weight` | 1.0 | 子任务 CE 权重 |
-| `video_loss_weight` | 1.0 | 世界损失权重 |
-| `lambda_vqa` | 1.0 | VQA 权重 |
+模型只有 `abs` 和 `delta` 两种数据策略：
 
-`num_learnable_tokens` 自动设为 `64 + 144 = 208`，用于兼容 InternVLA-A1.5 的 WAN 构造接口；模型中已用显式 `future_2d_queries` 和 `future_3d_queries` 替代父类未分类的 query bank。
+- `abs`：不运行 `DeltaActionTransformFn`；
+- `delta`：运行该 transform，并严格服从 schema 的 `action_mask_spec`。
 
-## 12. 代码位置
+例如单臂 7D EEF schema 可以声明 `[-7]`，表示 7 个值都保留原始 absolute 定义。双手 EEF 加夹爪是 16D，因此当前 human schema 使用 `[-16]`。固定槽编码只负责映射、归一化和生成 mask，不负责改变 EEF 的物理定义。
 
-| 文件 | 责任 |
-|---|---|
-| `configuration_wsa1_5.py` | Policy/Dataset 配置和 transform pipeline |
-| `modeling_wsa1_5.py` | 三专家模型、query 头、flow 动作和 Policy API |
-| `mot.py` | 全深度三专家逐层执行 |
-| `attention.py` | 可独立测试的显式注意力依赖图 |
-| `transform_wsa1_5.py` | Qwen context processor 和子任务标签 |
-| `../../datasets/wsa1_5.py` | 32D codec、sidecar 子任务、世界标注和 batch schema |
+## 7. 可选 subtask 标注
 
-`attention.py` 已放入 `policies/wsa1_5/` 包内，不再在 `src/lerobot/` 根目录放 WSA1.5 专用文件。
+默认从 `meta/sidecar.json` 读取，接受顶层 episode 列表或：
 
-## 13. 当前限制
+```json
+{
+  "episodes": [
+    {
+      "episode_index": 0,
+      "task_instruction": "fold the cloth",
+      "subtasks": [
+        {
+          "start_frame": 0,
+          "end_frame": 40,
+          "subtask_text": "pick up the left corner"
+        }
+      ]
+    }
+  ]
+}
+```
 
-1. memory 是空扩展点，当前没有记忆检索、记忆 token 或时序记忆损失。
-2. EEF camera-frame delta 在没有外参时退化到 base frame；若要求严格相机系，应设置 `require_camera_calibration=True`。
-3. 2D/3D query 当前联合条件化一个 WAN，没有分开的像素损失，也没有 WSA-L 的 DA3 多层 3D 蒸馏。
-4. 灵巧手 schema 当前不支持；需要时必须设计新的显式槽位，不能借用保留维。
-   使用 `synthetic_embodiment` 时应通过 `dataset.embodiments` 排除
-   `piper_inspire`、`ur7e_wuji` 等灵巧手本体，否则 codec 会在加载样本时明确报错。
-5. 旧版浅层 `mot.*`、80D 动作头和旧 query bank 参数与本结构不兼容。Qwen3.5 和 WAN 仍按 InternVLA-A1.5 路径加载，新规划专家、query 和 32D 动作头需要重新训练。
-6. `inference_backend=optimized` 和 `compile_model=True` 对三专家路径会明确报错，避免静默退化为旧 action-only 语义。
+当前帧位于闭区间 `[start_frame, end_frame]` 时输出：
+
+```text
+wsa.subtask_text   string
+wsa.subtask_valid  bool
+```
+
+进入 tokenizer 后，policy-facing batch 使用固定长度的 `wsa.subtask_token_ids` 和 `wsa.subtask_token_mask`。没有 sidecar 或当前帧没有 subtask 时，valid 为 false，不计算 subtask loss。
+
+## 8. 未来 2D/3D 图
+
+补充视频字段仍登记在 LeRobotV3 的 `meta/info.json` features 中：
+
+```text
+observation.motion_mask
+observation.motion_mask_ids
+```
+
+EgoDex demo 的逻辑 feature 名带 `observation.`，而 episode 列和视频目录使用 `motion_mask` / `motion_mask_ids`。数据流会对这两组已声明名称建立显式映射；标准 LeRobot 的逻辑名与存储名相同时不映射。除此之外不猜测第三种路径。
+
+当前 RGB 只查询 `t`。未来目标在 action horizon 内均匀查询。默认 `H=50`、`F=4` 时偏移为：
+
+```text
+[12, 25, 37, 50]
+```
+
+输出为：
+
+| 字段 | shape | 插值 | 无标注时 |
+|---|---|---|---|
+| `wsa.future_motion_mask` | `[F,3,224,224]` | bilinear | 值为 `-1`，valid=false |
+| `wsa.future_motion_mask_ids` | `[F,3,224,224]` | nearest | 值为 `-1`，valid=false |
+| `wsa.future_motion_mask_valid` | scalar bool | - | false |
+| `wsa.future_motion_mask_ids_valid` | scalar bool | - | false |
+
+目标像素从 `[0,1]` 变换到 `[-1,1]`。两种目标分别判断是否存在，因此可以只监督其中一种。当前数据流不从 `pose.parquet` 合成这两个目标。
+
+## 9. 归一化统计
+
+robot 数据继续使用 LeRobotV3 metadata 中的统计量。human 的每种动作表示使用独立文件：
+
+```text
+<human_stats_dir>/<embodiment>/stats.json
+```
+
+统计文件包含 `observation.state` 和 `action` 的 mean/std。可用现有脚本计算：
+
+```bash
+python util_scripts/compute_synthetic_embodiment_stats.py \
+  --dataset-roots-file /path/to/human_roots.txt \
+  --output-dir /path/to/human_stats \
+  --chunk-size 50 \
+  --action-mode abs
+```
+
+`chunk-size` 和 `action-mode` 必须与训练一致。Human 数据存在时 `human_stats_dir` 是显式必填项，不会回退到 robot stats。
+
+## 10. 完整执行顺序
+
+```text
+meta/info.json.robot_type
+  |
+  +-- robot
+  |    LeRobotV3 image/state/action
+  |
+  +-- human
+       LeRobotV3 image/index/optional motion
+       -> action.parquet 有效窗口索引
+       -> 随机有效 EEF/本体
+       -> state=q[t], action=q[t+1:t+H+1]
+
+两条路径汇合
+  -> optional Delta（仅 action_mode=delta）
+  -> future motion targets + 独立 valid
+  -> RGB resize/remap
+  -> Compose state/action
+  -> 32D semantic slots + valid/decode metadata
+  -> sidecar task/subtask + valid
+  -> 后续 tokenizer/processor
+```
+
+## 11. 数据流启动脚本
+
+`launch/wsa1_5_test_dataflow.sh` 是纯数据 smoke test，不加载 VLM 或 policy。它会递归发现数据集、按 `robot_type` 分类、随机解码有效帧，并打印 state/action、subtask、未来目标和所有有效位。
+
+```bash
+DATASET_ROOT=/path/to/collection \
+HUMAN_STATS_DIR=/path/to/human_stats \
+ACTION_MODE=abs \
+CHUNK_SIZE=50 \
+NUM_FUTURE_FRAMES=4 \
+bash launch/wsa1_5_test_dataflow.sh
+```
+
+只检查指定数据集和本体：
+
+```bash
+REPO_IDS="robot/task_a human/task_b" \
+HUMAN_EMBODIMENTS="human_eef franka" \
+DATASET_ROOT=/path/to/collection \
+HUMAN_STATS_DIR=/path/to/human_stats \
+bash launch/wsa1_5_test_dataflow.sh
+```
+
+若数据实际位于 `meta/action.parquet`：
+
+```bash
+HUMAN_ACTION_FILE=meta/action.parquet \
+DATASET_ROOT=/path/to/collection \
+HUMAN_STATS_DIR=/path/to/human_stats \
+bash launch/wsa1_5_test_dataflow.sh
+```
+
+对应 Python 入口是 `util_scripts/inspect_wsa1_5_dataflow.py`。
+
+## 12. 关键实现文件
+
+- `src/lerobot/datasets/factory.py`：多数据集创建和 robot/human 分流。
+- `src/lerobot/datasets/wsa1_5.py`：时间查询、可选标注、motion target、固定语义槽。
+- `src/lerobot/datasets/synthetic_embodiment.py`：补充动作表、有效窗口、随机动作表示。
+- `src/lerobot/dataset_schemas/configs/egodex_v.yaml`：EgoDex source/embodiment schema。
+- `src/lerobot/dataset_schemas/configs/egoverse_human_bimanual.yaml`：Egoverse source/embodiment schema。
+- `util_scripts/inspect_wsa1_5_dataflow.py`：纯数据审阅入口。
+- `launch/wsa1_5_test_dataflow.sh`：launch 包装脚本。

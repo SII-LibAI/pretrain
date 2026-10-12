@@ -169,9 +169,9 @@ Egoverse: observation.images.front
 | `piper_inspire` | 40 | right 20 + left 20 | left `[0:20]`, right `[20:40]` |
 | `franka` | 18 | right 9 + left 9 | left `[0:9]`, right `[9:18]` |
 | `arx_l5` | 16 | right 8 + left 8 | left `[0:8]`, right `[8:16]` |
-| `xarm7` | 14 | right 7 + left 7 | left `[0:7]`, gap `[7]`, right `[8:15]` |
-| `rm75` | 14 | right 7 + left 7 | left `[0:7]`, gap `[7]`, right `[8:15]` |
-| `ur7e` | 12 | right 6 + left 6 | left `[0:6]`, gap `[6:8]`, right `[8:14]` |
+| `xarm7` | 14 | right 7 + left 7 | left `[0:7]`, right `[7:14]` |
+| `rm75` | 14 | right 7 + left 7 | left `[0:7]`, right `[7:14]` |
+| `ur7e` | 12 | right 6 + left 6 | left `[0:6]`, right `[6:12]` |
 | `ur7e_wuji` | 52 | right 26 + left 26 | left `[0:26]`, right `[26:52]` |
 
 [`test_source_schemas_share_action_layout_and_reorder`](../tests/test_synthetic_embodiment_dataset.py) 用递增向量检查 EgoDex/Egoverse 的同名本体 mask、layout、state reorder 和 action reorder 是否一致，并检查左半/右半目标位置。
@@ -195,7 +195,7 @@ Egoverse: observation.images.front
 
 - state 统计加入每个有效 anchor 的绝对 `q[t]`；
 - action 统计加入每个 chunk 中实际用于训练的 `H` 个目标；
-- action 先调用仓库原始 `DeltaActionTransformFn`；
+- `--action-mode delta` 时 action 先调用仓库原始 `DeltaActionTransformFn`；`--action-mode abs` 时保持原值；
 - 哪些维做 `q[t+k]-q[t]` 由本体 schema 的 `action_mask_spec` 决定；
 - 负数段保留 `q[t+k]` 绝对值；
 - `human_eef` 使用 `[-16]`，16 维全部保持 absolute；
@@ -203,7 +203,7 @@ Egoverse: observation.images.front
 
 所以统计文件的维度顺序仍是原始右先顺序。这与训练时“先 Normalize、后 Reorder”完全对应。
 
-`--chunk-size` 必须与训练 `CHUNK_SIZE` 相同。否则无效帧附近能够进入统计的 anchor 集合不同，最终 mean/std 也会不同。
+`--action-mode` 和 `--chunk-size` 都必须与训练配置相同。否则动作表示或无效帧附近能够进入统计的 anchor 集合不同，最终 mean/std 会错误。
 
 ### 4.3 多数据源合并统计
 

@@ -1,15 +1,29 @@
-import math
 from pathlib import Path
 from runpy import run_path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from lerobot.dataset_schemas import DatasetSchema
 from lerobot.datasets.wsa1_5 import (
     ACTION_VALID_MASK_KEY,
+    FUTURE_2D_TARGET_KEY,
+    FUTURE_2D_VALID_KEY,
+    FUTURE_3D_TARGET_KEY,
+    FUTURE_3D_VALID_KEY,
+    SUBTASK_TEXT_KEY,
+    SUBTASK_VALID_KEY,
     CanonicalStateActionTransformFn,
+    LoadWSA15PhysicalAnnotationsFn,
+    PrepareWSA15MotionTargetsFn,
     decode_canonical_actions,
+    resolve_wsa15_delta_timestamps,
+    resolve_wsa15_video_key_mapping,
+    wsa15_future_indices,
+    wsa15_source_kind,
 )
+from lerobot.transforms.core import DeltaActionTransformFn
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 # Keep this pure attention-mask unit test runnable in component-only
@@ -17,6 +31,89 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 # normal policy import still uses lerobot.policies.wsa1_5.attention.
 _ATTENTION_MODULE = run_path(str(Path(__file__).parents[1] / "src/lerobot/policies/wsa1_5/attention.py"))
 build_wsa_attention_mask = _ATTENTION_MODULE["build_wsa_attention_mask"]
+
+
+def test_wsa_dataflow_query_plan_separates_robot_and_human_actions() -> None:
+    config = SimpleNamespace(chunk_size=8, num_video_frames=2)
+    metadata = SimpleNamespace(
+        robot_type="egodex_v",
+        fps=10,
+        features={
+            "observation.state": {"dtype": "float32"},
+            "action": {"dtype": "float32"},
+            "observation.image": {"dtype": "video"},
+            "observation.motion_mask": {"dtype": "video"},
+        },
+    )
+
+    assert wsa15_source_kind("egodex_v") == "human"
+    assert wsa15_source_kind("franka") == "robot"
+    assert wsa15_future_indices(8, 2) == [4, 8]
+
+    robot = resolve_wsa15_delta_timestamps(config, metadata, human_source=False)
+    assert robot["action"] == [index / 10 for index in range(8)]
+    assert robot["observation.image"] == [0.0]
+    assert robot["observation.motion_mask"] == [0.4, 0.8]
+
+    human = resolve_wsa15_delta_timestamps(config, metadata, human_source=True)
+    assert "action" not in human
+    assert human["observation.image"] == [0.0]
+    assert human["observation.motion_mask"] == [0.4, 0.8]
+
+
+def test_wsa_supplemental_video_storage_alias_is_explicit() -> None:
+    metadata = SimpleNamespace(
+        features={"observation.motion_mask": {"dtype": "video"}},
+        episodes=[{"videos/motion_mask/chunk_index": 0}],
+    )
+    assert resolve_wsa15_video_key_mapping(metadata) == {
+        "observation.motion_mask": "motion_mask"
+    }
+
+    malformed = SimpleNamespace(
+        features={"observation.motion_mask": {"dtype": "video"}},
+        episodes=[{}],
+    )
+    with pytest.raises(KeyError, match="episode metadata"):
+        resolve_wsa15_video_key_mapping(malformed)
+
+
+def test_optional_motion_targets_have_independent_valid_masks() -> None:
+    transform = PrepareWSA15MotionTargetsFn(num_future_frames=2, height=8, width=8)
+    output = transform(
+        {"observation.motion_mask": torch.rand(2, 3, 4, 4)}
+    )
+
+    assert output[FUTURE_2D_TARGET_KEY].shape == (2, 3, 8, 8)
+    assert output[FUTURE_2D_VALID_KEY]
+    assert output[FUTURE_3D_TARGET_KEY].shape == (2, 3, 8, 8)
+    assert not output[FUTURE_3D_VALID_KEY]
+    assert torch.all(output[FUTURE_3D_TARGET_KEY] == -1)
+
+
+def test_optional_subtask_sidecar_sets_text_and_validity(tmp_path: Path) -> None:
+    sidecar = tmp_path / "meta" / "sidecar.json"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(
+        '{"episodes":[{"episode_index":2,"task_instruction":"fold",'
+        '"subtasks":[{"start_frame":3,"end_frame":5,'
+        '"subtask_text":"pick corner"}]}]}',
+        encoding="utf-8",
+    )
+    transform = LoadWSA15PhysicalAnnotationsFn().hydrate(SimpleNamespace(root=tmp_path))
+
+    annotated = transform(
+        {"episode_index": torch.tensor(2), "frame_index": torch.tensor(4), "task": "old"}
+    )
+    assert annotated[SUBTASK_TEXT_KEY] == "pick corner"
+    assert annotated[SUBTASK_VALID_KEY]
+    assert annotated["task"] == "fold"
+
+    missing = transform(
+        {"episode_index": torch.tensor(2), "frame_index": torch.tensor(8), "task": "old"}
+    )
+    assert missing[SUBTASK_TEXT_KEY] == ""
+    assert not missing[SUBTASK_VALID_KEY]
 
 
 def test_joint_embodiment_uses_semantic_slots_and_round_trips() -> None:
@@ -53,7 +150,7 @@ def test_joint_embodiment_uses_semantic_slots_and_round_trips() -> None:
     torch.testing.assert_close(decoded, raw_action)
 
 
-def test_eef_actions_become_relative_quaternions() -> None:
+def test_eef_actions_are_only_mapped_and_never_pose_converted() -> None:
     layout = [
         {"name": "left_eef_position_absolute", "size": 3},
         {"name": "left_eef_quaternion_xyzw_absolute", "size": 4},
@@ -74,11 +171,11 @@ def test_eef_actions_become_relative_quaternions() -> None:
             torch.tensor([0.8]),
         )
     )
-    z_quarter_turn = torch.tensor([0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)])
+    raw_quaternion = torch.tensor([0.1, -0.2, 0.3, 0.4])
     action = torch.cat(
         (
             torch.tensor([1.1, 2.0, 3.0]),
-            z_quarter_turn,
+            raw_quaternion,
             torch.tensor([0.3]),
             torch.tensor([-1.0, 0.2, 1.0]),
             identity,
@@ -87,16 +184,46 @@ def test_eef_actions_become_relative_quaternions() -> None:
     )[None]
     output = transform({OBS_STATE: state, ACTION: action})
 
-    torch.testing.assert_close(output[ACTION][0, 7:10], torch.tensor([0.1, 0.0, 0.0]))
-    torch.testing.assert_close(output[ACTION][0, 10:14], z_quarter_turn, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(output[ACTION][0, 7:10], action[0, :3])
+    torch.testing.assert_close(output[ACTION][0, 10:14], raw_quaternion)
+    torch.testing.assert_close(output[OBS_STATE][7:14], state[:7])
     assert output[ACTION_VALID_MASK_KEY].sum().item() == 16
     assert not output[ACTION_VALID_MASK_KEY][15]
     assert not output[ACTION_VALID_MASK_KEY][31]
     decoded = decode_canonical_actions(output[ACTION][None], output)[0]
-    torch.testing.assert_close(decoded[..., :3], action[..., :3], atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(decoded[..., 3:7].abs(), action[..., 3:7].abs(), atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(decoded[..., 8:11], action[..., 8:11], atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(decoded[..., 11:15].abs(), action[..., 11:15].abs(), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(decoded, action)
+
+
+def test_schema_delta_mask_is_the_only_abs_delta_authority() -> None:
+    state = torch.arange(8, dtype=torch.float32)
+    action = (state + 10)[None]
+    mapping = {OBS_STATE: [OBS_STATE], ACTION: [ACTION]}
+
+    # A schema mask of [-7] means every EEF dimension remains absolute.
+    eef_schema = DatasetSchema(robot_type="eef", action_mask_spec=[-7])
+    eef_data = DeltaActionTransformFn(mask=eef_schema.action_mask, mapping=mapping)(
+        {OBS_STATE: state[:7].clone(), ACTION: action[:, :7].clone()}
+    )
+    torch.testing.assert_close(eef_data[ACTION], action[:, :7])
+    eef_encoded = CanonicalStateActionTransformFn(
+        action_layout=[
+            {"name": "left_eef_position_absolute", "size": 3},
+            {"name": "left_eef_quaternion_xyzw_absolute", "size": 4},
+        ],
+        robot_type="eef",
+    )(eef_data)
+    torch.testing.assert_close(eef_encoded[ACTION][0, 7:14], action[0, :7])
+    torch.testing.assert_close(
+        decode_canonical_actions(eef_encoded[ACTION][None], eef_encoded)[0], action[:, :7]
+    )
+
+    # Positive mask entries become delta; negative entries stay absolute.
+    joint_schema = DatasetSchema(robot_type="joint", action_mask_spec=[6, -2])
+    joint_data = DeltaActionTransformFn(mask=joint_schema.action_mask, mapping=mapping)(
+        {OBS_STATE: state.clone(), ACTION: action.clone()}
+    )
+    torch.testing.assert_close(joint_data[ACTION][:, :6], torch.full((1, 6), 10.0))
+    torch.testing.assert_close(joint_data[ACTION][:, 6:], action[:, 6:])
 
 
 def test_dexterous_hand_slots_are_rejected() -> None:

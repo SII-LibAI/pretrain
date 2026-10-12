@@ -13,18 +13,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
 import logging
-from pathlib import Path
+import re
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data._utils.collate import default_collate
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.dataset_schemas import get_schema
 from lerobot.datasets.configuration_synthetic_embodiment import (
     SyntheticEmbodimentDatasetConfig,
 )
@@ -32,28 +33,31 @@ from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
 )
-from lerobot.datasets.transforms import ImageTransforms
-from lerobot.datasets.utils import load_json, cast_stats_to_numpy
+from lerobot.datasets.sampler import MultiLeRobotWeightedSampler, MultiMixedWeightedSampler
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.synthetic_embodiment import SyntheticEmbodimentDataset
 from lerobot.datasets.transformed_dataset import (
-    TransformedLeRobotDataset,
-    TransformedStreamingLeRobotDataset,
     MultiLeRobotDataset,
     MultiStreamingLeRobotDataset,
+    TransformedLeRobotDataset,
+    TransformedStreamingLeRobotDataset,
 )
+from lerobot.datasets.transforms import ImageTransforms
+from lerobot.datasets.utils import cast_stats_to_numpy, load_json
 from lerobot.datasets.vqa_dataset import (
-    VQADataset,
-    TransformedVQADataset,
-    MultiVQADataset,
     MixedMultimodalDataset,
+    MultiVQADataset,
+    TransformedVQADataset,
+    VQADataset,
 )
-from lerobot.datasets.sampler import MultiLeRobotWeightedSampler, MultiMixedWeightedSampler
-
-from lerobot.dataset_schemas import get_schema
-
-from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
-from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.datasets.wsa1_5 import (
+    WSA15_DATAFLOW_NAME,
+    is_wsa15_human_robot_type,
+    resolve_wsa15_delta_timestamps,
+    resolve_wsa15_video_key_mapping,
+    wrap_wsa15_dataset,
+)
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_PREFIX, REWARD
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
@@ -93,7 +97,7 @@ def get_rank_and_world_size() -> tuple[int, int]:
     return 0, 1
 
 def find_info_json_path_for_repo(cfg: TrainPipelineConfig, repo_id: str) -> Path | None:
-    if cfg.dataset.root is not None: 
+    if cfg.dataset.root is not None:
         root = Path(cfg.dataset.root)
         return root / repo_id / "meta" / "info.json"
     else:
@@ -272,12 +276,12 @@ def compute_repo_weights(
             scores.append(s)
 
         total = sum(scores)
-        for rid, s in zip(repos, scores):
+        for rid, s in zip(repos, scores, strict=True):
             repo_weights[rid] = budget * (s / total)
 
-    Z = sum(repo_weights.values())
+    total_weight = sum(repo_weights.values())
     for rid in repo_weights:
-        repo_weights[rid] /= Z
+        repo_weights[rid] /= total_weight
 
     return repo_weights
 
@@ -301,11 +305,11 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
-    
+
     schema = get_schema(ds_meta.robot_type)
     action_keys = schema.get_action_keys()
     image_keys = list(schema.image_mapping.keys())
-    
+
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
@@ -315,7 +319,7 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
         elif key in action_keys and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        
+
         if key in image_keys and hasattr(cfg, "image_delta_indices") and cfg.image_delta_indices is not None:
             # WSA1.5 obtains its future world targets from supplemental motion
             # streams; ordinary RGB cameras remain current-observation inputs.
@@ -327,10 +331,17 @@ def resolve_delta_timestamps(
     supplemental_video_keys = getattr(cfg, "supplemental_video_keys", ())
     image_delta_indices = getattr(cfg, "image_delta_indices", None)
     if image_delta_indices is not None:
+        future_image_delta_indices = [index for index in image_delta_indices if index > 0]
         for key in supplemental_video_keys:
             feature = ds_meta.features.get(key)
-            if feature is not None and feature.get("dtype") == "video":
-                delta_timestamps[key] = [index / ds_meta.fps for index in image_delta_indices]
+            if (
+                feature is not None
+                and feature.get("dtype") == "video"
+                and future_image_delta_indices
+            ):
+                delta_timestamps[key] = [
+                    index / ds_meta.fps for index in future_image_delta_indices
+                ]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -338,11 +349,40 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def _apply_dataset_stats_overrides(
+    cfg: TrainPipelineConfig, base_ds, *, include_external: bool = True
+) -> None:
+    """Install requested statistics before transforms capture dataset metadata."""
+
+    if cfg.dataset.use_imagenet_stats:
+        for key in base_ds.meta.camera_keys:
+            for stats_type, stats in IMAGENET_STATS.items():
+                base_ds.meta.stats[key][stats_type] = torch.tensor(
+                    stats, dtype=torch.float32
+                )
+
+    if not include_external or not cfg.dataset.use_external_stats:
+        return
+    if cfg.dataset.external_stats_path is not None:
+        stat_path = Path(cfg.dataset.external_stats_path)
+    else:
+        robot_type = base_ds.meta.robot_type
+        action_mode = cfg.dataset.action_mode
+        stat_path = HF_LEROBOT_HOME / f"stats/{robot_type}/{action_mode}/stats.json"
+    if not stat_path.exists():
+        raise FileNotFoundError(
+            f"use_external_stats=True but no file found at {stat_path}."
+        )
+    ext_stats = cast_stats_to_numpy(load_json(stat_path))
+    logging.info("Using external stats from %s", stat_path)
+    base_ds.meta.stats.update(ext_stats)
+
+
 def _build_single_dataset(
     cfg: TrainPipelineConfig,
     repo_id: str,
     image_transforms,
-    seed_offset: int, 
+    seed_offset: int,
 ):
     """
     Build one dataset (single robot) including:
@@ -360,8 +400,29 @@ def _build_single_dataset(
     """
 
     use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
+    use_wsa15_dataflow = getattr(cfg.dataset, "dataflow", None) == WSA15_DATAFLOW_NAME
+    input_transforms = cfg.dataset.data_transforms.inputs
+    policy_type = getattr(cfg.policy, "type", None)
+    if use_synthetic_embodiments and policy_type in {"wsa1_5", "wsa_pretrain"}:
+        # ``synthetic_embodiment`` is a storage adapter, not a model-specific
+        # batch format.  Use the WSA transforms so regular and synthetic data
+        # reach the policy with exactly the same keys and semantic slots.
+        from lerobot.policies.wsa1_5.configuration_wsa1_5 import (
+            build_wsa15_robot_transforms,
+        )
+
+        input_transforms = build_wsa15_robot_transforms(
+            action_mode=cfg.dataset.action_mode,
+            max_prompt_length=cfg.dataset.max_prompt_length,
+            mode=cfg.dataset.mode,
+            chunk_size=cfg.policy.chunk_size,
+            num_video_frames=cfg.policy.num_video_frames,
+            video_height=cfg.policy.video_height,
+            video_width=cfg.policy.video_width,
+            num_subtask_tokens=cfg.policy.num_subtask_tokens,
+        ).inputs
     dataset_root = cfg.dataset.root
-    if use_synthetic_embodiments:
+    if use_synthetic_embodiments or (use_wsa15_dataflow and cfg.dataset.root is not None):
         dataset_root = Path(cfg.dataset.root) / repo_id
 
     # Load metadata + determine delta timestamps
@@ -370,31 +431,51 @@ def _build_single_dataset(
         root=dataset_root,
         revision=cfg.dataset.revision,
     )
-    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    use_human_actions = use_wsa15_dataflow and is_wsa15_human_robot_type(
+        ds_meta.robot_type
+    )
+    if use_wsa15_dataflow:
+        logging.info(
+            "[wsa1_5] repo_id=%s robot_type=%s source=%s",
+            repo_id,
+            ds_meta.robot_type,
+            "human/meta-action" if use_human_actions else "robot/lerobot-v3",
+        )
+        delta_timestamps = resolve_wsa15_delta_timestamps(
+            cfg.dataset,
+            ds_meta,
+            human_source=use_human_actions,
+        )
+        video_key_mapping = resolve_wsa15_video_key_mapping(ds_meta)
+    else:
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        video_key_mapping = None
     if use_synthetic_embodiments and delta_timestamps is not None:
-        delta_timestamps.pop(ACTION, None)
+        for action_key in get_schema(ds_meta.robot_type).get_action_keys():
+            delta_timestamps.pop(action_key, None)
         delta_timestamps = delta_timestamps or None
 
     if cfg.dataset.streaming:
         root = cfg.dataset.root if cfg.dataset.root is not None else HF_LEROBOT_HOME / repo_id
         base_ds = StreamingLeRobotDataset(
             repo_id=repo_id,
-            root=root,          
+            root=root,
             episodes=cfg.dataset.episodes,
             image_transforms=image_transforms,
             delta_timestamps=delta_timestamps,
             revision=cfg.dataset.revision,
-            force_cache_sync=False,         
-            streaming=True,                 
-            buffer_size=cfg.dataset.buffer_size,               
+            force_cache_sync=False,
+            streaming=True,
+            buffer_size=cfg.dataset.buffer_size,
             max_num_shards=cfg.num_workers,
             seed=cfg.seed + seed_offset,
             rng=None,
             shuffle=True,
         )
+        _apply_dataset_stats_overrides(cfg, base_ds)
         transformed_ds = TransformedStreamingLeRobotDataset.from_base(
             base_ds,
-            cfg.dataset.data_transforms.inputs,
+            input_transforms,
         )
     else:
 
@@ -404,12 +485,16 @@ def _build_single_dataset(
             root=dataset_root,
             episodes=cfg.dataset.episodes,
             delta_timestamps=delta_timestamps,
-            # tolerance_s=0.2, 
+            # tolerance_s=0.2,
             image_transforms=image_transforms,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
+            video_key_mapping=video_key_mapping,
         )
-        if use_synthetic_embodiments:
+        _apply_dataset_stats_overrides(cfg, base_ds, include_external=not use_human_actions)
+        if use_wsa15_dataflow:
+            transformed_ds = wrap_wsa15_dataset(base_ds, cfg.dataset, input_transforms)
+        elif use_synthetic_embodiments:
             transformed_ds = SyntheticEmbodimentDataset(
                 base_ds,
                 annotation_file=cfg.dataset.annotation_file,
@@ -418,45 +503,20 @@ def _build_single_dataset(
                 max_state_dim=cfg.policy.max_state_dim,
                 max_action_dim=cfg.policy.max_action_dim,
                 embodiments=cfg.dataset.embodiments or None,
-                transforms=cfg.dataset.data_transforms.inputs,
+                row_group_cache_size=cfg.dataset.annotation_row_group_cache_size,
+                transforms=input_transforms,
+                require_wsa15_layout=policy_type in {"wsa1_5", "wsa_pretrain"},
             )
         else:
             transformed_ds = TransformedLeRobotDataset.from_base(
                 base_ds,
-                cfg.dataset.data_transforms.inputs,
+                input_transforms,
             )
-
-    # Optional: override stats using ImageNet norm
-    if cfg.dataset.use_imagenet_stats:
-        for key in base_ds.meta.camera_keys:
-            for stats_type, stats in IMAGENET_STATS.items():
-                base_ds.meta.stats[key][stats_type] = torch.tensor(
-                    stats, dtype=torch.float32
-                )
 
     robot_type = base_ds.meta.robot_type
-
-    # Optional: load aggregated external stats
-    if cfg.dataset.use_external_stats:
-        if cfg.dataset.external_stats_path is not None:
-            stat_path = Path(cfg.dataset.external_stats_path)
-        else:
-            action_mode = cfg.dataset.action_mode
-            stat_path = HF_LEROBOT_HOME / f"stats/{robot_type}/{action_mode}/stats.json"
-        # stat_path = HF_LEROBOT_HOME / f"stats/{robot_type}/{action_mode}/{repo_id}/stats.json"
-
-        if stat_path.exists():
-            ext_stats = cast_stats_to_numpy(load_json(stat_path))
-            logging.info(f"Using external stats from {stat_path}")
-            base_ds.meta.stats.update(ext_stats)
-        else:
-            raise FileNotFoundError(
-                f"use_external_stats=True but no file found at {stat_path}."
-            )
-
     stats_copy = (
         transformed_ds.checkpoint_stats
-        if use_synthetic_embodiments
+        if use_synthetic_embodiments or use_human_actions
         else base_ds.meta.stats.copy()
     )
 
@@ -656,7 +716,7 @@ def make_dataloader(
         getattr(cfg.policy, "type", None) in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}
         and bool(getattr(cfg.policy, "enable_vqa_loss", False))
     )
-    collate_fn = _multimodal_collate # if use_mm_collate else None
+    collate_fn = _multimodal_collate if use_mm_collate else None
 
     if (
         not cfg.dataset.streaming

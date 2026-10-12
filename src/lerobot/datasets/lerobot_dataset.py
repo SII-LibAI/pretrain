@@ -88,6 +88,7 @@ class LeRobotDatasetMetadata:
         revision: str | None = None,
         force_cache_sync: bool = False,
         metadata_buffer_size: int = 10,
+        video_key_mapping: dict[str, str] | None = None,
     ):
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
@@ -96,6 +97,7 @@ class LeRobotDatasetMetadata:
         self.latest_episode = None
         self.metadata_buffer: list[dict] = []
         self.metadata_buffer_size = metadata_buffer_size
+        self.video_key_mapping = dict(video_key_mapping or {})
 
         try:
             if force_cache_sync:
@@ -208,9 +210,14 @@ class LeRobotDatasetMetadata:
                 f"Episode index {ep_index} out of range. Episodes: {len(self.episodes) if self.episodes else 0}"
             )
         ep = self.episodes[ep_index]
-        chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
-        file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        storage_key = self.video_key_mapping.get(vid_key, vid_key)
+        chunk_idx = ep[f"videos/{storage_key}/chunk_index"]
+        file_idx = ep[f"videos/{storage_key}/file_index"]
+        fpath = self.video_path.format(
+            video_key=storage_key,
+            chunk_index=chunk_idx,
+            file_index=file_idx,
+        )
         return Path(fpath)
 
     @property
@@ -563,6 +570,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        video_key_mapping: dict[str, str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -685,6 +693,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
+        self.video_key_mapping = dict(video_key_mapping or {})
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
@@ -700,7 +709,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Load metadata
         self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
+            self.repo_id,
+            self.root,
+            self.revision,
+            force_cache_sync=force_cache_sync,
+            video_key_mapping=self.video_key_mapping,
         )
 
         # Track dataset state for efficient incremental writing
@@ -1000,7 +1013,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Episodes are stored sequentially on a single mp4 to reduce the number of files.
             # Thus we load the start timestamp of the episode on this mp4 and,
             # shift the query timestamp accordingly.
-            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+            storage_key = self.video_key_mapping.get(vid_key, vid_key)
+            from_timestamp = ep[f"videos/{storage_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)

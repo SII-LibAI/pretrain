@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -12,8 +13,19 @@ import torch
 from lerobot.dataset_schemas import DatasetSchema, get_schema, register_schema
 from lerobot.datasets.synthetic_embodiment import (
     EmbodimentSpec,
+    SyntheticActionTable,
     SyntheticEmbodimentDataset,
     load_embodiment_stats,
+)
+from lerobot.datasets.wsa1_5 import (
+    ACTION_VALID_MASK_KEY,
+    DEFAULT_HUMAN_ACTION_FILE,
+    FUTURE_2D_VALID_KEY,
+    FUTURE_3D_VALID_KEY,
+    SUBTASK_VALID_KEY,
+    CanonicalStateActionTransformFn,
+    build_wsa15_data_transforms,
+    wrap_wsa15_dataset,
 )
 from util_scripts.compute_synthetic_embodiment_stats import (
     RunningVectorStats,
@@ -45,6 +57,9 @@ class _FakeBaseDataset:
     def __getitem__(self, idx: int) -> dict:
         return {
             "index": torch.tensor(idx),
+            "episode_index": torch.tensor(0),
+            "frame_index": torch.tensor(idx),
+            "observation.image": torch.zeros(3, 8, 8),
             "observation.state": torch.full((8,), -1.0),
             "action": torch.full((8,), -1.0),
             "task": "fold the cloth",
@@ -112,6 +127,42 @@ def _register_test_schema(
         ),
         override=True,
     )
+
+
+@pytest.mark.parametrize("action_mode", ["abs", "delta"])
+def test_shared_wsa_human_pipeline_collates_without_optional_annotations(
+    tmp_path: Path, action_mode: str
+) -> None:
+    root = tmp_path / "dataset"
+    poses = [[float(frame + joint) for joint in range(18)] for frame in range(4)]
+    _write_annotations(root, {"franka": poses}, {"franka": [True] * 4})
+    stats_dir = tmp_path / "stats"
+    _write_unit_stats(stats_dir, {"franka": 18})
+    config = SimpleNamespace(
+        chunk_size=2,
+        human_action_file=DEFAULT_HUMAN_ACTION_FILE,
+        human_stats_dir=stats_dir,
+        human_embodiments=["franka"],
+        human_annotation_row_group_cache_size=0,
+    )
+    dataset = wrap_wsa15_dataset(
+        _FakeBaseDataset(root, 4),
+        config,
+        build_wsa15_data_transforms(action_mode=action_mode, num_future_frames=2, height=8, width=8),
+    )
+    sample = dataset[0]
+    assert sample["observation.images.image0"].shape == (3, 8, 8)
+    assert sample["action"].shape == (2, 32)
+    assert sample[ACTION_VALID_MASK_KEY].sum() == 18
+    assert sample["action"][0, 0] == (10.0 if action_mode == "abs" else 1.0)
+    # Gripper dimensions retain the raw target in both modes per schema mask.
+    assert sample["action"][0, 14] == 17.0
+    assert not sample[SUBTASK_VALID_KEY]
+    assert not sample[FUTURE_2D_VALID_KEY]
+    assert not sample[FUTURE_3D_VALID_KEY]
+    batch = next(iter(torch.utils.data.DataLoader(dataset, batch_size=2)))
+    assert batch["observation.state"].shape == (2, 32)
+    assert batch["action"].shape == (2, 2, 32)
 
 
 def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -> None:
@@ -221,6 +272,93 @@ def test_sources_use_separate_schemas_and_shared_stats(tmp_path: Path) -> None:
         np.testing.assert_allclose(dataset.embodiment_stats["franka"].state_std, 1)
 
 
+def test_native_human_eef_is_loaded_only_from_action_parquet(tmp_path: Path) -> None:
+    root = tmp_path / "dataset"
+    length = 4
+    annotation_dir = root / "meta" / "annotations"
+    annotation_dir.mkdir(parents=True)
+    franka = [[float(frame + joint) for joint in range(18)] for frame in range(length)]
+    right_quaternion = [0.0, 0.0, 0.0, 1.0]
+    left_quaternion = [0.0, 0.0, 1.0, 0.0]
+    pq.write_table(
+        pa.table(
+            {
+                "index": list(range(length)),
+                "episode_index": [0] * length,
+                "frame_index": list(range(length)),
+                "action.franka": franka,
+                "action.franka_valid": [True] * length,
+                "human_eef.right.pos": [[float(i), 1.0, 2.0] for i in range(length)],
+                "human_eef.right.rot": [right_quaternion] * length,
+                "human_eef.right.grasp": [0.25] * length,
+                "human_eef.right.valid": [True] * length,
+                "human_eef.left.pos": [[float(i + 10), 11.0, 12.0] for i in range(length)],
+                "human_eef.left.rot": [left_quaternion] * length,
+                "human_eef.left.grasp": [0.75] * length,
+                "human_eef.left.valid": [True] * length,
+            }
+        ),
+        annotation_dir / "action.parquet",
+    )
+    (root / "meta" / "info.json").write_text(
+        json.dumps({"robot_type": "egodex_v"}), encoding="utf-8"
+    )
+
+    # An unrelated pose.parquet must not become a second EEF action embodiment.
+    identity_matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    pq.write_table(
+        pa.table(
+            {
+                "index": list(range(length)),
+                "episode_index": [0] * length,
+                "frame_index": list(range(length)),
+                "hand.right.pos": [[float(i), 0.0, 0.0] for i in range(length)],
+                "hand.right.rot": [identity_matrix] * length,
+                "hand.right.valid": [True] * length,
+                "hand.left.pos": [[0.0, float(i), 0.0] for i in range(length)],
+                "hand.left.rot": [identity_matrix] * length,
+                "hand.left.valid": [True] * length,
+            }
+        ),
+        annotation_dir / "pose.parquet",
+    )
+    table = SyntheticActionTable.from_parquet(annotation_dir / "action.parquet")
+    assert table.names == ("franka", "human_eef")
+
+    stats_dir = tmp_path / "stats"
+    _write_unit_stats(stats_dir, {"franka": 18, "human_eef": 16})
+    dataset = SyntheticEmbodimentDataset(
+        _FakeBaseDataset(root, length),
+        stats_dir=stats_dir,
+        chunk_size=1,
+        max_state_dim=32,
+        max_action_dim=32,
+        embodiments=["human_eef"],
+        transforms=[CanonicalStateActionTransformFn()],
+        require_wsa15_layout=True,
+    )
+
+    assert dataset.candidate_embodiments(0) == ("human_eef",)
+    sample = dataset[0]
+    assert sample["observation.state"].shape == (32,)
+    # The native columns are right-first; the schema writes left/right into
+    # their canonical EEF/gripper slots without changing the quaternions.
+    torch.testing.assert_close(
+        sample["observation.state"][7:10], torch.tensor([10.0, 11.0, 12.0])
+    )
+    torch.testing.assert_close(
+        sample["observation.state"][10:14], torch.tensor(left_quaternion)
+    )
+    torch.testing.assert_close(sample["observation.state"][14:15], torch.tensor([0.75]))
+    torch.testing.assert_close(
+        sample["observation.state"][23:26], torch.tensor([0.0, 1.0, 2.0])
+    )
+    torch.testing.assert_close(
+        sample["observation.state"][26:30], torch.tensor(right_quaternion)
+    )
+    assert sample["action"].shape == (1, 32)
+
+
 def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
     pytest.importorskip("draccus")
     pytest.importorskip("datasets")
@@ -253,6 +391,9 @@ def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
 
     roots = [first.resolve(), second.resolve()]
     stats, specs = compute_embodiment_stats(roots, chunk_size=1)
+    absolute_stats, _ = compute_embodiment_stats(
+        roots, chunk_size=1, action_mode="abs"
+    )
     output_dir = tmp_path / "stats"
     write_embodiment_stats(output_dir, stats)
 
@@ -261,6 +402,7 @@ def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:
     assert stats["arm"]["action"]["count"] == 3
     np.testing.assert_allclose(stats["arm"]["observation.state"]["mean"], [13 / 3, 16 / 3])
     np.testing.assert_allclose(stats["arm"]["action"]["mean"], [2.0, 22 / 3])
+    np.testing.assert_allclose(absolute_stats["arm"]["action"]["mean"], [19 / 3, 22 / 3])
     written = json.loads((output_dir / "arm" / "stats.json").read_text(encoding="utf-8"))
     assert written["observation.state"] != written["action"]
     assert not (output_dir / "manifest.json").exists()
@@ -363,6 +505,7 @@ def test_stats_files_work_without_manifest(tmp_path: Path) -> None:
 
 def test_source_schemas_share_action_layout_and_reorder() -> None:
     dimensions = {
+        "human_eef": 16,
         "piper_inspire": 40,
         "franka": 18,
         "arx_l5": 16,

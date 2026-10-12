@@ -7,9 +7,15 @@ SINGLE_EVAL_SCRIPT="${SCRIPT_DIR}/eval.sh"
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
 IFS=',' read -r -a GPU_ARR <<< "${GPUS}"
 NUM_GPUS=${#GPU_ARR[@]}
+JOBS_PER_GPU="${JOBS_PER_GPU:-1}"
 
 if [[ ${NUM_GPUS} -lt 1 || -z "${GPU_ARR[0]}" ]]; then
     echo "ERROR: GPUS cannot be empty" >&2
+    exit 2
+fi
+
+if [[ ! "${JOBS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: JOBS_PER_GPU must be a positive integer; got ${JOBS_PER_GPU}" >&2
     exit 2
 fi
 
@@ -177,13 +183,24 @@ task_is_complete() {
 }
 
 monitor_gpu_and_run_burner() {
-    local worker_pid="$1"
-    local gpu="$2"
+    local gpu="$1"
+    shift
+    local worker_pids=("$@")
     local burner_log="${LOG_ROOT}/gpu_${gpu}_burner.log"
     local burner_pid=""
     local low_samples=0
     local utilization
     local grace_deadline=$((SECONDS + BURNER_GRACE_SECONDS))
+
+    any_worker_is_running() {
+        local pid
+        for pid in "${worker_pids[@]}"; do
+            if kill -0 "${pid}" 2>/dev/null; then
+                return 0
+            fi
+        done
+        return 1
+    }
 
     burner_is_running() {
         [[ -n "${burner_pid}" ]] && {
@@ -202,13 +219,13 @@ monitor_gpu_and_run_burner() {
     trap stop_burner EXIT
 
     while (( SECONDS < grace_deadline )); do
-        if ! kill -0 "${worker_pid}" 2>/dev/null; then
+        if ! any_worker_is_running; then
             return
         fi
         sleep "${BURNER_POLL_SECONDS}"
     done
 
-    while kill -0 "${worker_pid}" 2>/dev/null; do
+    while any_worker_is_running; do
         if [[ -n "${burner_pid}" ]]; then
             if burner_is_running; then
                 sleep "${BURNER_POLL_SECONDS}"
@@ -296,6 +313,8 @@ echo "TASK_CONFIG       = ${TASK_CONFIG}"
 echo "TASK_RANGE        = ${TASK_START}..${TASK_END}"
 echo "NUM_EPISODES      = ${NUM_EPISODES}"
 echo "GPUS              = ${GPUS}"
+echo "JOBS_PER_GPU      = ${JOBS_PER_GPU}"
+echo "TOTAL_WORKERS     = $((NUM_GPUS * JOBS_PER_GPU))"
 echo "ACTION_MODE       = ${ACTION_MODE}"
 echo "INFER_HORIZON     = ${INFER_HORIZON}"
 echo "INFERENCE_BACKEND = ${INFERENCE_BACKEND}"
@@ -306,12 +325,18 @@ if [[ "${BURNER_ENABLED}" == "true" ]]; then
     echo "BURNER_TIMING     = grace=${BURNER_GRACE_SECONDS}s poll=${BURNER_POLL_SECONDS}s"
 fi
 
-for worker_idx in "${!GPU_ARR[@]}"; do
-    worker_loop "${worker_idx}" "${GPU_ARR[$worker_idx]}" &
-    worker_pid="$!"
-    PIDS+=("${worker_pid}")
+worker_idx=0
+for gpu in "${GPU_ARR[@]}"; do
+    gpu_worker_pids=()
+    for ((job_slot = 0; job_slot < JOBS_PER_GPU; job_slot++)); do
+        worker_loop "${worker_idx}" "${gpu}" &
+        worker_pid="$!"
+        PIDS+=("${worker_pid}")
+        gpu_worker_pids+=("${worker_pid}")
+        worker_idx=$((worker_idx + 1))
+    done
     if [[ "${BURNER_ENABLED}" == "true" ]]; then
-        monitor_gpu_and_run_burner "${worker_pid}" "${GPU_ARR[$worker_idx]}" &
+        monitor_gpu_and_run_burner "${gpu}" "${gpu_worker_pids[@]}" &
         PIDS+=("$!")
     fi
 done

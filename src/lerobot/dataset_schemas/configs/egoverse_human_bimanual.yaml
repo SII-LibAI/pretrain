@@ -107,11 +107,10 @@
   action_dim: 14
   action_mode: joint
   action_mask_spec: [14]
-  # Raw annotations are right[7] + left[7]. Keep a fixed 8-slot block per arm:
-  # left[7] + zero[1] + right[7] + zero[1].
+  # Raw annotations are right[7] + left[7]; reorder to compact left-first.
   action_reorder: &xarm7_reorder
     - [7, 14, 0, 7]
-    - [0, 7, 8, 15]
+    - [0, 7, 7, 14]
   state_reorder: *xarm7_reorder
   action_layout:
     - {name: left_arm, size: 7}
@@ -121,7 +120,7 @@
     action: [action]
   image_mapping:
     observation.images.front: observation.images.image0
-  description: "Dual xArm7 in fixed 16-slot bimanual layout"
+  description: "Dual xArm7 in compact left-first layout"
 
 - robot_type: egoverse_synthetic_piper
   state_dim: 16
@@ -151,11 +150,10 @@
   action_dim: 14
   action_mode: joint
   action_mask_spec: [14]
-  # Raw annotations are right[7] + left[7]. Keep a fixed 8-slot block per arm:
-  # left[7] + zero[1] + right[7] + zero[1].
+  # Raw annotations are right[7] + left[7]; reorder to compact left-first.
   action_reorder: &rm75_reorder
     - [7, 14, 0, 7]
-    - [0, 7, 8, 15]
+    - [0, 7, 7, 14]
   state_reorder: *rm75_reorder
   action_layout:
     - {name: left_arm, size: 7}
@@ -165,18 +163,17 @@
     action: [action]
   image_mapping:
     observation.images.front: observation.images.image0
-  description: "Dual RM75 in fixed 16-slot bimanual layout"
+  description: "Dual RM75 in compact left-first layout"
 
 - robot_type: egoverse_synthetic_ur7e
   state_dim: 12
   action_dim: 12
   action_mode: joint
   action_mask_spec: [12]
-  # Raw annotations are right[6] + left[6]. Reserve two slots after each arm:
-  # left[6] + zero[2] + right[6] + zero[2].
+  # Raw annotations are right[6] + left[6]; reorder to compact left-first.
   action_reorder: &ur7e_reorder
     - [6, 12, 0, 6]
-    - [0, 6, 8, 14]
+    - [0, 6, 6, 12]
   state_reorder: *ur7e_reorder
   action_layout:
     - {name: left_arm, size: 6}
@@ -186,7 +183,7 @@
     action: [action]
   image_mapping:
     observation.images.front: observation.images.image0
-  description: "Dual UR7e in fixed 16-slot bimanual layout"
+  description: "Dual UR7e in compact left-first layout"
 
 - robot_type: egoverse_synthetic_ur7e_wuji
   state_dim: 52

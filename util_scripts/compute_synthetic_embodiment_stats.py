@@ -12,7 +12,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-import pyarrow.parquet as pq
 import torch
 
 from lerobot.datasets.synthetic_embodiment import (
@@ -20,7 +19,6 @@ from lerobot.datasets.synthetic_embodiment import (
     EmbodimentSpec,
     SyntheticActionTable,
     _build_candidate_masks,
-    discover_embodiments,
     embodiment_schema_prefix,
     load_embodiment_schemas,
 )
@@ -118,13 +116,13 @@ def _compute_one_root(
     embodiments: Sequence[str] | None,
     chunk_size: int,
     batch_size: int,
+    action_mode: str,
 ) -> tuple[tuple[EmbodimentSpec, ...], dict[str, tuple[RunningVectorStats, RunningVectorStats]]]:
     """Worker: accumulate each embodiment's trainable state/action vectors."""
     from lerobot.transforms.core import DeltaActionTransformFn
 
     path = root / annotation_file
-    parquet = pq.ParquetFile(path)
-    specs = discover_embodiments(parquet, embodiments)
+    specs = SyntheticActionTable.from_parquet(path, embodiments).specs
     with (root / "meta" / "info.json").open(encoding="utf-8") as stream:
         source_robot_type = json.load(stream)["robot_type"]
     schema_prefix = embodiment_schema_prefix(source_robot_type)
@@ -134,13 +132,15 @@ def _compute_one_root(
         for spec in specs
     }
 
-    for spec, schema in zip(specs, schemas):
+    for spec, schema in zip(specs, schemas, strict=True):
         table = SyntheticActionTable.from_parquet(path, [spec.name])
         anchors = np.flatnonzero(_build_candidate_masks(table, chunk_size))
         values = table.values[0]
         state_stats, action_stats = accumulators[spec.name]
         view = SimpleNamespace(meta=SimpleNamespace(robot_type=schema.robot_type))
-        delta_transform = DeltaActionTransformFn().hydrate(view)
+        delta_transform = (
+            DeltaActionTransformFn().hydrate(view) if action_mode == "delta" else None
+        )
 
         for start in range(0, len(anchors), batch_size):
             batch_anchors = anchors[start : start + batch_size]
@@ -152,7 +152,8 @@ def _compute_one_root(
                     OBS_STATE: torch.from_numpy(states[i]),
                     ACTION: torch.from_numpy(values[anchor + 1 : anchor + chunk_size + 1].copy()),
                 }
-                delta_transform(sample)
+                if delta_transform is not None:
+                    delta_transform(sample)
                 actions[i * chunk_size : (i + 1) * chunk_size] = sample[ACTION].numpy()
             action_stats.update(actions)
 
@@ -167,15 +168,18 @@ def compute_embodiment_stats(
     chunk_size: int = 50,
     batch_size: int = 1024,
     num_workers: int = 1,
+    action_mode: str = "delta",
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], tuple[EmbodimentSpec, ...]]:
     """Aggregate worker-local statistics, parallelized across dataset roots."""
     if chunk_size < 1 or batch_size < 1 or num_workers < 1:
         raise ValueError("chunk_size, batch_size, and num_workers must be positive")
+    if action_mode not in {"abs", "delta"}:
+        raise ValueError("action_mode must be 'abs' or 'delta'")
     roots = [Path(root).resolve() for root in dataset_roots]
     if not roots:
         raise ValueError("dataset_roots is empty")
     jobs = [
-        (root, annotation_file, embodiments, chunk_size, batch_size)
+        (root, annotation_file, embodiments, chunk_size, batch_size, action_mode)
         for root in roots
     ]
     if num_workers == 1:
@@ -190,7 +194,7 @@ def compute_embodiment_stats(
         spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
         for spec in reference_specs
     }
-    for root, (specs, worker_stats) in zip(roots, results):
+    for root, (specs, worker_stats) in zip(roots, results, strict=True):
         if [(spec.name, spec.dim) for spec in specs] != [
             (spec.name, spec.dim) for spec in reference_specs
         ]:
@@ -257,9 +261,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=50,
         help=(
-            "Training action chunk length. Joint delta and absolute human EEF statistics "
-            "are computed over the same valid windows."
+            "Training action chunk length. State/action statistics are computed over "
+            "the same fully valid windows."
         ),
+    )
+    parser.add_argument(
+        "--action-mode",
+        choices=("abs", "delta"),
+        default="delta",
+        help="Action representation whose normalization statistics are computed.",
     )
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument(
@@ -281,6 +291,7 @@ def main() -> None:
         chunk_size=args.chunk_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        action_mode=args.action_mode,
     )
     output_dir = (
         Path(args.output_dir)
