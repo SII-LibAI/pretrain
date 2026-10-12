@@ -22,6 +22,8 @@
 
 ```text
 launch/wsa1_5_test_dataflow.sh
+  -> 扫描 DATASET_ROOT 父目录，发现相对 repo_id 列表
+  -> 为每个 repo_id 传入一个 --repo-id 参数
   -> inspect_wsa1_5_dataflow.main
      -> build_dataflow_dataset
         -> 读取 LeRobotDatasetMetadata
@@ -86,7 +88,7 @@ SyntheticEmbodimentDataset.__getitem__
 
 以 human `franka` 为例，先观察 `index/episode_index/frame_index` 与 `synthetic_embodiment`，再观察 schema 的 `action_reorder` 和 `action_layout`。其原始 18D 双臂动作会写入左右 joint/gripper 槽，得到 `[H,32]`，EEF 空槽的 `wsa.action_valid_mask` 为 false。
 
-随后确认 subtask valid 与两组 motion valid，最后检查 batch 是否仍有这些有效位。归一化的数学细节集中在 `CanonicalStateActionTransformFn.__call__`；最初阅读只需掌握“原始值 → schema 重排/归一化 → 固定语义槽 + mask”即可。
+随后确认 subtask valid 与两组 motion valid，最后检查 batch 是否仍有这些有效位。归一化直接复用 `transforms/core.py` 的 `NormalizeTransformFn`；阅读时按“原始值 → 仓库 Normalize → ComposeFields → schema 重排 → 固定语义槽 + mask”跟踪。`CanonicalStateActionTransformFn` 只做槽位映射，动作的反归一化信息通过仓库 `UnNormalizeTransformFn` 生成。
 
 当前监督来自 subtask 与两个 motion 视频流，已移除单独的 pose 读取模块。原始数据中的 `pose.parquet` 可以保留，它不参与这条加载链路。
 
@@ -211,6 +213,8 @@ human_eef.left.valid      bool
 
 因此无效 anchor 在构建索引时就被移除，不进入 loss。`__getitem__` 会在当前 anchor 的所有有效动作表示中随机选择一种：可以是 `human_eef`，也可以是某个合成本体。
 
+默认只选择 `human_eef`。如果配置了其它本体，候选集合只包含配置列表中的表示，然后在其中筛选有效窗口并随机抽样。训练配置通过 `dataset.human_embodiments` 指定，例如 `["human_eef", "franka"]`。
+
 训练时 `DataLoader(shuffle=True)` 再从全部有效 anchor 中随机取帧。两层随机性的含义不同：
 
 - shuffle 随机选择有效时间帧；
@@ -262,7 +266,7 @@ wsa.action_raw_dim         scalar
 - `abs`：不运行 `DeltaActionTransformFn`；
 - `delta`：运行该 transform，并严格服从 schema 的 `action_mask_spec`。
 
-例如单臂 7D EEF schema 可以声明 `[-7]`，表示 7 个值都保留原始 absolute 定义。双手 EEF 加夹爪是 16D，因此当前 human schema 使用 `[-16]`。固定槽编码只负责映射、归一化和生成 mask，不负责改变 EEF 的物理定义。
+例如单臂 7D EEF schema 可以声明 `[-7]`，表示 7 个值都保留原始 absolute 定义。双手 EEF 加夹爪是 16D，因此当前 human schema 使用 `[-16]`。固定槽编码只负责映射和生成 mask；归一化由仓库 Normalize 执行。
 
 ## 7. 可选 subtask 标注
 
@@ -343,6 +347,8 @@ python util_scripts/compute_synthetic_embodiment_stats.py \
 
 `chunk-size` 和 `action-mode` 必须与训练一致。Human 数据存在时 `human_stats_dir` 是显式必填项，不会回退到 robot stats。
 
+WSA1.5 对 schema 中所有 state/action 来源字段要求真实 mean/std。缺少统计文件、字段或 mean/std 时会直接报错，不生成 mean=0/std=1，也不切换到其它归一化方式。正常计算使用仓库 `NormalizeTransformFn`，其标准差处理是 `std + 1e-6`。
+
 ## 10. 完整执行顺序
 
 ```text
@@ -361,6 +367,7 @@ meta/info.json.robot_type
   -> optional Delta（仅 action_mode=delta）
   -> future motion targets + 独立 valid
   -> RGB resize/remap
+  -> 仓库 NormalizeTransformFn（来源字段的 stats）
   -> Compose state/action
   -> 32D semantic slots + valid/decode metadata
   -> sidecar task/subtask + valid
@@ -369,7 +376,20 @@ meta/info.json.robot_type
 
 ## 11. 数据流启动脚本
 
-`launch/wsa1_5_test_dataflow.sh` 是纯数据 smoke test，不加载 VLM 或 policy。它会递归发现数据集、按 `robot_type` 分类、随机解码有效帧，并打印 state/action、subtask、未来目标和所有有效位。
+`launch/wsa1_5_test_dataflow.sh` 是纯数据 smoke test，不加载 VLM 或 policy。与训练启动流程一样，它先在 `DATASET_ROOT` 父目录下扫描含有 `data/` 和 `meta/info.json` 的数据集目录，生成相对父目录的 repo_id，再逐个通过 `--repo-id` 传给检验工具。工具按 `robot_type` 分类、随机解码有效帧，并打印 state/action、subtask、未来目标和所有有效位。
+
+例如父目录 `/datasets` 下有 `/datasets/robot/task_a` 和 `/datasets/human/task_b`，传给工具的 repo_id 分别是 `robot/task_a` 和 `human/task_b`。`REPO_IDS` 可从发现的列表中选择子集。
+
+`HUMAN_EMBODIMENTS` 默认是 `human_eef`。添加本体时设置完整的空格分隔列表，例如 `HUMAN_EMBODIMENTS="human_eef franka xarm7"`。该参数只作用于 human 数据，robot 数据仍读取自己的原生动作。
+
+终端打印内容会同步写入 TXT，包括启动参数、样本检查结果和错误信息。默认路径是 `outputs/wsa1_5/dataflow/dataflow_<时间戳>_<进程号>.txt`，启动时会打印实际文件路径。可通过 `OUTPUT_TXT` 指定路径；文件已存在时追加，不覆盖原有内容：
+
+```bash
+OUTPUT_TXT=outputs/wsa1_5/dataflow_report.txt \
+DATASET_ROOT=/path/to/collection \
+HUMAN_STATS_DIR=/path/to/human_stats \
+bash launch/wsa1_5_test_dataflow.sh
+```
 
 ```bash
 DATASET_ROOT=/path/to/collection \
@@ -400,6 +420,57 @@ bash launch/wsa1_5_test_dataflow.sh
 ```
 
 对应 Python 入口是 `util_scripts/inspect_wsa1_5_dataflow.py`。
+
+直接使用工具时必须显式提供 repo_id；它不再扫描父目录：
+
+```bash
+python util_scripts/inspect_wsa1_5_dataflow.py \
+  --dataset-root /path/to/collection \
+  --repo-id human/task_b \
+  --human-stats-dir /path/to/human_stats \
+  --human-embodiment human_eef \
+  --human-embodiment franka
+```
+
+`--repo-id` 和 `--human-embodiment` 均可重复传入。未传 `--human-embodiment` 时只选择 `human_eef`；传入时使用所给出的完整列表。对于 demo 中没有原生 human EEF 列的数据，可以显式使用 `HUMAN_EMBODIMENTS="franka"`。
+
+### 11.1 有效维度与归一化报告
+
+每个样本的 `state_action_inspection` 包含实际统计文件路径、所选本体的 `schema_robot_type`，以及 state/action 各自的：
+
+- `valid_indices`：32D 向量中的有效维度索引，使用从 0 开始的索引；
+- `dimensions`：每个有效维度的 `index`、`semantic` 和原始向量的 `source_index`；
+- state 的 `input_value/value`：归一化前后数值；
+- action 的 `input_value_t0/value_t0`：chunk 第一个目标的归一化前后数值；
+- `mean/std`：从实际 stats 中读取的归一化参数。
+
+这里的 input 是仓库 Normalize 之前捕获的来源字段数值，报告中再按 ComposeFields 顺序合并。在 delta 模式下，action 的 input 已经按 schema 做过差分。Human 报告使用本次随机抽中的 EEF/本体 schema 和统计量，而不是 source 的 800D state/action。报告同时显示配置的 `selected_human_embodiments`、当前帧有效的 `eligible_human_embodiments` 和实际抽中的 `human_action_representation`。
+
+例如一个 Franka 左臂关节的记录可以是：
+
+```json
+{
+  "index": 0,
+  "semantic": "left_arm.0",
+  "source_index": 9,
+  "input_value": 0.6,
+  "value": 1.99999,
+  "mean": 0.2,
+  "std": 0.2
+}
+```
+
+`normalization` 用仓库 `NormalizeTransformFn` 对捕获的输入得到参照值，再检查整个 action chunk 和全部有效 state 槽位是否与参照值一致。检验工具不自写归一化公式；仓库 mean/std 转换的计算方式为：
+
+```text
+expected = (input - mean) / (std + 1e-6)
+```
+
+`mean_std_loaded=true` 表示真实 mean/std 已加载；`reference_transform=NormalizeTransformFn` 标明参照实现；`formula_matches=true` 和 `verified=true` 表示槽位数值核验通过。报告还包含 `max_abs_error`、`checked_values`、`all_finite`、统计中 std 为零的原始维度，以及归一化后的最大绝对值。
+
+统计字段缺失时直接终止，不会生成恒等统计或 min/max 兜底报告。
+
+该检查验证统计量是否按正确顺序应用、计算结果是否一致；单个样本不要求均值为 0 或标准差为 1，也不能据此证明统计文件的生成模式与本次 abs/delta 配置一致。统计文件仍需使用与加载一致的 action-mode 和 chunk-size 生成。
 
 ## 12. 关键实现文件
 

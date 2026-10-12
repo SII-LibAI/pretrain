@@ -8,6 +8,7 @@ from typing import ClassVar
 
 from lerobot.configs.default import DatasetConfig, VQADatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.synthetic_embodiment import HUMAN_EEF_EMBODIMENT
 from lerobot.datasets.wsa1_5 import (
     CANONICAL_DIM,
     DEFAULT_HUMAN_ACTION_FILE,
@@ -109,7 +110,7 @@ class WSA15DatasetConfig(InternVLAA15DatasetConfig):
     video_width: int = 224
     human_action_file: str = DEFAULT_HUMAN_ACTION_FILE
     human_stats_dir: str | None = None
-    human_embodiments: list[str] = field(default_factory=list)
+    human_embodiments: list[str] = field(default_factory=lambda: [HUMAN_EEF_EMBODIMENT])
     human_annotation_row_group_cache_size: int = 0
     data_transforms: TransformGroup = field(default_factory=_robot_transforms)
     supplemental_video_keys: tuple[str, ...] = MOTION_MASK_KEYS + MOTION_MASK_ID_KEYS

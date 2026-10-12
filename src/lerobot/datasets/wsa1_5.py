@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor
@@ -27,8 +28,10 @@ from lerobot.transforms.core import (
     DataTransformFn,
     DeltaActionTransformFn,
     LoadActionTextFromJsonlTransformFn,
+    NormalizeTransformFn,
     RemapImageKeyTransformFn,
     ResizeImagesWithPadFn,
+    UnNormalizeTransformFn,
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, OBS_STR
 
@@ -189,6 +192,7 @@ def build_wsa15_data_transforms(
         ResizeImagesWithPadFn(height=height, width=width),
         RemapImageKeyTransformFn(),
         SelectWSA15CurrentObservationFn(),
+        NormalizeTransformFn(),
         ComposeFieldsTransform(),
         CanonicalStateActionTransformFn(),
         LoadActionTextFromJsonlTransformFn(),
@@ -254,34 +258,25 @@ def _layout_side(name: str) -> str | None:
     return None
 
 
-def _normalization_affine(
-    stats: dict[str, Any] | None, mode: str, dim: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return raw = normalized * scale + bias for one source vector."""
+def validate_wsa15_normalization_stats(dataset) -> None:
+    """Require real mean/std for every schema state/action source feature.
 
-    if not stats:
-        return torch.ones(dim), torch.zeros(dim)
-    if mode == "mean_std" and "mean" in stats and "std" in stats:
-        return torch.as_tensor(stats["std"]).float().clamp_min(1e-6), torch.as_tensor(stats["mean"]).float()
-    key_min, key_max = ("q01", "q99") if mode == "q01_q99" else ("min", "max")
-    if key_min in stats and key_max in stats:
-        minimum = torch.as_tensor(stats[key_min]).float()
-        maximum = torch.as_tensor(stats[key_max]).float()
-        return ((maximum - minimum) * 0.5).clamp_min(1e-6), (maximum + minimum) * 0.5
-    return torch.ones(dim), torch.zeros(dim)
+    The repository normalizer owns the arithmetic. This WSA boundary check
+    prevents its generic missing-feature skip from admitting unnormalized
+    state/action into a mixed training batch.
+    """
 
-
-def _compose_stats(all_stats: dict[str, dict[str, Any]], source_keys: list[str]) -> dict[str, Tensor] | None:
-    """Concatenate source-feature statistics in the same order as ComposeFields."""
-
-    if not source_keys or any(key not in all_stats for key in source_keys):
-        return None
-    result: dict[str, Tensor] = {}
-    for statistic in ("mean", "std", "min", "max", "q01", "q99"):
-        values = [all_stats[key].get(statistic) for key in source_keys]
-        if all(value is not None for value in values):
-            result[statistic] = torch.cat([torch.as_tensor(value).flatten() for value in values], dim=0)
-    return result or None
+    schema = get_schema(dataset.meta.robot_type)
+    stats = dataset.meta.stats
+    for key in schema.get_state_keys() + schema.get_action_keys():
+        if stats is None or key not in stats:
+            raise ValueError(f"{schema.robot_type}: missing normalization stats for {key!r}")
+        for statistic in ("mean", "std"):
+            if statistic not in stats[key]:
+                raise ValueError(f"{schema.robot_type}: missing stats[{key!r}][{statistic!r}]")
+            values = np.asarray(stats[key][statistic])
+            if not np.isfinite(values).all() or (statistic == "std" and (values < 0).any()):
+                raise ValueError(f"{schema.robot_type}: invalid {key!r} {statistic} statistics")
 
 
 def _reorder_matrix(raw_dim: int, spec: list[list[int]] | None) -> torch.Tensor:
@@ -309,28 +304,41 @@ class CanonicalStateActionTransformFn(DataTransformFn):
     absent* fields and are paired with binary masks.  They are never treated as
     action targets.  Absolute-versus-delta conversion is deliberately outside
     this codec and is controlled only by ``DeltaActionTransformFn`` plus the
-    dataset schema's ``action_mask_spec``.  This transform only normalizes,
-    reorders, fills semantic slots, and emits the inverse affine mapping.
+    dataset schema's ``action_mask_spec``. Inputs are already normalized by
+    the repository's ``NormalizeTransformFn``. This transform only reorders,
+    fills semantic slots, and emits decode metadata derived using the
+    repository's ``UnNormalizeTransformFn``.
     """
 
     normalization_mode: str = "mean_std"
     action_layout: list[dict[str, Any]] = field(default_factory=list)
     action_reorder: list[list[int]] | None = None
     state_reorder: list[list[int]] | None = None
-    state_stats: dict[str, Any] | None = None
-    action_stats: dict[str, Any] | None = None
+    action_decode_scale: Tensor | None = None
+    action_decode_bias: Tensor | None = None
     robot_type: str = ""
 
     def hydrate(self, dataset: LeRobotDataset | StreamingLeRobotDataset) -> CanonicalStateActionTransformFn:
         schema = get_schema(dataset.meta.robot_type)
-        stats = getattr(dataset.meta, "stats", {})
+        validate_wsa15_normalization_stats(dataset)
+        action_keys = schema.get_action_keys()
+        stats = dataset.meta.stats
+        unnormalize = UnNormalizeTransformFn(
+            selected_keys=action_keys, mode=self.normalization_mode, norm_stats=stats
+        )
+        zeros = {key: torch.zeros_like(torch.as_tensor(stats[key]["mean"]), dtype=torch.float64) for key in action_keys}
+        ones = {key: torch.ones_like(value) for key, value in zeros.items()}
+        decoded_zeros = unnormalize(zeros)
+        decoded_ones = unnormalize(ones)
+        decode_bias = torch.cat([decoded_zeros[key].flatten() for key in action_keys])
+        decode_scale = torch.cat([decoded_ones[key].flatten() for key in action_keys]) - decode_bias
         return replace(
             self,
             action_layout=list(schema.action_layout),
             action_reorder=schema.action_reorder,
             state_reorder=schema.state_reorder,
-            state_stats=_compose_stats(stats, schema.feature_mapping.get(OBS_STATE, [OBS_STATE])),
-            action_stats=_compose_stats(stats, schema.feature_mapping.get(ACTION, [ACTION])),
+            action_decode_scale=decode_scale,
+            action_decode_bias=decode_bias,
             robot_type=schema.robot_type,
         )
 
@@ -396,18 +404,18 @@ class CanonicalStateActionTransformFn(DataTransformFn):
         state_logical = state_map @ state_raw
         action_logical = action_raw @ action_map.transpose(0, 1)
 
-        state_scale_raw, state_bias_raw = _normalization_affine(
-            self.state_stats, self.normalization_mode, state_raw.shape[-1]
+        # A directly constructed codec is a pure slot map. Hydrated dataset
+        # codecs always derive physical-unit decoding from the loaded stats.
+        action_scale_raw = (
+            self.action_decode_scale.to(action_raw)
+            if self.action_decode_scale is not None else action_raw.new_ones(action_raw.shape[-1])
         )
-        action_scale_raw, action_bias_raw = _normalization_affine(
-            self.action_stats, self.normalization_mode, action_raw.shape[-1]
+        action_bias_raw = (
+            self.action_decode_bias.to(action_raw)
+            if self.action_decode_bias is not None else action_raw.new_zeros(action_raw.shape[-1])
         )
-        state_scale = (state_map.abs() @ state_scale_raw.to(state_raw)).clamp_min(1e-6)
-        state_bias = state_map @ state_bias_raw.to(state_raw)
-        action_scale = (action_map.abs() @ action_scale_raw.to(action_raw)).clamp_min(1e-6)
-        action_bias = action_map @ action_bias_raw.to(action_raw)
-        state_normalized = (state_logical - state_bias) / state_scale
-        action_normalized = (action_logical - action_bias) / action_scale
+        action_scale = action_map.abs() @ action_scale_raw
+        action_bias = action_map @ action_bias_raw
 
         state = state_raw.new_zeros(CANONICAL_DIM)
         actions = action_raw.new_zeros(action_raw.shape[0], CANONICAL_DIM)
@@ -426,8 +434,8 @@ class CanonicalStateActionTransformFn(DataTransformFn):
                 if len(slots) != size:
                     raise RuntimeError(f"Internal canonical slot mismatch for {name!r}")
                 slot_tensor = torch.tensor(slots, device=state_raw.device)
-                state[slot_tensor] = state_normalized[logical_slice]
-                actions[:, slot_tensor] = action_normalized[:, logical_slice]
+                state[slot_tensor] = state_logical[logical_slice]
+                actions[:, slot_tensor] = action_logical[:, logical_slice]
                 state_valid[slot_tensor] = True
                 action_valid[slot_tensor] = True
                 for logical_index, canonical_index in zip(range(offset, offset + size), slots, strict=True):

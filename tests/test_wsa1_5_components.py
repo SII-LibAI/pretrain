@@ -2,6 +2,7 @@ from pathlib import Path
 from runpy import run_path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,12 +26,81 @@ from lerobot.datasets.wsa1_5 import (
 )
 from lerobot.transforms.core import DeltaActionTransformFn
 from lerobot.utils.constants import ACTION, OBS_STATE
+from util_scripts.inspect_wsa1_5_dataflow import (
+    INSPECTION_KEY,
+    InspectWSA15NormalizationFn,
+    InspectWSA15StateActionFn,
+)
 
 # Keep this pure attention-mask unit test runnable in component-only
 # environments that do not install the Qwen3.5 Transformers extension.  A
 # normal policy import still uses lerobot.policies.wsa1_5.attention.
 _ATTENTION_MODULE = run_path(str(Path(__file__).parents[1] / "src/lerobot/policies/wsa1_5/attention.py"))
 build_wsa_attention_mask = _ATTENTION_MODULE["build_wsa_attention_mask"]
+
+
+def _inspect_normalized(state, action, state_stats, action_stats, inspector):
+    normalizer = InspectWSA15NormalizationFn(
+        selected_keys=[OBS_STATE, ACTION],
+        norm_stats={
+            key: {name: np.asarray(values) for name, values in stats.items()}
+            for key, stats in ((OBS_STATE, state_stats), (ACTION, action_stats))
+        },
+        mapping={OBS_STATE: [OBS_STATE], ACTION: [ACTION]},
+    )
+    return inspector(normalizer({OBS_STATE: state, ACTION: action}))
+
+
+def test_inspector_checks_nonidentity_stats_and_semantics_after_reorder() -> None:
+    inspector = InspectWSA15StateActionFn(
+        action_layout=[{"name": "left_arm", "size": 2}],
+        state_reorder=[[1, 2, 0, 1], [0, 1, 1, 2]],
+        action_reorder=[[1, 2, 0, 1], [0, 1, 1, 2]],
+    )
+    sample = _inspect_normalized(
+        torch.tensor([6.0, 12.0]), torch.tensor([[5.0, 9.0], [9.0, 15.0]]),
+        {"mean": [2.0, 4.0], "std": [2.0, 4.0]},
+        {"mean": [1.0, 3.0], "std": [2.0, 3.0]}, inspector,
+    )
+    report = sample[INSPECTION_KEY]
+    assert report["state"]["valid_indices"] == [0, 1]
+    assert report["state"]["dimensions"][0]["source_index"] == 1
+    assert report["state"]["dimensions"][0]["semantic"] == "left_arm.0"
+    assert report["state"]["dimensions"][0]["value"] == pytest.approx(2.0)
+    assert report["action"]["dimensions"][0]["value_t0"] == pytest.approx(2.0)
+    assert report["state"]["normalization"]["verified"]
+    assert report["action"]["normalization"]["verified"]
+    assert report["action"]["normalization"]["checked_values"] == 4
+
+
+@pytest.mark.parametrize("stats", [None, {}, {OBS_STATE: {"min": np.zeros(18), "max": np.ones(18)}}])
+def test_wsa_rejects_missing_mean_std_instead_of_fabricating_stats(stats) -> None:
+    dataset = SimpleNamespace(
+        meta=SimpleNamespace(robot_type="egodex_synthetic_franka", stats=stats)
+    )
+    with pytest.raises(ValueError, match="missing"):
+        CanonicalStateActionTransformFn().hydrate(dataset)
+    with pytest.raises(ValueError, match="missing"):
+        InspectWSA15NormalizationFn().hydrate(dataset)
+
+
+def test_inspector_detects_incorrect_normalized_action(monkeypatch) -> None:
+    original = CanonicalStateActionTransformFn.__call__
+
+    def corrupted_codec(self, data):
+        output = original(self, data)
+        output[ACTION][-1, 0] += 1.0
+        return output
+
+    monkeypatch.setattr(CanonicalStateActionTransformFn, "__call__", corrupted_codec)
+    stats = {"mean": [1.0], "std": [2.0]}
+    sample = _inspect_normalized(
+        torch.tensor([5.0]), torch.tensor([[7.0], [9.0]]), stats, stats,
+        InspectWSA15StateActionFn(action_layout=[{"name": "left_arm", "size": 1}]),
+    )
+    report = sample[INSPECTION_KEY]["action"]["normalization"]
+    assert not report["formula_matches"]
+    assert report["max_abs_error"] == 1.0
 
 
 def test_wsa_dataflow_query_plan_separates_robot_and_human_actions() -> None:

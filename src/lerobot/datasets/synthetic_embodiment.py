@@ -437,6 +437,7 @@ class SyntheticEmbodimentDataset(Dataset):
 
         source_transforms = list(transforms or [])
         if source_transforms:
+            from lerobot.datasets.wsa1_5 import CanonicalStateActionTransformFn
             from lerobot.transforms.core import (
                 DeltaActionTransformFn,
                 NormalizeTransformFn,
@@ -451,7 +452,7 @@ class SyntheticEmbodimentDataset(Dataset):
             }
 
             uses_semantic_canonicalizer = any(
-                type(transform).__name__ == "CanonicalStateActionTransformFn"
+                isinstance(transform, CanonicalStateActionTransformFn)
                 for transform in source_transforms
             )
             pose_types = (
@@ -462,8 +463,8 @@ class SyntheticEmbodimentDataset(Dataset):
             )
             if uses_semantic_canonicalizer:
                 # WSA1.5 canonicalization is schema-aware and must remain after
-                # ComposeFieldsTransform.  It replaces the old
-                # delta/normalize/pad/reorder chain as one atomic codec.
+                # ComposeFieldsTransform. Delta/Normalize remain standard
+                # transforms; the codec replaces only legacy pad/reorder.
                 pose_sources = []
                 remaining_transforms = source_transforms
             else:
