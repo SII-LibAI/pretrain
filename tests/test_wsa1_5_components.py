@@ -112,7 +112,8 @@ def test_wsa_dataflow_query_plan_separates_robot_and_human_actions() -> None:
             "observation.state": {"dtype": "float32"},
             "action": {"dtype": "float32"},
             "observation.image": {"dtype": "video"},
-            "observation.motion_mask": {"dtype": "video"},
+            "observation.mask": {"dtype": "video"},
+            "observation.motion": {"dtype": "video"},
         },
     )
 
@@ -123,42 +124,53 @@ def test_wsa_dataflow_query_plan_separates_robot_and_human_actions() -> None:
     robot = resolve_wsa15_delta_timestamps(config, metadata, human_source=False)
     assert robot["action"] == [index / 10 for index in range(8)]
     assert robot["observation.image"] == [0.0]
-    assert robot["observation.motion_mask"] == [0.4, 0.8]
+    assert robot["observation.mask"] == [0.4, 0.8]
+    assert robot["observation.motion"] == [0.4, 0.8]
 
     human = resolve_wsa15_delta_timestamps(config, metadata, human_source=True)
     assert "action" not in human
     assert human["observation.image"] == [0.0]
-    assert human["observation.motion_mask"] == [0.4, 0.8]
+    assert human["observation.mask"] == [0.4, 0.8]
+    assert human["observation.motion"] == [0.4, 0.8]
 
 
 def test_wsa_supplemental_video_storage_alias_is_explicit() -> None:
     metadata = SimpleNamespace(
-        features={"observation.motion_mask": {"dtype": "video"}},
-        episodes=[{"videos/motion_mask/chunk_index": 0}],
+        features={"observation.mask": {"dtype": "video"}, "observation.motion": {"dtype": "video"}},
+        episodes=[{"videos/mask/chunk_index": 0, "videos/motion/chunk_index": 0}],
     )
     assert resolve_wsa15_video_key_mapping(metadata) == {
-        "observation.motion_mask": "motion_mask"
+        "observation.mask": "mask", "observation.motion": "motion",
     }
 
     malformed = SimpleNamespace(
-        features={"observation.motion_mask": {"dtype": "video"}},
+        features={"observation.mask": {"dtype": "video"}},
         episodes=[{}],
     )
     with pytest.raises(KeyError, match="episode metadata"):
         resolve_wsa15_video_key_mapping(malformed)
 
 
-def test_optional_motion_targets_have_independent_valid_masks() -> None:
+@pytest.mark.parametrize("has_mask,has_motion", [(True, False), (False, True), (True, True), (False, False)])
+def test_optional_motion_targets_have_independent_valid_masks(has_mask, has_motion) -> None:
     transform = PrepareWSA15MotionTargetsFn(num_future_frames=2, height=8, width=8)
-    output = transform(
-        {"observation.motion_mask": torch.rand(2, 3, 4, 4)}
-    )
+    data = {}
+    if has_mask:
+        data["observation.mask"] = torch.tensor([[0.0, 1.0], [1.0, 0.0]])[None, None].expand(2, 3, -1, -1)
+    if has_motion:
+        data["observation.motion"] = torch.rand(2, 3, 4, 4)
+    output = transform(data)
 
     assert output[FUTURE_2D_TARGET_KEY].shape == (2, 3, 8, 8)
-    assert output[FUTURE_2D_VALID_KEY]
+    assert bool(output[FUTURE_2D_VALID_KEY]) == has_mask
+    if has_mask:
+        assert set(output[FUTURE_2D_TARGET_KEY].unique().tolist()) == {-1.0, 1.0}
+    else:
+        assert torch.all(output[FUTURE_2D_TARGET_KEY] == -1)
     assert output[FUTURE_3D_TARGET_KEY].shape == (2, 3, 8, 8)
-    assert not output[FUTURE_3D_VALID_KEY]
-    assert torch.all(output[FUTURE_3D_TARGET_KEY] == -1)
+    assert bool(output[FUTURE_3D_VALID_KEY]) == has_motion
+    if not has_motion:
+        assert torch.all(output[FUTURE_3D_TARGET_KEY] == -1)
 
 
 def test_optional_subtask_sidecar_sets_text_and_validity(tmp_path: Path) -> None:

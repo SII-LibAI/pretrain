@@ -35,15 +35,15 @@ from lerobot.transforms.core import (
 )
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, OBS_STR
 
-MOTION_MASK_KEYS = ("observation.motion_mask", "motion_mask")
-MOTION_MASK_ID_KEYS = ("observation.motion_mask_ids", "motion_mask_ids")
+FUTURE_2D_SOURCE_KEY = "observation.mask"
+FUTURE_3D_SOURCE_KEY = "observation.motion"
 WSA15_DATAFLOW_NAME = "wsa1_5"
 WSA15_SOURCE_ROBOT = "robot"
 WSA15_SOURCE_HUMAN = "human"
 DEFAULT_HUMAN_ACTION_FILE = "meta/annotations/action.parquet"
 WSA15_VIDEO_STORAGE_ALIASES = {
-    "observation.motion_mask": "motion_mask",
-    "observation.motion_mask_ids": "motion_mask_ids",
+    FUTURE_2D_SOURCE_KEY: "mask",
+    FUTURE_3D_SOURCE_KEY: "motion",
 }
 FUTURE_2D_TARGET_KEY = "wsa.future_motion_mask"
 FUTURE_2D_VALID_KEY = "wsa.future_motion_mask_valid"
@@ -81,9 +81,9 @@ def wsa15_future_indices(chunk_size: int, num_future_frames: int) -> list[int]:
 def resolve_wsa15_video_key_mapping(dataset_metadata: Any) -> dict[str, str]:
     """Resolve the two documented supplemental-video storage aliases.
 
-    EgoDex supplements expose logical feature names such as
-    ``observation.motion_mask`` in ``info.json`` while their episode columns
-    and video directories use ``motion_mask``. Standard LeRobot videos use the
+    Supplements expose logical feature names such as ``observation.mask`` in
+    ``info.json`` while their episode columns and video directories can use
+    ``mask``. Standard LeRobot videos use the
     same key in both locations. Both layouts are explicit and supported; any
     third layout is a malformed dataset rather than a path to guess.
     """
@@ -142,7 +142,7 @@ def resolve_wsa15_delta_timestamps(
         if key in features:
             timestamps[key] = [0.0]
 
-    for key in (*MOTION_MASK_KEYS, *MOTION_MASK_ID_KEYS):
+    for key in (FUTURE_2D_SOURCE_KEY, FUTURE_3D_SOURCE_KEY):
         feature = features.get(key)
         if feature is not None and feature.get("dtype") == "video":
             timestamps[key] = [index / fps for index in future_indices]
@@ -574,14 +574,6 @@ class LoadWSA15PhysicalAnnotationsFn(DataTransformFn):
         return data
 
 
-def _find_tensor(data: DataDict, keys: tuple[str, ...]) -> torch.Tensor | None:
-    for key in keys:
-        value = data.get(key)
-        if isinstance(value, torch.Tensor):
-            return value
-    return None
-
-
 @DataTransformFn.register_subclass("wsa1_5_select_current_observation")
 @dataclass
 class SelectWSA15CurrentObservationFn(DataTransformFn):
@@ -612,7 +604,7 @@ def _as_video(value: torch.Tensor) -> torch.Tensor:
 @DataTransformFn.register_subclass("wsa1_5_motion_targets")
 @dataclass
 class PrepareWSA15MotionTargetsFn(DataTransformFn):
-    """Prepare independent future 2D-motion and 3D-ID image targets."""
+    """Prepare independent future 2D mask and 3D motion image targets."""
 
     num_future_frames: int = 4
     height: int = 224
@@ -630,20 +622,20 @@ class PrepareWSA15MotionTargetsFn(DataTransformFn):
         return video.mul(2.0).sub(1.0)
 
     def __call__(self, data: DataDict) -> DataDict:
-        motion = _find_tensor(data, MOTION_MASK_KEYS)
-        ids = _find_tensor(data, MOTION_MASK_ID_KEYS)
+        mask = data.get(FUTURE_2D_SOURCE_KEY)
+        motion = data.get(FUTURE_3D_SOURCE_KEY)
 
         def empty() -> torch.Tensor:
             return -torch.ones(self.num_future_frames, 3, self.height, self.width)
 
         data[FUTURE_2D_TARGET_KEY] = (
+            self._prepare(mask, "nearest") if mask is not None else empty()
+        )
+        data[FUTURE_2D_VALID_KEY] = torch.tensor(mask is not None, dtype=torch.bool)
+        data[FUTURE_3D_TARGET_KEY] = (
             self._prepare(motion, "bilinear") if motion is not None else empty()
         )
-        data[FUTURE_2D_VALID_KEY] = torch.tensor(motion is not None, dtype=torch.bool)
-        data[FUTURE_3D_TARGET_KEY] = (
-            self._prepare(ids, "nearest") if ids is not None else empty()
-        )
-        data[FUTURE_3D_VALID_KEY] = torch.tensor(ids is not None, dtype=torch.bool)
+        data[FUTURE_3D_VALID_KEY] = torch.tensor(motion is not None, dtype=torch.bool)
         return data
 
 

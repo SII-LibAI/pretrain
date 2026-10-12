@@ -102,10 +102,10 @@ SyntheticEmbodimentDataset.__getitem__
 | 输入 | `observation.state` | 是 | robot 来自主 parquet；human 由补充动作表示在时刻 `t` 的值替换 |
 | 监督 | `action` | 是 | robot 来自主 parquet；human 来自补充 `action.parquet` |
 | 监督 | subtask | 否 | 来自 `meta/sidecar.json`；缺失时关闭 subtask loss |
-| 监督 | `motion_mask` | 否 | 未来 2D 图；缺失时关闭该 loss |
-| 监督 | `motion_mask_ids` | 否 | 未来 3D/ID 图；缺失时关闭该 loss |
+| 监督 | `observation.mask` | 否 | 未来 2D mask 图；缺失时关闭该 loss |
+| 监督 | `observation.motion` | 否 | 未来 3D motion 图；缺失时关闭该 loss |
 
-LeRobotV3 原生的 image、state、action 是数据集必须项。subtask、`motion_mask` 和 `motion_mask_ids` 是补充标注，三者分别带独立有效位，互不依赖。
+LeRobotV3 原生的 image、state、action 是数据集必须项。subtask、`observation.mask` 和 `observation.motion` 是补充标注，三者分别带独立有效位，互不依赖。
 
 数据层不会因为某个可选标注缺失而伪造有效目标，也不会用最后一帧填满未来监督。
 
@@ -304,11 +304,11 @@ wsa.subtask_valid  bool
 补充视频字段仍登记在 LeRobotV3 的 `meta/info.json` features 中：
 
 ```text
-observation.motion_mask
-observation.motion_mask_ids
+observation.mask    # future 2D
+observation.motion  # future 3D
 ```
 
-EgoDex demo 的逻辑 feature 名带 `observation.`，而 episode 列和视频目录使用 `motion_mask` / `motion_mask_ids`。数据流会对这两组已声明名称建立显式映射；标准 LeRobot 的逻辑名与存储名相同时不映射。除此之外不猜测第三种路径。
+逻辑 feature 名是 `observation.mask` / `observation.motion`。episode 列和视频目录可以使用同名，或使用去掉前缀的 `mask` / `motion`；后者由数据流建立显式映射。旧的 `observation.motion_mask` / `observation.motion_mask_ids` 不再作为监督源读取。
 
 当前 RGB 只查询 `t`。未来目标在 action horizon 内均匀查询。默认 `H=50`、`F=4` 时偏移为：
 
@@ -318,12 +318,14 @@ EgoDex demo 的逻辑 feature 名带 `observation.`，而 episode 列和视频�
 
 输出为：
 
-| 字段 | shape | 插值 | 无标注时 |
-|---|---|---|---|
-| `wsa.future_motion_mask` | `[F,3,224,224]` | bilinear | 值为 `-1`，valid=false |
-| `wsa.future_motion_mask_ids` | `[F,3,224,224]` | nearest | 值为 `-1`，valid=false |
-| `wsa.future_motion_mask_valid` | scalar bool | - | false |
-| `wsa.future_motion_mask_ids_valid` | scalar bool | - | false |
+| batch 字段 | 监督来源 | shape | 插值 | 无标注时 |
+|---|---|---|---|---|
+| `wsa.future_motion_mask`（2D） | `observation.mask` | `[F,3,224,224]` | nearest | 值为 `-1`，valid=false |
+| `wsa.future_motion_mask_ids`（3D） | `observation.motion` | `[F,3,224,224]` | bilinear | 值为 `-1`，valid=false |
+| `wsa.future_motion_mask_valid` | `observation.mask` 是否可用 | scalar bool | - | false |
+| `wsa.future_motion_mask_ids_valid` | `observation.motion` 是否可用 | scalar bool | - | false |
+
+内部 batch 字段保留既有名称，来源与 2D/3D 含义以上表为准。检验报告会打印 `future_2d_source=observation.mask` 和 `future_3d_source=observation.motion`。
 
 目标像素从 `[0,1]` 变换到 `[-1,1]`。两种目标分别判断是否存在，因此可以只监督其中一种。当前数据流不从 `pose.parquet` 合成这两个目标。
 

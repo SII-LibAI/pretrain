@@ -12,8 +12,8 @@ from lerobot.datasets.synthetic_embodiment import HUMAN_EEF_EMBODIMENT
 from lerobot.datasets.wsa1_5 import (
     CANONICAL_DIM,
     DEFAULT_HUMAN_ACTION_FILE,
-    MOTION_MASK_ID_KEYS,
-    MOTION_MASK_KEYS,
+    FUTURE_2D_SOURCE_KEY,
+    FUTURE_3D_SOURCE_KEY,
     WSA15_DATAFLOW_NAME,
     PrepareWSA15MotionTargetsFn,
     UnifyWSA15InputsFn,
@@ -113,7 +113,7 @@ class WSA15DatasetConfig(InternVLAA15DatasetConfig):
     human_embodiments: list[str] = field(default_factory=lambda: [HUMAN_EEF_EMBODIMENT])
     human_annotation_row_group_cache_size: int = 0
     data_transforms: TransformGroup = field(default_factory=_robot_transforms)
-    supplemental_video_keys: tuple[str, ...] = MOTION_MASK_KEYS + MOTION_MASK_ID_KEYS
+    supplemental_video_keys: tuple[str, ...] = (FUTURE_2D_SOURCE_KEY, FUTURE_3D_SOURCE_KEY)
 
     def __post_init__(self) -> None:
         # Do not call InternVLAA15DatasetConfig.__post_init__: it intentionally
@@ -204,7 +204,7 @@ class WSA15Config(InternVLAA15Config):
     num_future_3d_tokens: int = 144
     future_query_init_std: float = 0.02
     subtask_loss_weight: float = 1.0
-    supplemental_video_keys: tuple[str, ...] = MOTION_MASK_KEYS + MOTION_MASK_ID_KEYS
+    supplemental_video_keys: tuple[str, ...] = (FUTURE_2D_SOURCE_KEY, FUTURE_3D_SOURCE_KEY)
 
     def __post_init__(self) -> None:
         self.num_learnable_tokens = self.num_future_2d_tokens + self.num_future_3d_tokens
