@@ -99,6 +99,53 @@ def test_3d_does_not_change_rgb_motion_outputs():
         torch.testing.assert_close(before[group], after[group], atol=0, rtol=0)
 
 
+def test_3d_cannot_read_motion_placeholder():
+    flow = small_flow(True)
+    future = Future3DExpert(hidden_dim=10, ffn_dim=20, layers=3, heads=2, head_dim=8, freq_dim=8, output_dim=20)
+    obs, text, valid, rgb, motion, rt, mt = inputs()
+
+    def run(value):
+        states, experts, _, _ = flow.prepare_states(obs, text, valid, rgb, value, rt, mt)
+        states["G"] = future.prepare(2, torch.ones(2, 3, dtype=torch.bool))
+        experts["G"] = future
+        tokens, _ = flow.mot(states, experts)
+        return tokens
+
+    before = run(motion)
+    changed = motion.detach().clone()
+    changed[:, :, 0] += 1000
+    after = run(changed)
+    for group in before:
+        torch.testing.assert_close(before[group], after[group], atol=0, rtol=0)
+    grad = torch.autograd.grad(before["G"].square().sum(), motion)[0]
+    assert torch.isfinite(grad).all() and not grad[:, :, 0].any()
+    assert grad[:, :, 1:].abs().sum() > 0
+
+
+def test_joint_sampler_predicts_3d_in_each_step_without_extra_forward():
+    flow = small_flow().eval()
+    future = Future3DExpert(hidden_dim=10, ffn_dim=20, layers=3, heads=2, head_dim=8, freq_dim=8, output_dim=20).eval()
+    obs, text, valid, *_ = inputs()
+    captures = []
+
+    def record_joint_forward(module, args, output):
+        assert set(args[0]) == {"O", "R", "M", "G"}
+        assert args[0]["M"].tokens.shape[1] == 8
+        captures.append(output[1])
+
+    flow.mot.register_forward_hook(record_joint_forward)
+    with torch.no_grad():
+        rgb, motion, features = flow.sample_latents(
+            obs, text, valid, rgb_shape=(2, 4, 9, 4, 4), motion_shape=(2, 4, 9, 2, 2),
+            motion_placeholder=torch.zeros(2, 4, 1, 2, 2), steps=2, seed=9,
+            future_3d=future, goal_view_valid=torch.ones(2, 3, dtype=torch.bool), return_features=True)
+        expected = future.project(captures[-1])
+    assert len(captures) == 2
+    assert rgb.shape == (2, 4, 9, 4, 4) and motion.shape == (2, 4, 9, 2, 2)
+    for layer in features:
+        torch.testing.assert_close(features[layer], expected[layer], rtol=0, atol=0)
+
+
 def test_missing_views_and_padding_excluded_from_loss():
     student = {4: torch.randn(1, 3, 273, 10, requires_grad=True)}
     teacher = {4: torch.randn(1, 3, 273, 10)}

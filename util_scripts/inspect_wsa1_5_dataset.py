@@ -23,6 +23,7 @@ def main():
     torch.set_num_threads(2)
     base = LeRobotDataset(args.root.name, root=args.root, video_backend="pyav")
     ds = WSA1_5Dataset(base, WSA1_5DatasetConfig(repo_id=args.root.name))
+    # shortcut: 仅检查默认 schema 的首批；需要全量验数时再扩展。
     batch = next(iter(DataLoader(ds, batch_size=1, num_workers=args.workers, collate_fn=wsa1_5_collate)))
     report = {"samples": len(ds), "episodes": ds.num_episodes, "view_keys": ds.view_keys,
               "observed_shape": list(batch["observed_rgb"].shape),

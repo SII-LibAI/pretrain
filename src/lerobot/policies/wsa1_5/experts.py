@@ -93,21 +93,41 @@ class WorldFlow(nn.Module):
             pre = self.motion.pre_dit(motion_latent, motion_t, text, text_valid, fuse_vae_embedding_in_latents=True)
             valid = (torch.ones(b, 1, *motion_latent.shape[2:], dtype=torch.bool, device=motion_latent.device)
                      if motion_valid is None else motion_valid)
-            states["M"] = state_from_pre(pre, token_validity(valid, pre["meta"]["grid_size"]))
+            motion_state = state_from_pre(pre, token_validity(valid, pre["meta"]["grid_size"]))
+            # t0 exists only for the VAE's 4n+1 layout. Remove its tokens before
+            # MoT so it never supplies Q/K/V, text queries, or keys read by G.
+            prefix_n = pre["meta"]["tokens_per_frame"]
+            states["M"] = replace(motion_state, tokens=motion_state.tokens[:, prefix_n:],
+                                  modulation=motion_state.modulation[:, prefix_n:],
+                                  valid=motion_state.valid[:, prefix_n:], freqs=motion_state.freqs[prefix_n:])
             experts["M"], pre_states["M"] = self.motion, pre
         return states, experts, pre_states, obs_n
 
     def velocity(self, observed_latent, text, text_valid, rgb_latent=None, motion_latent=None,
-                 rgb_t=None, motion_t=None, **validity):
+                 rgb_t=None, motion_t=None, *, future_3d=None, goal_view_valid=None, **validity):
         states, experts, pre, obs_n = self.prepare_states(observed_latent, text, text_valid,
                                                        rgb_latent, motion_latent, rgb_t, motion_t, **validity)
-        tokens, _ = self.mot(states, experts)
+        capture_layers = ()
+        if future_3d is not None:
+            if goal_view_valid is None:
+                raise ValueError("Joint 3D prediction requires observed view validity")
+            states["G"] = future_3d.prepare(observed_latent.shape[0], goal_view_valid)
+            experts["G"] = future_3d
+            capture_layers = future_3d.student_layers
+        tokens, captured = self.mot(states, experts, capture_layers=capture_layers)
         result = {}
         if "R" in pre:
             full = torch.cat([tokens["O"][:, :obs_n], tokens["R"]], 1)
             result["rgb"] = self.rgb.post_dit(full, pre["R"])
         if "M" in pre:
-            result["motion"] = self.motion.post_dit(tokens["M"], pre["M"])
+            # Restore the codec layout only after all attention has finished.
+            # The placeholder has no predicted velocity or supervision.
+            prefix_n = pre["M"]["meta"]["tokens_per_frame"]
+            full = torch.cat([torch.zeros_like(pre["M"]["tokens"][:, :prefix_n]), tokens["M"]], 1)
+            motion = self.motion.post_dit(full, pre["M"])
+            result["motion"] = torch.cat([torch.zeros_like(motion[:, :, :1]), motion[:, :, 1:]], 2)
+        if future_3d is not None:
+            result["3d"] = future_3d.project(captured)
         return result
 
     def training_state(self, clean, condition, timestep=None, noise=None):
@@ -148,8 +168,13 @@ class WorldFlow(nn.Module):
         return (per_sample * weights * active).sum() / active.sum().clamp_min(1)
 
     def sample_latents(self, observed_latent, text, text_valid, *, rgb_shape=None, motion_shape=None,
-                       motion_placeholder=None, seed=0, steps=20, observed_valid=None):
-        """Inputs are observations/text plus shapes/constants; there is no motion observation."""
+                       motion_placeholder=None, seed=0, steps=20, observed_valid=None,
+                       future_3d=None, goal_view_valid=None, return_features=False):
+        """Joint denoising; optional 3D features come from the last mixed forward.
+
+        Inputs are observations/text plus shapes/constants; there is no motion
+        observation. G is rebuilt from learned queries at each denoising step.
+        """
         rgb_gen = torch.Generator(device=observed_latent.device).manual_seed(int(seed))
         motion_gen = torch.Generator(device=observed_latent.device).manual_seed(int(seed) + 1)
         # Keep the Euler state in FP32; transformer operations still use AMP.
@@ -165,6 +190,7 @@ class WorldFlow(nn.Module):
         if rgb_flags is not None:
             rgb = rgb.masked_fill(~rgb_flags, 0)
         times, deltas = self.scheduler.build_inference_schedule(steps, observed_latent.device, observed_latent.dtype)
+        features = {}
         for time, delta in zip(times, deltas, strict=True):
             t = time.expand(observed_latent.shape[0])
             if rgb is not None:
@@ -173,7 +199,9 @@ class WorldFlow(nn.Module):
                 motion = torch.cat([motion_placeholder, motion[:, :, 1:]], 2)
             velocity = self.velocity(observed_latent, text, text_valid, rgb, motion,
                                      t if rgb is not None else None, t if motion is not None else None,
-                                     observed_valid=observed_valid, rgb_valid=rgb_flags)
+                                     observed_valid=observed_valid, rgb_valid=rgb_flags,
+                                     future_3d=future_3d, goal_view_valid=goal_view_valid)
+            features = velocity.get("3d", {})
             if rgb is not None:
                 rgb = self.scheduler.step(velocity["rgb"], delta, rgb)
                 if rgb_flags is not None:
@@ -184,7 +212,7 @@ class WorldFlow(nn.Module):
             rgb = torch.cat([observed_latent, rgb[:, :, 1:]], 2)
         if motion is not None:
             motion = torch.cat([motion_placeholder, motion[:, :, 1:]], 2)
-        return rgb, motion
+        return (rgb, motion, features) if return_features else (rgb, motion)
 
 
 class FrozenWanVAE(nn.Module):

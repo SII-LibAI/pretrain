@@ -1,4 +1,4 @@
-"""WSA-style heterogeneous experts with strictly block-causal mixed attention."""
+"""WSA heterogeneous experts with strictly block-causal mixed attention."""
 from __future__ import annotations
 
 from dataclasses import dataclass

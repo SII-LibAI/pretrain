@@ -4,6 +4,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .mot import ExpertState
+from .validation import require_bool, require_finite
 from .vendor.wan_video_dit import SelfAttention, precompute_freqs_cis, sinusoidal_embedding_1d
 
 
@@ -60,8 +61,6 @@ class Future3DExpert(nn.Module):
 
 
 def geometric_feature_loss(student, teacher, valid, *, mse_weight=1.0, cosine_weight=1.0):
-    from .validation import require_bool, require_finite
-
     require_bool(valid, "3D feature validity")
     if not student:
         raise ValueError("3D feature supervision requires non-empty layers")

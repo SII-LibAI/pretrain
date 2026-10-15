@@ -80,10 +80,15 @@ dependencies = [
 wsa1_5 = [
     "torch>=2.6",
     "numpy>=1.26,<2",
+    "transformers>=4.51,<5",
     "safetensors>=0.4.3,<1.0.0",
     "ftfy>=6.1,<7.0",
     "sentencepiece>=0.2,<0.3",
     "regex>=2024.0",
+]
+
+wsa1_5_download = [
+    "modelscope==1.34.0",
 ]
 
 # Policy-specific dependencies

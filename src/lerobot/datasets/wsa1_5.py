@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import operator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from lerobot.dataset_schemas import get_registry, get_schema
 from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
 
 PROMPT_VERSION = "wsa1_5.task-subtask-hand-scene.v1"
@@ -93,7 +95,7 @@ class LoadedEpisodeMetadata:
         self.source = source
         self.entries = {}
         cursor = 0
-        for ep in np.unique(episode_indices):
+        for ep in dict.fromkeys(episode_indices.tolist()):
             count = int((episode_indices == ep).sum())
             self.entries[int(ep)] = {**source.episodes[int(ep)], "dataset_from_index": cursor,
                                      "dataset_to_index": cursor + count}
@@ -112,8 +114,11 @@ class LoadedEpisodeMetadata:
 
 
 class WSA1_5Dataset(Dataset):
-    def __init__(self, base, config: WSA1_5DatasetConfig):
+    def __init__(self, base, config: WSA1_5DatasetConfig, *, include_3d_targets=True):
         self.base, self.config = base, config
+        if type(include_3d_targets) is not bool:
+            raise TypeError("include_3d_targets must be boolean")
+        self.include_3d_targets = include_3d_targets
         self.repo_id = base.repo_id
         self.meta = base.meta
         self.root = Path(base.root)
@@ -121,8 +126,8 @@ class WSA1_5Dataset(Dataset):
         self.timestamps = np.asarray([float(v) for v in base.hf_dataset["timestamp"]], dtype=np.float64)
         if not np.isfinite(self.timestamps).all():
             raise ValueError("Dataset timestamps must be finite")
-        self.frame_indices = np.asarray([int(v) for v in base.hf_dataset["frame_index"]], dtype=np.int64)
-        self.episode_indices = np.asarray([int(v) for v in base.hf_dataset["episode_index"]], dtype=np.int64)
+        self.frame_indices = np.asarray([operator.index(v) for v in base.hf_dataset["frame_index"]], dtype=np.int64)
+        self.episode_indices = np.asarray([operator.index(v) for v in base.hf_dataset["episode_index"]], dtype=np.int64)
         if config.view_keys:
             self.view_keys = list(config.view_keys)
             absent = [key for key in self.view_keys if key and key not in self.meta.features]
@@ -168,12 +173,13 @@ class WSA1_5Dataset(Dataset):
         self.segment_for_sample = []
         self._build_segments(annotations)
         self.meta = LoadedEpisodeMetadata(base.meta, self.episode_indices)
+        self.delta_indices = {config.motion_key: [i * config.frame_stride for i in range(1, 33)]}
         self._motion_reads = 0
         logging.info("[WSA data] repo=%s samples=%d views=%s sidecar_sha256=%s",
                      self.repo_id, len(self), self.view_keys, self.sidecar_digest)
 
     def _build_segments(self, annotations):
-        for ep in np.unique(self.episode_indices):
+        for ep in dict.fromkeys(self.episode_indices.tolist()):
             positions = np.flatnonzero(self.episode_indices == ep)
             if not np.array_equal(positions, np.arange(positions[0], positions[-1] + 1)):
                 raise ValueError(f"Episode {ep} rows are not contiguous")
@@ -258,11 +264,14 @@ class WSA1_5Dataset(Dataset):
     def __getitem__(self, index):
         idx = self.sample_indices[index]
         segment = self.segments[self.segment_for_sample[index]]
-        requested = idx + np.arange(1, 33) * self.config.frame_stride
-        valid_time = torch.from_numpy(requested <= segment.last)
-        future_indices = np.minimum(requested, segment.last)
+        # Use loaded-table episode offsets, including when the base dataset filters episodes.
+        query_indices, padding = LeRobotDataset._get_query_indices(self, idx, segment.episode)
+        future_indices = query_indices[self.config.motion_key]
+        valid_time = ~padding[f"{self.config.motion_key}_is_pad"]
         future_ts = self.timestamps[future_indices]
-        all_ts = np.concatenate(([self.timestamps[idx]], future_ts, [self.timestamps[segment.last]]))
+        all_ts = np.concatenate(([self.timestamps[idx]], future_ts))
+        if self.include_3d_targets:
+            all_ts = np.concatenate((all_ts, [self.timestamps[segment.last]]))
         views, view_valid = zip(*(self._decode(key, all_ts, segment.episode) for key in self.view_keys), strict=True)
         canvas, pixels_valid = compose_rgb_views(views, view_valid, self.config.rgb_height, self.config.rgb_width)
         normalized = imagenet_normalize(canvas)
@@ -279,11 +288,14 @@ class WSA1_5Dataset(Dataset):
         motion = imagenet_normalize(motion).masked_fill(~motion_valid[:, None, None, None], 0)
         targets = {
             "future_rgb": normalized[1:33], "future_motion": motion,
-            "goal_rgb_views": [view[-1] for view in views],  # Raw [0,1], native sizes.
             "rgb_valid": pixels_valid[1:33] & valid_time[:, None, None, None],
             "motion_valid": motion_valid,
-            "goal_view_valid": torch.tensor([bool(mask[-1]) and segment.metadata_valid for mask in view_valid]),
         }
+        if self.include_3d_targets:
+            targets.update({
+                "goal_rgb_views": [view[-1] for view in views],  # Raw [0,1], native sizes.
+                "goal_view_valid": torch.tensor([bool(mask[-1]) and segment.metadata_valid for mask in view_valid]),
+            })
         return {
             **build_inference_condition(normalized[0], segment.text, observed_valid=pixels_valid[0]),
             "targets": targets, "sample_id": f"{self.repo_id}:{segment.episode}:{int(self.frame_indices[idx])}",
@@ -299,9 +311,13 @@ def wsa1_5_collate(samples):
     """Native teacher view shapes may differ between cameras and datasets."""
     if not samples:
         raise ValueError("Cannot collate an empty WSA batch")
+    target_keys = set(samples[0]["targets"])
+    if any(set(sample["targets"]) != target_keys for sample in samples):
+        raise ValueError("Cannot collate samples with different 3D supervision settings")
     out = default_collate([{k: v for k, v in sample.items() if k not in {"targets", "repo_id", "dataset_index"}}
                            for sample in samples])
     out["targets"] = default_collate([{k: v for k, v in sample["targets"].items() if k != "goal_rgb_views"}
                                       for sample in samples])
-    out["targets"]["goal_rgb_views"] = [sample["targets"]["goal_rgb_views"] for sample in samples]
+    if "goal_rgb_views" in target_keys:
+        out["targets"]["goal_rgb_views"] = [sample["targets"]["goal_rgb_views"] for sample in samples]
     return out

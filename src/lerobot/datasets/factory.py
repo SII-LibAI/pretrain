@@ -384,7 +384,8 @@ def _build_single_dataset(
         root = Path(cfg.dataset.root) / repo_id if cfg.dataset.root else HF_LEROBOT_HOME / repo_id
         base = LeRobotDataset(repo_id, root=root, episodes=cfg.dataset.episodes,
                              revision=cfg.dataset.revision, video_backend=cfg.dataset.video_backend)
-        return WSA1_5Dataset(base, cfg.dataset), base.meta.stats.copy(), base.meta.robot_type
+        dataset = WSA1_5Dataset(base, cfg.dataset, include_3d_targets=cfg.policy.use_3d_supervision)
+        return dataset, base.meta.stats.copy(), base.meta.robot_type
 
     use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
     input_transforms = cfg.dataset.data_transforms.inputs

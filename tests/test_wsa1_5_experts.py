@@ -54,6 +54,45 @@ def test_rgb_motion_perturbation_and_observation_isolation():
     torch.testing.assert_close(only_motion["motion"], before["motion"], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("backend", ["sdpa", "math", "reference"])
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_motion_placeholder_never_enters_attention(monkeypatch, backend, checkpointing):
+    model = small_flow(checkpointing)
+    model.mot.backend = backend
+    obs, text, text_valid, rgb, _, rt, mt = inputs()
+    motion = torch.randn(2, 4, 9, 4, 4, requires_grad=True)
+    valid = torch.ones(2, 1, 9, 4, 4, dtype=torch.bool)
+    valid[:, :, 4, :, :2] = False
+    original_valid = valid.clone()
+    states, _, pre, _ = model.prepare_states(obs, text, text_valid, rgb, motion, rt, mt, motion_valid=valid)
+    prefix_n = pre["M"]["meta"]["tokens_per_frame"]
+    assert prefix_n == 4 and states["M"].tokens.shape[1] == 8 * prefix_n
+    torch.testing.assert_close(states["M"].freqs, pre["M"]["freqs"][prefix_n:])
+    expected_valid = valid[:, :, 1:].reshape(2, 1, 8, 2, 2, 2, 2).all((4, 6)).flatten(1)
+    torch.testing.assert_close(states["M"].valid, expected_valid)
+    torch.testing.assert_close(valid, original_valid)
+    calls = []
+
+    def check_future_queries_only(module, args):
+        assert args[0].shape[1] == 8 * prefix_n
+        calls.append(1)
+
+    for block in model.motion.blocks:
+        for projection in [block.self_attn.q, block.self_attn.k, block.self_attn.v, block.cross_attn.q]:
+            projection.register_forward_pre_hook(check_future_queries_only)
+    before = model.velocity(obs, text, text_valid, rgb, motion, rt, mt, motion_valid=valid)
+    assert len(calls) == 4 * len(model.motion.blocks)
+    assert before["motion"].shape == motion.shape and not before["motion"][:, :, 0].any()
+    changed = motion.detach().clone()
+    changed[:, :, 0] += 1000
+    after = model.velocity(obs, text, text_valid, rgb, changed, rt, mt, motion_valid=valid)
+    for name in before:
+        torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
+    before["motion"][:, :, 1:].square().sum().backward()
+    assert torch.isfinite(motion.grad).all()
+    assert not motion.grad[:, :, 0].any() and motion.grad[:, :, 1:].abs().sum() > 0
+
+
 def test_motion_sampling_without_motion_observation():
     model = small_flow().eval()
     obs, text, valid, *_ = inputs()
@@ -66,6 +105,13 @@ def test_motion_sampling_without_motion_observation():
         torch.testing.assert_close(x, y, atol=0, rtol=0)
     torch.testing.assert_close(a[0][:, :, :1], obs)
     assert not a[1][:, :, 0].any()
+    # The codec retains t0, but its value must not affect future sampling.
+    kwargs["motion_placeholder"] = torch.full_like(kwargs["motion_placeholder"], 100)
+    with torch.no_grad():
+        changed = model.sample_latents(obs, text, valid, **kwargs)
+    torch.testing.assert_close(changed[0], a[0], rtol=0, atol=0)
+    torch.testing.assert_close(changed[1][:, :, 1:], a[1][:, :, 1:], rtol=0, atol=0)
+    torch.testing.assert_close(changed[1][:, :, :1], kwargs["motion_placeholder"])
 
 
 def test_temporal_mapping_masks_and_no_observed_motion():
@@ -106,6 +152,23 @@ def test_masked_flow_and_first_frame_exclusion():
     loss = flow.flow_loss(prediction, target, t, valid)
     loss.backward()
     assert loss.item() == 0 and torch.isfinite(prediction.grad).all()
+
+
+def test_placeholder_prediction_and_target_have_zero_loss_gradients():
+    flow = small_flow()
+    prediction = torch.randn(2, 4, 9, 2, 2, requires_grad=True)
+    target = torch.randn_like(prediction, requires_grad=True)
+    valid = torch.ones(2, 1, 9, 2, 2, dtype=torch.bool)
+    t = torch.tensor([400.0, 600.0])
+    loss = flow.flow_loss(prediction, target, t, valid)
+    changed_prediction, changed_target = prediction.detach().clone(), target.detach().clone()
+    changed_prediction[:, :, 0] += 1000
+    changed_target[:, :, 0] -= 1000
+    torch.testing.assert_close(loss, flow.flow_loss(changed_prediction, changed_target, t, valid), rtol=0, atol=0)
+    loss.backward()
+    for grad in [prediction.grad, target.grad]:
+        assert torch.isfinite(grad).all() and not grad[:, :, 0].any()
+        assert grad[:, :, 1:].abs().sum() > 0
 
 
 def test_bf16_autocast_with_fp32_master_parameters():

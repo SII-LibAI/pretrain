@@ -1,3 +1,7 @@
+# Adapted from zaleni/WSA @ 32211e42399bddb48382585639f79ea749f253f2:
+# src/lerobot/policies/WSA_Large/core/models/wan22/schedulers/scheduler_continuous.py
+# Preserve its shifted time distribution and Gaussian-shaped loss weights;
+# keep integration, times and loss arithmetic in FP32 in this implementation.
 import math
 
 import torch
@@ -69,11 +73,6 @@ class WanContinuousFlowMatchScheduler:
             return (1 - sigma) * original_samples.float() + sigma * noise.float()
         sigma = sigma.view(-1, *([1] * (original_samples.ndim - 1)))
         return (1 - sigma) * original_samples.float() + sigma * noise.float()
-
-    @staticmethod
-    def training_target(sample: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        del timestep
-        return noise - sample
 
     def build_inference_schedule(
         self,

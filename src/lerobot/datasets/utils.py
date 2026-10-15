@@ -131,7 +131,10 @@ def load_nested_dataset(
         table = arrow_dataset.to_table(filter=filter_expr)
 
         if features is not None:
-            table = table.cast(features.arrow_schema)
+            schema = features.arrow_schema
+            if sorted(table.column_names) != sorted(schema.names):
+                raise ValueError(f"Parquet columns {table.column_names} do not match feature schema {schema.names}")
+            table = table.select(schema.names).cast(schema)
 
         return Dataset(table)
 

@@ -96,9 +96,10 @@ def main():
         count = 0
         for cached_batch in batches:
             cached_batch = send_to_device(cached_batch, accelerator.device)
-            observed, *_ = policy.encode_observation(cached_batch["observed_rgb"], cached_batch["condition_text"],
-                                                      cached_batch.get("observed_valid"))
-            policy.prepare_training_targets(cached_batch, observed)
+            clean, *_ = policy.prepare_training_targets(cached_batch)
+            latent = clean["rgb"][:, :, :1] if "rgb" in clean else None
+            policy.encode_observation(cached_batch["observed_rgb"], cached_batch["condition_text"],
+                                      cached_batch.get("observed_valid"), latent=latent)
             count += 1
             if count >= args.cache_batches:
                 break

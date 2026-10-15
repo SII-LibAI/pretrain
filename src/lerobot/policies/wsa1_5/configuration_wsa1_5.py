@@ -39,10 +39,12 @@ class WSA1_5Config(PreTrainedConfig):
     student_layers: tuple[int, ...] | None = None
     enable_rgb: bool = True
     enable_motion: bool = True
-    enable_3d: bool = True
+    enable_3d_queries: bool = True  # Expert/query existence, including zero-loss ablations.
+    enable_3d_supervision: bool = True
+    enable_3d: bool | None = None  # Legacy query flag, normalized into enable_3d_queries.
     lambda_rgb: float = 1.0
     lambda_motion: float = 1.0
-    lambda_3d: float = 1.0
+    lambda_3d: float = 1.0  # Zero skips teacher construction, target loading/cache and 3D loss.
     feature_mse_weight: float = 1.0
     feature_cosine_weight: float = 1.0
     freeze_rgb: bool = False
@@ -56,10 +58,9 @@ class WSA1_5Config(PreTrainedConfig):
     gradient_accumulation_steps: int = 1
     flow_shift: float = 5.0
     sampler_steps: int = 20
-    goal_sampler_steps: int = 8
-    # Sole supported training mode: generate from independent noise, then
-    # recompute differentiable representations; no noisy-target estimates.
-    goal_conditioning: str = "generated"
+    # Legacy checkpoint field; joint 3D training performs no extra sampling.
+    goal_sampler_steps: int | None = None
+    goal_conditioning: str = "joint"
     cache_dir: str | None = None
     # Saved with the policy: these frozen weights are included in the complete
     # checkpoint, so resume/inference can reuse artifacts without source .pth files.
@@ -74,6 +75,13 @@ class WSA1_5Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.enable_3d is not None:
+            if type(self.enable_3d) is not bool:
+                raise ValueError("enable_3d must be boolean when supplied")
+            self.enable_3d_queries = self.enable_3d
+            self.enable_3d = None
+        if type(self.enable_3d_queries) is not bool or type(self.enable_3d_supervision) is not bool:
+            raise ValueError("3D query and supervision switches must be boolean")
         scalars = ["lambda_rgb", "lambda_motion", "lambda_3d", "feature_mse_weight", "feature_cosine_weight",
                    "rgb_lr", "motion_lr", "goal_lr", "heads_lr", "optimizer_weight_decay", "flow_shift"]
         for name in scalars:
@@ -82,7 +90,7 @@ class WSA1_5Config(PreTrainedConfig):
         dimensions = ["rgb_hidden_dim", "rgb_ffn_dim", "motion_hidden_dim", "motion_ffn_dim",
                       "goal_hidden_dim", "goal_ffn_dim", "latent_channels", "text_dim", "freq_dim", "max_text_length",
                       "num_layers", "num_heads", "head_dim", "gradient_accumulation_steps", "sampler_steps",
-                      "goal_sampler_steps", "rgb_height", "rgb_width", "motion_height", "motion_width"]
+                      "rgb_height", "rgb_width", "motion_height", "motion_width"]
         if any(type(getattr(self, name)) is not int or getattr(self, name) <= 0 for name in dimensions):
             raise ValueError("Model dimensions and step counts must be positive integers")
         if self.freq_dim % 2:
@@ -96,17 +104,17 @@ class WSA1_5Config(PreTrainedConfig):
             raise ValueError("Unsupported WSA dtype")
         if self.future_frames != 32 or self.n_obs_steps != 1:
             raise ValueError("WSA1.5 first version requires one observation and 32 future frames")
-        if not any((self.enable_rgb, self.enable_motion, self.enable_3d)):
+        if not any((self.enable_rgb, self.enable_motion, self.enable_3d_queries)):
             raise ValueError("Enable at least one supervised modality")
-        if self.goal_conditioning != "generated":
-            raise ValueError("Only target-independent generated-future 3D conditioning is supported")
+        # Accept serialized legacy configs while making their new semantics explicit.
+        if self.goal_conditioning == "generated":
+            self.goal_conditioning = "joint"
+        if self.goal_conditioning != "joint":
+            raise ValueError("Only joint O/R/M/G mixed-attention 3D conditioning is supported")
         if self.motion_initialization not in {"wan_width_interpolation", "random"} or self.goal_initialization not in {"wan_width_interpolation", "random"}:
             raise ValueError("Unknown expert initialization rule")
         if self.attention_backend not in {"sdpa", "math", "reference"}:
             raise ValueError("Attention backend must preserve explicit masks")
-        if min(self.num_layers, self.num_heads, self.head_dim, self.gradient_accumulation_steps,
-               self.sampler_steps, self.goal_sampler_steps) <= 0:
-            raise ValueError("Depth, attention geometry, accumulation and sampler steps must be positive")
         rope_width = (self.head_dim - 2 * (self.head_dim // 3)) // 2 + 2 * ((self.head_dim // 3) // 2)
         if self.head_dim % 2 or rope_width != self.head_dim // 2:
             raise ValueError("head_dim must support the Wan three-axis RoPE partition")
@@ -119,9 +127,14 @@ class WSA1_5Config(PreTrainedConfig):
         if min(self.rgb_lr, self.motion_lr, self.goal_lr, self.heads_lr) <= 0:
             raise ValueError("Per-module learning rates must be positive")
         effective = [self.lambda_rgb if self.enable_rgb else 0, self.lambda_motion if self.enable_motion else 0,
-                     self.lambda_3d * (self.feature_mse_weight + self.feature_cosine_weight) if self.enable_3d else 0]
+                     self.lambda_3d * (self.feature_mse_weight + self.feature_cosine_weight) if self.use_3d_supervision else 0]
         if not any(weight > 0 for weight in effective):
             raise ValueError("At least one enabled modality must have positive effective loss weight")
+
+    @property
+    def use_3d_supervision(self):
+        return (self.enable_3d_queries and self.enable_3d_supervision and self.lambda_3d > 0
+                and self.feature_mse_weight + self.feature_cosine_weight > 0)
 
     @property
     def observation_delta_indices(self):

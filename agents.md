@@ -12,9 +12,7 @@
 
 因：当前三视角 RGB 观测与丰富物理语义文本。
 
-中间结果：未来 32 帧 RGB 与未来 32 帧 XYZ motion。
-
-最终结果：当前子任务完成时刻的目标 3D state features。
+结果：未来 32 帧 RGB 与未来 32 帧 XYZ motion,当前子任务完成时刻的目标 3D state features
 
 暂时不预测 robot action，不添加 action expert，不添加额外结构化物理特征编码器。
 
@@ -43,6 +41,10 @@
 ### Future3D Expert
 
 - 参考 WSA-L 的 Future3DExpert。
+- 使用 `enable_3d_queries` 控制 G queries/3D expert 是否存在，与 3D 监督开关独立；旧 `enable_3d` 只作为兼容别名。
+- 使用 `enable_3d_supervision` 控制 3D 蒸馏监督，且只有 queries 开启、`lambda_3d > 0`、特征损失权重非零时才启用监督。`lambda_3d=0` 同样关闭监督。
+- 监督关闭时不创建/加载 VGGT-Omega teacher，不提取/读取 teacher 特征缓存，不要求目标图像或目标视角 mask，不计算 3D loss；queries 开启时 G 仍参与训练/推理的联合注意力并输出特征。
+- 无 3D 监督时，G 无法通过 R/M 的损失获得梯度，冻结 3D expert 并移出优化器，避免分布式训练的未使用可训练参数。
 - 初始化 3×273=819 个可学习 3D queries。
 - 每个视角包括 1 camera query、16 register queries 和 256 patch queries。
 - 目标是预测当前子任务结束时的三视角几何表征。
@@ -72,7 +74,7 @@
 - 不得因为使用 FlashAttention、SDPA 或其他优化算子而退化成 full attention。
 - 训练与推理必须保持相同的依赖关系。
 
-特别注意：3D 的最终目标是读取模型预测出来的未来表征，而不是训练过程中从真实未来视频生成的近似干净 latent。必须防止 teacher-forcing leakage。
+按用户最新说明：O/R/M/G 在同一次 MoT 前向中混合注意力，RGB、Motion、3D 分别并行输出并计算监督。训练时 R/M 使用标准 Flow Matching 的带噪训练状态，G 读取同次前向的 O/R/M/G 隐藏表征；不得为 3D 额外先采样未来或运行第二次 MoT。推理时每个去噪步骤也包含 G，返回最后一次联合前向的 3D 特征。真实目标图像与 teacher features 只用于监督，不作为 G 的输入。Motion 占位首帧 token 必须在 MoT 前移除，并从监督中屏蔽。
 
 
 MoT 风格共享注意力计算，但不能改变上述因果依赖。

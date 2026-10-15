@@ -14,7 +14,8 @@ WSA1.5 本地开发交付记录 — 2026-10-15
    dataset 的正式注册名为 wsa1_5。复用现有 draccus CLI、factory、DataLoader、
    数据混合/权重采样、Accelerate、optimizer/scheduler、日志和 checkpoint 体系。
 2. 数据 adapter 组合现有 LeRobotDataset，使用实际 frame table 的 timestamp。
-   未来索引按 frame_stride/fps 规则采样，并在当前子任务闭区间内重复边界帧。
+   未来索引按 frame_stride 采样，允许跨子任务；复用 LeRobot 的 episode 尾部 padding/mask。
+   仅越过 episode 末尾时重复末帧；当前子任务仍决定文本条件和 3D 终点标签。
    重复出的越界帧明确标记无效；每条 future_rgb/future_motion 仍为 32 时间步。
    Motion 视频帧按与 RGB 相同的源 timestamp 查询；不臆造其物理单位或编码 scale。
 3. 已核实 sidecar 为 episode 对象列表，字段为 episode_index/task_instruction/scene/
@@ -38,7 +39,8 @@ WSA1.5 本地开发交付记录 — 2026-10-15
    Motion 与 3D backbone 通过显式逐轴插值缩宽，time_projection 的六组门控不混合。
    加载前报告 missing/unexpected/shape mismatch，并记录各层参数数量；没有随机回退。
 8. 33 帧 RGB=当前 1 帧+未来 32 帧；Motion=固定模型域零占位帧+未来 32 帧。
-   当前 RGB latent 和固定 Motion placeholder latent 都单独编码，不能来自完整 target。
+   RGB 训练复用完整干净视频的首帧 latent；推理或无 RGB target 时单独编码观测。
+   Motion placeholder 保留 codec 时间布局，但其 token 在 MoT 前移除，不参与注意力或监督。
    明确校验 Wan 的 9 latent 时间步及 33 decoded 帧；仅未来 latent 参与 flow loss。
    官方源码显示直接编码 32 帧会得到 8 latents、解码 29 帧，真实权重行为待服务器验证。
 9. Future3DExpert 使用 819 个随机初始化的可学习 queries，每视角 1 camera +
@@ -48,12 +50,19 @@ WSA1.5 本地开发交付记录 — 2026-10-15
     原始图像遵循官方中心裁剪、PIL bicubic resize 和多视角白色 padding；没有拉伸成
     固定正方形。17 个特殊 tokens 直接对应，patch features 按内容区域网格采样至 16x16。
     padding/缺失视角不参与 normalized feature MSE 与 cosine feature loss。
-11. OmegaTeacher 冻结/eval/inference_mode，只有训练 target extraction 才懒加载。
+11. enable_3d_queries 控制 G，enable_3d_supervision 控制监督，lambda_3d=0 也关闭监督。
+    监督关闭时不构造 OmegaTeacher，不要求目标图像、不读取 teacher 缓存、不计算 3D loss；
+    G 可保留参与联合前向并输出特征，但无监督的 3D 参数冻结并移出优化器。
+    factory 同时关闭 dataset 的终点图像/goal mask 加载；collate 支持不含 3D 标签的 batch。
+    采样 helper 的 return_features 只决定返回值，不再决定已初始化的 G 是否参加每步联合前向。
+    OmegaTeacher 仅在监督有效时创建，冻结/eval/inference_mode，训练 target extraction 才懒加载。
     不注册为 policy 子模块，teacher 权重不进入 policy checkpoint。懒初始化保护 RNG，
     有无 endpoint 标签不能改变 student 的随机噪声轨迹。推理不加载或调用 teacher。
-12. 3D 训练通过独立噪声 sampler 生成未来，再重新计算可微表征。
-    不使用 GT clean latent，也不使用混有 GT 的 noisy latent 估计作为 G 的条件。
-    默认每次 3D loss 增加 8 次生成迭代和一次 feature pass；此计算开销真实存在。
+12. 按用户最新澄清，O/R/M/G 在同一次 MoT 前向中联合计算。
+    训练时 R/M 使用标准 flow matching 带噪状态，G 从同次前向的隐藏表征预测几何特征。
+    不额外采样未来或执行第二次 feature pass；推理时每一步去噪也联合计算 G。
+    目标图像和 teacher features 仅作监督，不输入学生；3D 输出取最后一次联合前向。
+    goal_sampler_steps 仅为旧 checkpoint 字段，不再控制训练计算；goal_conditioning 为 joint。
 13. 总损失为 lambda_rgb*RGB flow + lambda_motion*Motion flow + lambda_3d*3D feature。
     各项单独日志；支持 modality enable、模块冻结、四类独立学习率参数组。
     默认训练参数保持 FP32，计算使用 BF16 autocast；冻结 VAE/UMT5 按计算 dtype 加载。
@@ -114,7 +123,10 @@ src/lerobot/policies/internvla_a1_5/transform_internvla_a1_5.py：在实际使�
 后两项避免 WSA 注册被缺失的 Qwen3.5 依赖阻挡，没有改变 A1.5 的模型计算语义。
 
 本地检查
-56 项测试通过：45 项新组件/接口测试和 11 项现有数据回归测试。
+当前完整回归 138 项通过，1 项官方不同尺寸图像 padding 的预期 warning。
+覆盖 3D query/teacher/loss 开关、零权重无终点标签 batch、优化器分组、联合前向、数据工厂、
+缓存、数值边界、RGB/Motion 与 3D 梯度和现有数据回归；没有加载真实模型或执行 optimizer.step。
+本轮结果见 outputs/wsa1_5_3d_ablation_tests.txt。
 完整测试结果见 outputs/wsa1_5_test_results.txt；一个 warning 来自官方多视角 padding 提示。
 静态 F 规则检查见 outputs/wsa1_5_lint_results.txt；compileall 与 git diff --check 通过。
 launch/wsa_1_5_pretrain.sh 的 bash -n 及 WSA_DRY_RUN=1 通过；没有执行打印出的训练命令。
@@ -181,9 +193,22 @@ RGB/Motion 返回反归一化后的三通道视频数值；Motion 物理单位�
 - 官方 VAE 实际 encode32/decode29、encode33/decode33、t0 causality 的数值检查。
 - 真实模型单步训练、固定样本 loss 下降、保存/重载预测一致和继续优化。
 - 多 GPU DDP、BF16 大模型数值稳定性、梯度累积、checkpointing 的显存/吞吐表现。
-- 严格无泄漏 G 的生成迭代成本及实际生成质量；FP32 训练参数/Adam 状态会占用较多显存。
+- 联合 G 的每步混合注意力成本及实际生成质量；FP32 训练参数/Adam 状态会占用较多显存。
 - 独立异构真实多数据集混合；真实三视角数据与物理 XYZ 编码/误差。
 以上均未宣称通过。代码不提供 fake VAE/teacher、随机权重回退或跳过实际训练 loss。
+
+本轮未来窗口边界修正
+- RGB/Motion 的 32 帧窗口允许跨子任务，直接复用 LeRobotDataset._get_query_indices
+  的 episode 尾部 padding 和 mask；文本、3D 终点仍取当前子任务。
+- 筛选后的 episode 使用实际加载行偏移，保留源 episode 的出现顺序，避免跨 episode。
+- 修复基础 reader 在指定 episodes 时因 Parquet/schema 列顺序不同而失败的问题；
+  按列名对齐后仍执行严格 cast，缺列/额外列继续报错，不补默认值。
+- 完整回归 167 passed，1 项官方预处理的预期 warning；Ruff F、README 语法和
+  git diff --check 通过。日志：outputs/wsa1_5_episode_window_tests.txt。
+- 真实 knit_scarf 数据双 worker 读取通过；episodes=[0] 共 300 帧，第 85 帧为
+  子任务终点，之后 32 帧均有效，episode 最后一帧的未来 mask 全无效。
+  结果：outputs/wsa1_5_episode_window_dataset.json、wsa1_5_episode_boundary_real.json。
+- 未加载预训练模型或训练。episode 尾部若整批没有任何有效监督，仍按原数值检查报错。
 
 额度
 用户最后提供剩余 87%、页面显示 3:59 重置。本会话没有账户额度查询接口，无法将

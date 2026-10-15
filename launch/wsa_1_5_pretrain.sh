@@ -13,7 +13,6 @@ if [[ -n "${RESUME_CONFIG:-}" ]]; then
 else
     : "${DATA_ROOT:?Set the dataset collection root separately from model/output directories}"
     : "${WAN_MODEL_PATH:?Set the local Wan2.2-TI2V-5B directory}"
-    : "${OMEGA_CHECKPOINT_PATH:?Set the local VGGT-Omega-1B-256-Text-Alignment model.pt}"
     DATASET_REPO_IDS="${DATASET_REPO_IDS:-$(python util_scripts/discover_wsa1_5_datasets.py --root "$DATA_ROOT")}"
     TRAIN_ARGS=(
         --policy.type=WSA_1_5
@@ -22,7 +21,10 @@ else
         --policy.vae_path="${VAE_PATH:-$WAN_MODEL_PATH/Wan2.2_VAE.pth}"
         --policy.text_encoder_path="${TEXT_ENCODER_PATH:-$WAN_MODEL_PATH/models_t5_umt5-xxl-enc-bf16.pth}"
         --policy.tokenizer_path="${TOKENIZER_PATH:-$WAN_MODEL_PATH/google/umt5-xxl}"
-        --policy.omega_checkpoint_path="$OMEGA_CHECKPOINT_PATH"
+        --policy.omega_checkpoint_path="${OMEGA_CHECKPOINT_PATH:-}"
+        --policy.enable_3d_queries="${ENABLE_3D_QUERIES:-true}"
+        --policy.enable_3d_supervision="${ENABLE_3D_SUPERVISION:-true}"
+        --policy.lambda_3d="${LAMBDA_3D:-1.0}"
         --policy.dtype=bfloat16
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"

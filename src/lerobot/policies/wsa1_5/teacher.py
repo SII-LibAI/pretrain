@@ -105,7 +105,7 @@ class OmegaTeacher:
     def _load(self, device):
         if self.model is None:
             if not self.checkpoint_path:
-                raise ValueError("Training 3D targets requires an Omega checkpoint or a verified feature cache")
+                raise ValueError("Uncached 3D targets require an Omega checkpoint")
             from vggt_omega.models import VGGTOmega
             # Lazy teacher initialization must not consume the student's RNG:
             # whether endpoint labels exist cannot alter its noise trajectory.

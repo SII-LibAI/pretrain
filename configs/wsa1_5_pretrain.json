@@ -4,11 +4,14 @@
     "device": "cuda",
     "dtype": "bfloat16",
     "push_to_hub": false,
+    "enable_3d_queries": true,
+    "enable_3d_supervision": true,
+    "lambda_3d": 1.0,
     "wan_model_path": "weights/Wan2.2-TI2V-5B",
     "vae_path": "weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
     "text_encoder_path": "weights/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",
     "tokenizer_path": "weights/Wan2.2-TI2V-5B/google/umt5-xxl",
-    "omega_checkpoint_path": "weights/VGGT-Omega-1B-256-Text-Alignment/model.pt"
+    "omega_checkpoint_path": "weights/VGGT-Omega-1B-256-Text-Alignment/vggt_omega_1b_256_text.pt"
   },
   "dataset": {
     "type": "wsa1_5",

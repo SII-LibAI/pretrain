@@ -13,15 +13,20 @@ PIPELINE_VERSION = "wsa1_5.v2.wan32211e4.omega48b23c8.imagenet.33frames.fp32flow
 
 
 def fingerprint_path(path):
+    if not path or not str(path).strip():
+        raise ValueError("Cannot fingerprint an empty asset path")
     root = Path(path)
     if not root.exists():
         raise FileNotFoundError(root)
-    files = sorted(p for p in root.rglob("*") if p.is_file()) if root.is_dir() else [root]
+    # Directory filters exclude unrelated documents; a named weight file always counts.
+    files = [root]
+    if root.is_dir():
+        files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {
+            ".json", ".safetensors", ".pth", ".pt", ".bin", ".model", ".txt"})
+    if not files:
+        raise ValueError(f"No fingerprintable assets in {root}")
     digest = hashlib.sha256()
     for file in files:
-        # Model/tokenizer directories must not depend on unrelated Markdown.
-        if file.suffix.lower() not in {".json", ".safetensors", ".pth", ".pt", ".bin", ".model", ".txt"}:
-            continue
         digest.update((file.relative_to(root).as_posix() if root.is_dir() else file.name).encode())
         with file.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):

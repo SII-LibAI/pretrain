@@ -18,6 +18,7 @@ from .future_3d import Future3DExpert, geometric_feature_loss
 from .initialization import interpolate_wan_state, load_report, read_checkpoint
 from .teacher import OMEGA_PREPROCESS_VERSION, OmegaTeacher
 from .temporal import TemporalLayout
+from .validation import require_bool, require_finite
 from .vendor.helpers.state_dict_converters import wan_video_dit_state_dict_converter
 
 
@@ -53,12 +54,14 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 config.frozen_asset_fingerprints.clear()
             components = self._build_components(initialize_pretrained)
         self.flow = components.flow
-        self.future_3d = components.future_3d
+        self.future_3d = components.future_3d if config.enable_3d_queries else None
+        if config.enable_3d_queries and self.future_3d is None:
+            raise ValueError("enable_3d_queries requires a Future3DExpert")
         self.vae = components.vae
         self.text_encoder = components.text_encoder
         self.tokenizer = components.tokenizer
         self.teacher = OmegaTeacher(config.omega_checkpoint_path, config.teacher_layers,
-                                    dtype=self.model_dtype) if config.enable_3d else None
+                                    dtype=self.model_dtype) if config.use_3d_supervision else None
         self.cache = ArtifactCache(config.cache_dir) if config.cache_dir else None
         self._fingerprints = {}
         self._freeze_modules()
@@ -84,7 +87,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
             motion = MotionDiTExpert(**wan_config(cfg.motion_hidden_dim, cfg.motion_ffn_dim, **common)) if cfg.enable_motion else None
             student = Future3DExpert(cfg.goal_hidden_dim, cfg.goal_ffn_dim, cfg.num_layers, cfg.num_heads,
                                      cfg.head_dim, cfg.freq_dim, teacher_layers=cfg.teacher_layers,
-                                     student_layers=cfg.student_layers) if cfg.enable_3d else None
+                                     student_layers=cfg.student_layers) if cfg.enable_3d_queries else None
         with construction_dtype(self.model_dtype):
             text_encoder = WanTextEncoder()
         # Keep official mean/std and inverse-std calculation in float32;
@@ -136,7 +139,9 @@ class WSA1_5_Policy(PreTrainedPolicy):
         if self.flow.motion is not None and cfg.freeze_motion:
             self.flow.motion.requires_grad_(False)
         if self.future_3d is not None:
-            if cfg.freeze_3d:
+            # R/M cannot read G, so without 3D loss these parameters have no
+            # gradient path. Freeze them to avoid unused trainable DDP parameters.
+            if cfg.freeze_3d or not cfg.use_3d_supervision:
                 self.future_3d.requires_grad_(False)
             if cfg.freeze_heads:
                 self.future_3d.feature_heads.requires_grad_(False)
@@ -230,31 +235,26 @@ class WSA1_5_Policy(PreTrainedPolicy):
         return context, torch.stack(masks)
 
     def _encode_video(self, kind, video, metadata):
-        from .validation import require_finite
-
         require_finite(video, f"{kind} VAE input")
         if self.vae is None:
             raise RuntimeError("Pixel-space execution requires the actual frozen Wan2.2 VAE")
         if self.cache is None:
-            latent = self.vae.encode(video.to(self.model_dtype)).to(self.model_dtype)
-            self._validate_encoded_latent(latent, video)
-            return latent
-        # Cache by sample, not by shuffled batch composition. Offline artifacts
-        # remain reusable with different worker counts, batch sizes and mixing.
-        latents = []
-        for index in range(video.shape[0]):
-            item = video[index:index + 1]
-            info = self._sample_metadata(metadata, index, video.shape[0])
-            values = self._cached(kind, {"video": item, "metadata": info},
-                                  lambda item=item: {"latent": self.vae.encode(item.to(self.model_dtype))}, ["vae_path"])
-            latents.append(values["latent"])
-        latent = torch.cat(latents).to(self.model_dtype)
+            latent = self.vae.encode(video.to(self.model_dtype))
+        else:
+            # Cache per sample so shuffled batches can reuse the same artifacts.
+            latents = []
+            for index in range(video.shape[0]):
+                item = video[index:index + 1]
+                info = self._sample_metadata(metadata, index, video.shape[0])
+                values = self._cached(kind, {"video": item, "metadata": info},
+                                      lambda item=item: {"latent": self.vae.encode(item.to(self.model_dtype))}, ["vae_path"])
+                latents.append(values["latent"])
+            latent = torch.cat(latents)
+        latent = latent.to(self.model_dtype)
         self._validate_encoded_latent(latent, video)
         return latent
 
     def _validate_encoded_latent(self, latent, video):
-        from .validation import require_finite
-
         expected = (video.shape[0], self.config.latent_channels, (video.shape[2] - 1) // 4 + 1,
                     video.shape[3] // 16, video.shape[4] // 16)
         if tuple(latent.shape) != expected:
@@ -273,7 +273,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 result[key] = value
         return result
 
-    def encode_observation(self, observed, text, observed_valid=None):
+    def encode_observation(self, observed, text, observed_valid=None, *, latent=None):
         if observed.ndim != 4 or observed.shape[1:] != (3, self.config.rgb_height, self.config.rgb_width):
             raise ValueError("Observed RGB must be [B,3,384,320] in adapter ImageNet-normalized coordinates")
         if not torch.isfinite(observed).all():
@@ -285,7 +285,10 @@ class WSA1_5_Policy(PreTrainedPolicy):
             raise ValueError("Observed pixel mask shape mismatch")
         if not pixel_valid.flatten(1).any(1).all():
             raise ValueError("Every sample must contain at least one valid observed RGB view")
-        latent = self._encode_video("observation", observed[:, :, None], {})
+        if latent is None:
+            latent = self._encode_video("observation", observed[:, :, None], {})
+        else:
+            self._validate_encoded_latent(latent, observed[:, :, None])
         context, context_valid = self._encode_text(text)
         if context.shape[0] != latent.shape[0]:
             raise ValueError("Text batch must match observed RGB batch")
@@ -302,28 +305,19 @@ class WSA1_5_Policy(PreTrainedPolicy):
         motion = (batch_size, cfg.latent_channels, 9, cfg.motion_height // 16, cfg.motion_width // 16) if cfg.enable_motion else None
         return rgb, motion
 
-    def sample_generated_latents(self, observed_latent, context, context_valid, observed_valid, *, seed, steps):
+    def sample_generated_latents(self, observed_latent, context, context_valid, observed_valid, *, seed, steps,
+                                 pixel_valid=None, return_features=False):
         rgb_shape, motion_shape = self._shapes(observed_latent.shape[0])
         placeholder = self._placeholder(observed_latent.shape[0], observed_latent.device) if motion_shape else None
+        # Returning features is an API choice, not an expert ablation switch.
+        future_3d = self.future_3d
+        if future_3d is not None and pixel_valid is None:
+            raise ValueError("Joint 3D sampling requires observed pixel validity")
+        view_valid = self.observed_view_validity(pixel_valid) if future_3d is not None else None
         return self.flow.sample_latents(observed_latent, context, context_valid, rgb_shape=rgb_shape,
                                        motion_shape=motion_shape, motion_placeholder=placeholder,
-                                       seed=seed, steps=steps, observed_valid=observed_valid)
-
-    def predict_3d_from_generated(self, observed_latent, context, context_valid, generated_rgb, generated_motion,
-                                  observed_valid, pixel_valid):
-        if self.future_3d is None:
-            return {}
-        b = observed_latent.shape[0]
-        zero_t = observed_latent.new_zeros(b)
-        rgb_valid = observed_valid.expand(-1, -1, 9, -1, -1) if generated_rgb is not None else None
-        states, experts, _, _ = self.flow.prepare_states(observed_latent, context, context_valid,
-                                                        generated_rgb, generated_motion, zero_t, zero_t,
-                                                        observed_valid=observed_valid, rgb_valid=rgb_valid)
-        view_valid = self.observed_view_validity(pixel_valid)
-        states["G"] = self.future_3d.prepare(b, view_valid)
-        experts["G"] = self.future_3d
-        _, captured = self.flow.mot(states, experts, capture_layers=self.future_3d.student_layers)
-        return self.future_3d.project(captured)
+                                       seed=seed, steps=steps, observed_valid=observed_valid,
+                                       future_3d=future_3d, goal_view_valid=view_valid, return_features=return_features)
 
     @staticmethod
     def observed_view_validity(pixel_valid):
@@ -332,7 +326,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                             pixel_valid[:, :, h * 2 // 3:, :w // 2].flatten(1).any(1),
                             pixel_valid[:, :, h * 2 // 3:, w // 2:].flatten(1).any(1)], 1)
 
-    def prepare_training_targets(self, batch, observed_latent):
+    def prepare_training_targets(self, batch):
         target = batch["targets"]
         observed = batch["observed_rgb"]
         metadata = {key: batch.get(key) for key in ["sample_id", "sidecar_digest", "prompt_version", "frame_timestamps"]}
@@ -348,9 +342,9 @@ class WSA1_5_Policy(PreTrainedPolicy):
             clean["motion"] = self._encode_video("motion_targets", video, metadata)
             self.layout.check_latents(clean["motion"], self.config.motion_height, self.config.motion_width)
             future_valid = self.layout.latent_validity(target["motion_valid"], clean["motion"].shape[-2:])
-            masks["motion"] = torch.cat([torch.ones_like(future_valid[:, :, :1]), future_valid], 2)
+            masks["motion"] = torch.cat([torch.zeros_like(future_valid[:, :, :1]), future_valid], 2)
         teacher, teacher_valid = {}, None
-        if self.config.enable_3d:
+        if self.config.use_3d_supervision:
             endpoint_metadata = {key: batch.get(key) for key in [
                 "sidecar_digest", "prompt_version", "episode_index", "subtask_id", "goal_timestamp"]}
             feature_rows, valid_rows = [], []
@@ -382,10 +376,11 @@ class WSA1_5_Policy(PreTrainedPolicy):
         cfg = self.config
         weights = {"rgb": cfg.lambda_rgb, "motion": cfg.lambda_motion, "3d": cfg.lambda_3d}
         active = any(weights[name] > 0 and flags[:, :, 1:].any().item() for name, flags in masks.items())
-        active = active or (cfg.enable_3d and weights["3d"] > 0
+        active = active or (cfg.use_3d_supervision
                             and cfg.feature_mse_weight + cfg.feature_cosine_weight > 0
                             and teacher_valid is not None and teacher_valid.any().item())
         if not active:
+            # shortcut: 无监督 batch 直接终止；需连续训练无标签区间时再加入监督感知采样。
             raise ValueError("Batch has no valid positive-weight supervision; refusing a zero-loss optimizer update")
 
     def _training_forward(self, batch):
@@ -393,19 +388,18 @@ class WSA1_5_Policy(PreTrainedPolicy):
             raise ValueError("training_forward requires an explicit targets dictionary")
         if "observed_valid" not in batch:
             raise ValueError("Training requires explicit observed_valid; missing views cannot default to valid")
-        from .validation import require_bool, require_finite
-
         require_bool(batch["observed_valid"], "Observed validity")
         target = batch["targets"]
         for name, enabled in [("rgb", self.config.enable_rgb), ("motion", self.config.enable_motion)]:
             if enabled:
                 require_bool(target[f"{name}_valid"], f"{name} target validity")
                 require_finite(target[f"future_{name}"], f"Future {name} pixels")
-        if self.config.enable_3d:
+        if self.config.use_3d_supervision:
             require_bool(target["goal_view_valid"], "Goal view validity")
+        clean, masks, teacher_targets, teacher_valid = self.prepare_training_targets(batch)
+        observed_latent = clean["rgb"][:, :, :1] if "rgb" in clean else None
         observed, context, context_valid, observed_valid, pixel_valid = self.encode_observation(
-            batch["observed_rgb"], batch["condition_text"], batch.get("observed_valid"))
-        clean, masks, teacher_targets, teacher_valid = self.prepare_training_targets(batch, observed)
+            batch["observed_rgb"], batch["condition_text"], batch["observed_valid"], latent=observed_latent)
         if teacher_valid is not None:
             require_bool(teacher_valid, "Teacher feature validity")
             # An absent observed camera has no corresponding active G queries.
@@ -418,19 +412,15 @@ class WSA1_5_Policy(PreTrainedPolicy):
             states[name], velocities[name], timesteps[name] = self.flow.training_state(value, condition)
         prediction = self.flow.velocity(observed, context, context_valid, states.get("rgb"), states.get("motion"),
                                         timesteps.get("rgb"), timesteps.get("motion"), observed_valid=observed_valid,
-                                        rgb_valid=masks.get("rgb"), motion_valid=masks.get("motion"))
+                                        rgb_valid=masks.get("rgb"), motion_valid=masks.get("motion"),
+                                        future_3d=self.future_3d,
+                                        goal_view_valid=self.observed_view_validity(pixel_valid))
         losses, metrics = {}, {}
         for name in clean:
             losses[name] = self.flow.flow_loss(prediction[name], velocities[name], timesteps[name], masks[name])
             metrics[f"loss_{name}_flow"] = losses[name].detach().item()
-        if self.config.enable_3d:
-            seed = int(torch.randint(0, 2 ** 31 - 2, (), device=observed.device).item())
-            # Noise generation is completely independent of clean/noisy targets.
-            with torch.no_grad():
-                generated = self.sample_generated_latents(observed, context, context_valid, observed_valid,
-                                                          seed=seed, steps=self.config.goal_sampler_steps)
-            features = self.predict_3d_from_generated(observed, context, context_valid, *generated, observed_valid, pixel_valid)
-            losses["3d"], feature_metrics = geometric_feature_loss(features, teacher_targets, teacher_valid,
+        if self.config.use_3d_supervision:
+            losses["3d"], feature_metrics = geometric_feature_loss(prediction["3d"], teacher_targets, teacher_valid,
                                                                   mse_weight=self.config.feature_mse_weight,
                                                                   cosine_weight=self.config.feature_cosine_weight)
             metrics.update(feature_metrics)
@@ -456,15 +446,15 @@ class WSA1_5_Policy(PreTrainedPolicy):
 
     def _predict_future(self, observed_rgb, text, seed, observed_valid):
         observed, context, context_valid, latent_valid, pixel_valid = self.encode_observation(observed_rgb, text, observed_valid)
-        generated_rgb, generated_motion = self.sample_generated_latents(observed, context, context_valid, latent_valid,
-                                                                        seed=seed, steps=self.config.sampler_steps)
-        features = self.predict_3d_from_generated(observed, context, context_valid, generated_rgb, generated_motion,
-                                                  latent_valid, pixel_valid)
-        goal_valid = self.observed_view_validity(pixel_valid).repeat_interleave(273, dim=1).reshape(-1, 3, 273)
+        generated_rgb, generated_motion, features = self.sample_generated_latents(
+            observed, context, context_valid, latent_valid, seed=seed, steps=self.config.sampler_steps,
+            pixel_valid=pixel_valid, return_features=True)
+        goal_valid = (self.observed_view_validity(pixel_valid) & (self.future_3d is not None))
+        goal_valid = goal_valid.repeat_interleave(273, dim=1).reshape(-1, 3, 273)
         features = {key: value.masked_fill(~goal_valid[..., None], 0) for key, value in features.items()}
         result = {"goal_3d_features": features[self.config.teacher_layers[-1]] if features else None,
                   "goal_3d_layer_features": features, "goal_3d_valid": goal_valid,
-                  "future_rgb_valid": pixel_valid[:, None].expand(-1, 32, -1, -1, -1)}
+                  "future_rgb_valid": (pixel_valid & (generated_rgb is not None))[:, None].expand(-1, 32, -1, -1, -1)}
         for name, latent in [("rgb", generated_rgb), ("motion", generated_motion)]:
             if latent is not None:
                 decoded = self.layout.future_from_decoded(self.vae.decode(latent))

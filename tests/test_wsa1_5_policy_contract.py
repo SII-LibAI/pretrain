@@ -11,7 +11,7 @@ from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.factory import make_dataloader
 from lerobot.datasets.transformed_dataset import MultiLeRobotDataset
 from lerobot.policies.factory import get_policy_class, make_policy_config
-from lerobot.policies.wsa1_5.cache import ArtifactCache
+from lerobot.policies.wsa1_5.cache import ArtifactCache, fingerprint_path
 from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config
 from lerobot.policies.wsa1_5.future_3d import Future3DExpert
 from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy, WorldComponents
@@ -59,12 +59,15 @@ def test_optimizer_groups_are_disjoint_and_complete():
     assert set(frozen.config.get_scheduler_preset().group_schedules) == {"rgb", "motion", "3d", "heads"}
 
 
-def test_generated_feature_interface_and_backward():
+def test_joint_feature_interface_and_backward():
     policy = small_policy()
     obs, text, text_valid, rgb, motion, *_ = inputs()
     observation_valid = torch.ones(2, 1, 1, 4, 4, dtype=torch.bool)
     pixel_valid = torch.ones(2, 1, 12, 10, dtype=torch.bool)
-    features = policy.predict_3d_from_generated(obs, text, text_valid, rgb, motion, observation_valid, pixel_valid)
+    prediction = policy.flow.velocity(obs, text, text_valid, rgb, motion,
+                                      torch.zeros(2), torch.zeros(2), observed_valid=observation_valid,
+                                      future_3d=policy.future_3d, goal_view_valid=policy.observed_view_validity(pixel_valid))
+    features = prediction["3d"]
     assert features[23].shape == (2, 3, 273, 2048)
     features[23].square().mean().backward()
     assert policy.future_3d.query_tokens.grad.abs().sum() > 0
@@ -77,7 +80,7 @@ def test_inference_accepts_no_target_fields():
     assert set(params) == {"self", "observed_rgb", "text", "seed", "observed_valid"}
     with pytest.raises(ValueError, match="explicit targets"):
         small_policy().training_forward({})
-    with pytest.raises(ValueError, match="target-independent"):
+    with pytest.raises(ValueError, match="joint"):
         small_config(goal_conditioning="noisy_target_estimate")
 
 
@@ -102,6 +105,34 @@ def test_saved_frozen_asset_identity_does_not_require_source_weights():
                                                    "text_encoder_path": "verified-text-content-sha256"})
     assert policy._asset_fingerprint("vae_path") == "verified-vae-content-sha256"
     assert policy._asset_fingerprint("text_encoder_path") == "verified-text-content-sha256"
+
+
+def test_weight_fingerprint_hashes_any_single_file(tmp_path):
+    weight = tmp_path / "teacher.ckpt"
+    weight.write_bytes(b"first version")
+    before = fingerprint_path(weight)
+    weight.write_bytes(b"other version")
+    assert fingerprint_path(weight) != before
+
+
+def test_weight_directory_requires_hashable_assets(tmp_path):
+    with pytest.raises(ValueError, match="No fingerprintable"):
+        fingerprint_path(tmp_path)
+
+
+@pytest.mark.parametrize("path", ["", " "])
+def test_empty_asset_path_cannot_hash_the_workspace(path):
+    with pytest.raises(ValueError, match="empty asset path"):
+        fingerprint_path(path)
+
+
+def test_tokenizer_fingerprint_ignores_unrelated_files(tmp_path):
+    (tmp_path / "tokenizer.json").write_text('{"version": 1}')
+    preview = tmp_path / "preview.png"
+    preview.write_bytes(b"preview")
+    before = fingerprint_path(tmp_path)
+    preview.write_bytes(b"changed preview")
+    assert fingerprint_path(tmp_path) == before
 
 
 def test_existing_multi_dataset_and_weighted_dataloader(tmp_path, monkeypatch):

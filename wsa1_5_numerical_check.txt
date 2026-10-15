@@ -44,7 +44,7 @@ ImageNet mean/std 是用户要求的明确归一化，不是推测的 XYZ 物理
 固定 normalized-zero motion t0 是显式 padding，不是观测 motion 或真实未来条件。
 每个缺失模态的 loss 可为零；安全分母只避免该模态除零，全 batch 是否有监督另行严格检查。
 F.normalize epsilon、Wan norm epsilon、scheduler epsilon 是数值稳定参数，不能替代非法输入检查。
-训练与推理的 O/R/M/G 因果依赖保持不变；3D 继续读取从独立噪声生成的未来，不读取真实未来或 teacher 输入。
+训练与推理的 O/R/M/G 因果依赖保持不变；按用户最新澄清，3D 与 RGB/Motion 同次 MoT 前向，训练读取带噪 R/M 隐藏表征，推理读取每步生成状态；目标图像与 teacher 特征只用于监督。
 
 验证
 完整回归：93 passed，1 warning（官方 Omega 对不同尺寸图像做 padding 的预期提示）。
