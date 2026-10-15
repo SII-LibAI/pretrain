@@ -5,7 +5,6 @@
     "dtype": "bfloat16",
     "push_to_hub": false,
     "enable_3d_queries": true,
-    "enable_3d_supervision": true,
     "lambda_3d": 1.0,
     "wan_model_path": "weights/Wan2.2-TI2V-5B",
     "vae_path": "weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",

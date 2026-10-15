@@ -32,7 +32,7 @@ def test_nonfinite_config_rejected(field, value):
 @pytest.mark.parametrize("kwargs", [{"lambda_rgb": 0, "lambda_motion": 0, "lambda_3d": 0},
                                    {"enable_rgb": False, "enable_motion": False,
                                     "feature_mse_weight": 0, "feature_cosine_weight": 0},
-                                   {"freq_dim": 7}, {"rgb_hidden_dim": 0},
+                                   {"freq_dim": 7}, {"rgb_hidden_dim": 0}, {"goal_hidden_dim": 9},
                                    {"scheduler_warmup_steps": 600000}])
 def test_invalid_config_contract(kwargs):
     # Avoid duplicate explicit arguments in the small_config convenience helper.
@@ -186,11 +186,16 @@ def test_attention_requires_complete_padding_contract():
                          torch.zeros(1, 1, 2, 0, dtype=torch.bool))
 
 
-def test_wsa_scheduler_does_not_rescale_short_runs():
-    config = small_config(scheduler_warmup_steps=2000, scheduler_decay_steps=600000)
+@pytest.mark.parametrize("ratio", [0.0, 0.02, 0.1, 1.0])
+def test_wsa_scheduler_does_not_rescale_short_runs(ratio):
+    config = small_config(scheduler_warmup_steps=2000, scheduler_decay_steps=600000,
+                          scheduler_decay_lr_ratio=ratio)
     preset = config.get_scheduler_preset()
     assert not preset.auto_scale_to_training_steps
     # Build the scheduler only; no optimizer step or model training is performed.
     optimizer = torch.optim.SGD([{"params": [torch.nn.Parameter(torch.ones(1))], "name": "rgb", "lr": config.rgb_lr}])
     scheduler = preset.build(optimizer, num_training_steps=100)
     assert scheduler.lr_lambdas[0](0) == pytest.approx(1 / 2000)
+    assert scheduler.lr_lambdas[0](2000) == pytest.approx(1)
+    assert scheduler.lr_lambdas[0](600000) == pytest.approx(ratio)
+    assert scheduler.lr_lambdas[0](700000) == pytest.approx(ratio)

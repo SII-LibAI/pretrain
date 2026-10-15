@@ -32,7 +32,7 @@ WSA1.5 第二次检查：训练数值、兜底与默认值
 10. 权重：转换固定 latent channel、patch、text/frequency width、attention head geometry 不允许插值改变。
     拒绝非有限 checkpoint tensors、转换后的重复 key、VACE/未知 adapter 参数；拒绝多个歧义 state 容器。
     WSA from_pretrained 强制 strict=True，不能用随机缺失参数继续训练。
-    Future3D 新 queries/heads 的随机初始化仍是明确设计；backbone 缺失 key 的白名单检查保留。
+    Future3D 使用 WSA 默认 slot_noise，heads 随机初始化；backbone 缺失 key 的白名单检查保留。
 11. 训练精度：外部 Accelerator precision 和 accumulation 必须与 policy 一致。
     teacher 计算精度显式使用 policy dtype，不再在 CUDA 上无条件使用 BF16。
 12. LR：WSA preset 禁止按短训练总步数自动缩放 warmup/decay。

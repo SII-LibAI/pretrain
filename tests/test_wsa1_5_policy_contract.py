@@ -70,7 +70,8 @@ def test_joint_feature_interface_and_backward():
     features = prediction["3d"]
     assert features[23].shape == (2, 3, 273, 2048)
     features[23].square().mean().backward()
-    assert policy.future_3d.query_tokens.grad.abs().sum() > 0
+    grad = policy.future_3d.blocks[0].self_attn.q.weight.grad
+    assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
     assert policy.teacher.model is None
     assert "teacher" not in policy._modules
 

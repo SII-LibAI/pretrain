@@ -101,8 +101,8 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 logging.info("[WSA motion interpolation] rules=%s", rules)
                 load_report(motion, converted, name="Motion Wan DiT", strict=True)
             if student is not None and cfg.goal_initialization == "wan_width_interpolation":
-                # Geometric queries and projection heads are intentionally random;
-                # only the known Wan-compatible backbone keys are transplanted.
+                # Slot/noise buffers are deterministic; only Wan-compatible
+                # backbone keys are transplanted, leaving new feature heads random.
                 backbone = {key: value for key, value in student.state_dict().items()
                             if key.startswith(("blocks.", "time_embedding.", "time_projection."))}
                 converted, rules = interpolate_wan_state(state, backbone)
@@ -110,7 +110,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 expected_missing = set(student.state_dict()) - set(backbone)
                 report = load_report(student, converted, name="Future3D Wan backbone", strict=False)
                 if set(report.missing_keys) != expected_missing or report.unexpected_keys:
-                    raise RuntimeError("3D backbone initialization is incomplete beyond the explicit new query/heads")
+                    raise RuntimeError("3D backbone initialization is incomplete beyond the explicit new heads")
             vae_state = read_checkpoint(cfg.vae_path)
             if not all(key.startswith("model.") for key in vae_state):
                 vae_state = {f"model.{key}": value for key, value in vae_state.items()}

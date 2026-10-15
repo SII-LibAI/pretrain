@@ -6,7 +6,83 @@ from PIL import Image
 from lerobot.policies.wsa1_5.future_3d import Future3DExpert, geometric_feature_loss
 from lerobot.policies.wsa1_5.teacher import FeatureAligner3D, OmegaTeacher, preprocess_omega_views
 from lerobot.policies.wsa1_5.vendor.omega_preprocessing import load_and_preprocess_images
+from lerobot.policies.wsa1_5.vendor.wan_video_dit import sinusoidal_embedding_1d
 from test_wsa1_5_experts import small_flow, inputs
+
+
+def test_slot_noise_training_matches_wsa_default_and_resamples():
+    future = Future3DExpert(10, 20, 3, 2, 8, 8)
+    view_valid = torch.tensor([[True, True, False], [True, False, False]])
+    torch.manual_seed(27)
+    rng = torch.random.get_rng_state()
+    expected_noise = torch.randn(2, 819, 10)
+    torch.random.set_rng_state(rng)
+    first = future.prepare(2, view_valid, num_train_timesteps=1000)
+    positions = torch.arange(819, dtype=torch.float32)
+    slots = sinusoidal_embedding_1d(10, positions)[None]
+    torch.testing.assert_close(first.tokens, slots * 0.5 + expected_noise * 0.25, rtol=0, atol=0)
+    torch.testing.assert_close(first.valid, view_valid.repeat_interleave(273, 1))
+    assert not first.tokens.requires_grad
+    assert not torch.equal(first.tokens[0], first.tokens[1])
+    second = future.prepare(2, view_valid, num_train_timesteps=1000)
+    assert not torch.equal(first.tokens, second.tokens)
+    assert "query_tokens" not in dict(future.named_parameters())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("training", [True, False])
+def test_slot_noise_fixed_inference_matches_wsa_and_preserves_rng(dtype, training):
+    future = Future3DExpert(10, 20, 3, 2, 8, 8).to(dtype=dtype).train(training)
+    view_valid = torch.ones(2, 3, dtype=torch.bool)
+    rng = torch.random.get_rng_state().clone()
+    with torch.no_grad():
+        first = future.prepare(2, view_valid, num_train_timesteps=1000)
+        second = future.prepare(2, view_valid, num_train_timesteps=1000)
+    torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
+    fixed_noise = torch.empty(1, 819, 10).normal_(generator=torch.Generator().manual_seed(0)).to(dtype)
+    slots = sinusoidal_embedding_1d(10, torch.arange(819, dtype=torch.float32))[None].to(dtype)
+    torch.testing.assert_close(first.tokens, (slots * 0.5 + fixed_noise * 0.25).expand(2, -1, -1), rtol=0, atol=0)
+    torch.testing.assert_close(first.tokens, second.tokens, rtol=0, atol=0)
+    if not training:
+        # eval() alone must select fixed noise even when gradients remain enabled.
+        third = future.prepare(2, view_valid, num_train_timesteps=1000)
+        torch.testing.assert_close(first.tokens, third.tokens, rtol=0, atol=0)
+    assert first.tokens.dtype == dtype
+    assert not {"slot_pos_embed", "inference_noise_tokens", "query_tokens"} & set(future.state_dict())
+
+
+@pytest.mark.parametrize("num_train_timesteps", [1000, 2000])
+def test_slot_noise_time_modulation_uses_constant_sigma(num_train_timesteps):
+    flow = small_flow()
+    flow.scheduler.num_train_timesteps = num_train_timesteps
+    future = Future3DExpert(10, 20, 3, 2, 8, 8)
+    obs, text, valid, rgb, motion, rt, mt = inputs()
+    recorded = []
+    future.time_embedding.register_forward_pre_hook(lambda module, args: recorded.append(args[0].detach()))
+    flow.velocity(obs, text, valid, rgb, motion, rt, mt, future_3d=future,
+                  goal_view_valid=torch.ones(2, 3, dtype=torch.bool))
+    assert len(recorded) == 1
+    expected = sinusoidal_embedding_1d(8, torch.full((2,), num_train_timesteps * 0.5))
+    torch.testing.assert_close(recorded[0], expected, rtol=0, atol=0)
+
+
+def test_slot_noise_state_roundtrip_and_old_learned_query_rejection():
+    future = Future3DExpert(10, 20, 3, 2, 8, 8).eval()
+    restored = Future3DExpert(10, 20, 3, 2, 8, 8).eval()
+    state = future.state_dict()
+    restored.load_state_dict(state, strict=True)
+    view_valid = torch.ones(1, 3, dtype=torch.bool)
+    original = future.prepare(1, view_valid, num_train_timesteps=1000)
+    reloaded = restored.prepare(1, view_valid, num_train_timesteps=1000)
+    torch.testing.assert_close(original.tokens, reloaded.tokens, rtol=0, atol=0)
+    assert not {id(buffer) for buffer in future.buffers()} & {id(param) for param in future.parameters()}
+    with pytest.raises(RuntimeError, match="Unexpected key.*query_tokens"):
+        restored.load_state_dict({**state, "query_tokens": torch.zeros(1, 819, 10)}, strict=True)
+
+
+def test_slot_positional_encoding_rejects_odd_hidden_width():
+    with pytest.raises(ValueError, match="even hidden_dim"):
+        Future3DExpert(hidden_dim=9)
 
 
 def test_official_preprocessing_geometry():
@@ -53,15 +129,16 @@ def test_square_alignment_identity():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_student_generated_states_backward(dtype):
+def test_student_joint_states_backward(dtype):
     flow = small_flow(True)
     future = Future3DExpert(hidden_dim=10, ffn_dim=20, layers=3, heads=2, head_dim=8, freq_dim=8, output_dim=20)
     obs, text, valid, rgb, motion, rt, mt = inputs()
-    # Inputs here represent model-generated latents; endpoint/teacher data is
+    # R/M may be noisy flow states; endpoint/teacher data is
     # never accepted by prepare_states or Future3DExpert.prepare.
     with torch.autocast("cpu", dtype=dtype, enabled=dtype != torch.float32):
         states, experts, _, _ = flow.prepare_states(obs, text, valid, rgb, motion, rt * 0, mt * 0)
-        states["G"] = future.prepare(2, torch.tensor([[True, True, True], [True, False, False]]))
+        states["G"] = future.prepare(2, torch.tensor([[True, True, True], [True, False, False]]),
+                                      num_train_timesteps=flow.scheduler.num_train_timesteps)
         experts["G"] = future
         _, captured = flow.mot(states, experts, capture_layers=future.student_layers)
         predicted = future.project(captured)
@@ -71,7 +148,9 @@ def test_student_generated_states_backward(dtype):
     supervision[1, 1:] = False
     loss, metrics = geometric_feature_loss(predicted, targets, supervision)
     loss.backward()
-    assert future.query_tokens.grad.abs().sum() > 0
+    assert "query_tokens" not in dict(future.named_parameters())
+    grad = future.blocks[0].self_attn.q.weight.grad
+    assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
     assert flow.rgb.patch_embedding.weight.grad.abs().sum() > 0
     assert flow.motion.patch_embedding.weight.grad.abs().sum() > 0
     assert len(metrics) == 8
@@ -92,7 +171,8 @@ def test_3d_does_not_change_rgb_motion_outputs():
     states, experts, _, _ = flow.prepare_states(obs, text, valid, rgb, motion, rt, mt)
     before, _ = flow.mot(states, experts)
     future = Future3DExpert(hidden_dim=10, ffn_dim=20, layers=3, heads=2, head_dim=8, freq_dim=8, output_dim=20)
-    states["G"] = future.prepare(2, torch.ones(2, 3, dtype=torch.bool))
+    states["G"] = future.prepare(2, torch.ones(2, 3, dtype=torch.bool),
+                                  num_train_timesteps=flow.scheduler.num_train_timesteps)
     experts["G"] = future
     after, _ = flow.mot(states, experts)
     for group in ["O", "R", "M"]:
@@ -101,12 +181,13 @@ def test_3d_does_not_change_rgb_motion_outputs():
 
 def test_3d_cannot_read_motion_placeholder():
     flow = small_flow(True)
-    future = Future3DExpert(hidden_dim=10, ffn_dim=20, layers=3, heads=2, head_dim=8, freq_dim=8, output_dim=20)
+    future = Future3DExpert(hidden_dim=10, ffn_dim=20, layers=3, heads=2, head_dim=8, freq_dim=8, output_dim=20).eval()
     obs, text, valid, rgb, motion, rt, mt = inputs()
 
     def run(value):
         states, experts, _, _ = flow.prepare_states(obs, text, valid, rgb, value, rt, mt)
-        states["G"] = future.prepare(2, torch.ones(2, 3, dtype=torch.bool))
+        states["G"] = future.prepare(2, torch.ones(2, 3, dtype=torch.bool),
+                                      num_train_timesteps=flow.scheduler.num_train_timesteps)
         experts["G"] = future
         tokens, _ = flow.mot(states, experts)
         return tokens

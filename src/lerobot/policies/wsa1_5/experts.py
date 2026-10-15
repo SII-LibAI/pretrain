@@ -111,7 +111,8 @@ class WorldFlow(nn.Module):
         if future_3d is not None:
             if goal_view_valid is None:
                 raise ValueError("Joint 3D prediction requires observed view validity")
-            states["G"] = future_3d.prepare(observed_latent.shape[0], goal_view_valid)
+            states["G"] = future_3d.prepare(observed_latent.shape[0], goal_view_valid,
+                                             num_train_timesteps=self.scheduler.num_train_timesteps)
             experts["G"] = future_3d
             capture_layers = future_3d.student_layers
         tokens, captured = self.mot(states, experts, capture_layers=capture_layers)
@@ -173,7 +174,7 @@ class WorldFlow(nn.Module):
         """Joint denoising; optional 3D features come from the last mixed forward.
 
         Inputs are observations/text plus shapes/constants; there is no motion
-        observation. G is rebuilt from learned queries at each denoising step.
+        observation. G is rebuilt from fixed slot noise at each denoising step.
         """
         rgb_gen = torch.Generator(device=observed_latent.device).manual_seed(int(seed))
         motion_gen = torch.Generator(device=observed_latent.device).manual_seed(int(seed) + 1)

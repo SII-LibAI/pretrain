@@ -31,7 +31,7 @@ class RecordingVAE(nn.Module):
 
 
 def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_queries=False,
-                enable_3d_supervision=True, cache_dir=None, **loss_weights):
+                cache_dir=None, **loss_weights):
     config = WSA1_5Config(
         device="cpu", dtype="float32", push_to_hub=False,
         rgb_hidden_dim=16, rgb_ffn_dim=32, motion_hidden_dim=12, motion_ffn_dim=24,
@@ -39,7 +39,7 @@ def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_q
         head_dim=8, latent_channels=4, text_dim=8, freq_dim=8,
         rgb_height=96, rgb_width=32, motion_height=32, motion_width=32,
         enable_rgb=enable_rgb, enable_motion=enable_motion, enable_3d_queries=enable_3d_queries,
-        enable_3d_supervision=enable_3d_supervision, cache_dir=cache_dir,
+        cache_dir=cache_dir,
         frozen_asset_fingerprints={"vae_path": "recording-vae"}, **loss_weights,
     )
     vae = RecordingVAE()
@@ -164,7 +164,8 @@ def test_joint_training_has_one_mixed_forward_and_3d_gradients(monkeypatch, moda
     expected_groups = {"O", "G"} | ({"R"} if enable_rgb else set()) | ({"M"} if enable_motion else set())
     assert calls == [expected_groups]
     loss.backward()
-    assert policy.future_3d.query_tokens.grad.abs().sum() > 0
+    grad = policy.future_3d.blocks[0].self_attn.q.weight.grad
+    assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
     for enabled, expert in [(enable_rgb, policy.flow.rgb), (enable_motion, policy.flow.motion)]:
         if enabled:
             grad = expert.blocks[0].self_attn.v.weight.grad

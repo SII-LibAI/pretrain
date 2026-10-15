@@ -40,7 +40,6 @@ class WSA1_5Config(PreTrainedConfig):
     enable_rgb: bool = True
     enable_motion: bool = True
     enable_3d_queries: bool = True  # Expert/query existence, including zero-loss ablations.
-    enable_3d_supervision: bool = True
     enable_3d: bool | None = None  # Legacy query flag, normalized into enable_3d_queries.
     lambda_rgb: float = 1.0
     lambda_motion: float = 1.0
@@ -72,6 +71,7 @@ class WSA1_5Config(PreTrainedConfig):
     optimizer_weight_decay: float = 0.01
     scheduler_warmup_steps: int = 2000
     scheduler_decay_steps: int = 600000
+    scheduler_decay_lr_ratio: float = 0.1
 
     def __post_init__(self):
         super().__post_init__()
@@ -80,10 +80,11 @@ class WSA1_5Config(PreTrainedConfig):
                 raise ValueError("enable_3d must be boolean when supplied")
             self.enable_3d_queries = self.enable_3d
             self.enable_3d = None
-        if type(self.enable_3d_queries) is not bool or type(self.enable_3d_supervision) is not bool:
-            raise ValueError("3D query and supervision switches must be boolean")
+        if type(self.enable_3d_queries) is not bool:
+            raise ValueError("3D query switch must be boolean")
         scalars = ["lambda_rgb", "lambda_motion", "lambda_3d", "feature_mse_weight", "feature_cosine_weight",
-                   "rgb_lr", "motion_lr", "goal_lr", "heads_lr", "optimizer_weight_decay", "flow_shift"]
+                   "rgb_lr", "motion_lr", "goal_lr", "heads_lr", "optimizer_weight_decay", "flow_shift",
+                   "scheduler_decay_lr_ratio"]
         for name in scalars:
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(f"{name} must be finite")
@@ -100,6 +101,8 @@ class WSA1_5Config(PreTrainedConfig):
         if (type(self.scheduler_warmup_steps) is not int or type(self.scheduler_decay_steps) is not int
                 or self.scheduler_warmup_steps < 0 or self.scheduler_decay_steps <= self.scheduler_warmup_steps):
             raise ValueError("Scheduler requires integer 0 <= warmup < decay steps")
+        if not 0 <= self.scheduler_decay_lr_ratio <= 1:
+            raise ValueError("scheduler_decay_lr_ratio must be within [0, 1]")
         if self.dtype not in {"float32", "bfloat16", "float16"}:
             raise ValueError("Unsupported WSA dtype")
         if self.future_frames != 32 or self.n_obs_steps != 1:
@@ -113,6 +116,8 @@ class WSA1_5Config(PreTrainedConfig):
             raise ValueError("Only joint O/R/M/G mixed-attention 3D conditioning is supported")
         if self.motion_initialization not in {"wan_width_interpolation", "random"} or self.goal_initialization not in {"wan_width_interpolation", "random"}:
             raise ValueError("Unknown expert initialization rule")
+        if self.goal_hidden_dim % 2:
+            raise ValueError("goal_hidden_dim must be even for 3D slot positional encoding")
         if self.attention_backend not in {"sdpa", "math", "reference"}:
             raise ValueError("Attention backend must preserve explicit masks")
         rope_width = (self.head_dim - 2 * (self.head_dim // 3)) // 2 + 2 * ((self.head_dim // 3) // 2)
@@ -133,7 +138,7 @@ class WSA1_5Config(PreTrainedConfig):
 
     @property
     def use_3d_supervision(self):
-        return (self.enable_3d_queries and self.enable_3d_supervision and self.lambda_3d > 0
+        return (self.enable_3d_queries and self.lambda_3d > 0
                 and self.feature_mse_weight + self.feature_cosine_weight > 0)
 
     @property
@@ -159,6 +164,6 @@ class WSA1_5Config(PreTrainedConfig):
     def get_scheduler_preset(self):
         rates = {"rgb": self.rgb_lr, "motion": self.motion_lr, "3d": self.goal_lr, "heads": self.heads_lr}
         return MultiGroupCosineDecayWithWarmupSchedulerConfig(auto_scale_to_training_steps=False, group_schedules={name: {
-            "peak_lr": lr, "decay_lr": lr * 0.1, "num_warmup_steps": self.scheduler_warmup_steps,
+            "peak_lr": lr, "decay_lr": lr * self.scheduler_decay_lr_ratio, "num_warmup_steps": self.scheduler_warmup_steps,
             "num_decay_steps": self.scheduler_decay_steps,
         } for name, lr in rates.items()})

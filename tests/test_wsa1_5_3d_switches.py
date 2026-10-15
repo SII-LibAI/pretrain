@@ -12,13 +12,11 @@ from test_wsa1_5_observation_encoding import make_policy
 
 
 @pytest.mark.parametrize("queries", [True, False])
-@pytest.mark.parametrize("supervision", [True, False])
 @pytest.mark.parametrize("weight", [1.0, 0.0])
-def test_3d_supervision_requires_queries_switch_and_positive_weight(queries, supervision, weight):
-    cfg = WSA1_5Config(device="cpu", enable_3d_queries=queries,
-                       enable_3d_supervision=supervision, lambda_3d=weight)
+def test_3d_supervision_requires_queries_switch_and_positive_weight(queries, weight):
+    cfg = WSA1_5Config(device="cpu", enable_3d_queries=queries, lambda_3d=weight)
     assert cfg.enable_3d_queries is queries
-    assert cfg.use_3d_supervision == (queries and supervision and weight > 0)
+    assert cfg.use_3d_supervision == (queries and weight > 0)
 
 
 @pytest.mark.parametrize("legacy", [True, False])
@@ -27,7 +25,7 @@ def test_legacy_enable_3d_normalizes_into_query_switch(legacy):
     assert cfg.enable_3d_queries is legacy and cfg.enable_3d is None
 
 
-@pytest.mark.parametrize("kwargs", [{"enable_3d_queries": False}, {"enable_3d_supervision": False},
+@pytest.mark.parametrize("kwargs", [{"enable_3d_queries": False},
                                    {"lambda_3d": 0}, {"feature_mse_weight": 0, "feature_cosine_weight": 0}])
 def test_no_supervised_modality_is_rejected(kwargs):
     with pytest.raises(ValueError):
@@ -35,7 +33,6 @@ def test_no_supervised_modality_is_rejected(kwargs):
 
 
 @pytest.mark.parametrize("kwargs,queries", [
-    ({"enable_3d_queries": True, "enable_3d_supervision": False}, True),
     ({"enable_3d_queries": True, "lambda_3d": 0}, True),
     ({"enable_3d_queries": True, "feature_mse_weight": 0, "feature_cosine_weight": 0}, True),
     ({"enable_3d_queries": False}, False),

@@ -43,14 +43,16 @@ WSA1.5 本地开发交付记录 — 2026-10-15
    Motion placeholder 保留 codec 时间布局，但其 token 在 MoT 前移除，不参与注意力或监督。
    明确校验 Wan 的 9 latent 时间步及 33 decoded 帧；仅未来 latent 参与 flow loss。
    官方源码显示直接编码 32 帧会得到 8 latents、解码 29 帧，真实权重行为待服务器验证。
-9. Future3DExpert 使用 819 个随机初始化的可学习 queries，每视角 1 camera +
+9. Future3DExpert 使用 WSA 默认 slot_noise 的 819 个槽位，每视角 1 camera +
    16 register + 256 patch。四层 feature heads 输出 [B,3,273,2048]。
+   G=0.5×正弦位置编码+0.25×标准正态噪声，训练且开启梯度时采新噪声，
+   推理/no_grad 使用 seed=0 的固定噪声；不含可学习 query 参数，骨干和 heads 可训练。
    默认 teacher 层 [4,11,17,23] 对应 30 层 student 的 [5,14,21,29]。
 10. Omega 的特殊 token 起始为 17；patch 数随 max_size=256 的实际网格变化。
     原始图像遵循官方中心裁剪、PIL bicubic resize 和多视角白色 padding；没有拉伸成
     固定正方形。17 个特殊 tokens 直接对应，patch features 按内容区域网格采样至 16x16。
     padding/缺失视角不参与 normalized feature MSE 与 cosine feature loss。
-11. enable_3d_queries 控制 G，enable_3d_supervision 控制监督，lambda_3d=0 也关闭监督。
+11. enable_3d_queries 控制 G，lambda_3d>0 且特征损失权重非零时启用监督；lambda_3d=0 关闭监督。
     监督关闭时不构造 OmegaTeacher，不要求目标图像、不读取 teacher 缓存、不计算 3D loss；
     G 可保留参与联合前向并输出特征，但无监督的 3D 参数冻结并移出优化器。
     factory 同时关闭 dataset 的终点图像/goal mask 加载；collate 支持不含 3D 标签的 batch。
@@ -209,6 +211,40 @@ RGB/Motion 返回反归一化后的三通道视频数值；Motion 物理单位�
   子任务终点，之后 32 帧均有效，episode 最后一帧的未来 mask 全无效。
   结果：outputs/wsa1_5_episode_window_dataset.json、wsa1_5_episode_boundary_real.json。
 - 未加载预训练模型或训练。episode 尾部若整批没有任何有效监督，仍按原数值检查报错。
+
+本轮 3D Query 默认模式对齐
+- 按用户最新要求改为 WSA 默认 slot_noise，移除旧可学习 query_tokens。
+  保留 3×273 个槽位及 Omega 特殊 token/patch 监督对应关系。
+- G=0.5×位置编码+0.25×标准正态噪声；训练且开启梯度时每样本重新采样，
+  推理/no_grad 复用 seed=0 的固定噪声。位置和噪声为非持久 buffer，不进入优化器。
+- 固定 sigma=0.5，G 时间调制为 0.5×scheduler.num_train_timesteps，默认 t=500。
+  R/M 加噪训练状态与 O/G 仍在同一次 MoT 中联合处理，没有增加未来采样。
+- 更新 G 的骨干梯度、Query 随机性、推理确定性、时间调制和严格恢复测试；
+  旧 query_token checkpoint 的 query_tokens 会被严格加载拒绝，需新开实验。
+- 完整回归 177 passed，1 项官方预处理预期 warning；Ruff F、compileall、
+  README 语法/链接和 git diff --check 通过。未加载预训练模型、未执行训练。
+- 从工作区 WSA 源码提取原始 Query 函数进行 8 组 FP32/BF16、train/eval、
+  grad/no_grad 对照，Query 最大差异为 0，全局 RNG 状态一致。
+  结果：outputs/wsa1_5_slot_noise_tests.txt、outputs/wsa1_5_slot_noise_reference.json。
+
+本轮启动脚本与数据发现调整
+- discover 默认扫描当前目录，也支持 --root；检查根目录本身和任意深度子目录，
+  根目录本身为数据集时输出 repo_id="."，保留无 sidecar 数据集，扫描错误直接报错。
+- 删除 policy/JSON/启动脚本的 enable_3d_supervision；监督由 enable_3d_queries、
+  lambda_3d>0 和非零特征损失权重决定。旧配置需移除该字段；旧值 false 应配 lambda_3d=0。
+- 启动脚本新增 LAMBDA_RGB、LAMBDA_MOTION、FEATURE_MSE_WEIGHT、FEATURE_COSINE_WEIGHT、
+  SCHEDULER_WARMUP_STEPS、SCHEDULER_DECAY_STEPS、SCHEDULER_DECAY_LR_RATIO 共 7 个入口。
+  新入口默认值沿用 policy 原值：1/1/1/1、2000/600000/0.1；支持配置余弦衰减终点比例。
+- 与本轮开始时的脚本逐项对照，除删除的监督开关外，33 个原有默认值均未变化。
+  保留用户四组 LR=5e-5、LAMBDA_3D=0.01、PROC_PER_NODE=2，以及用户数据和权重路径。
+  JSON 模板仅删除监督开关，不改变其中原有超参数值；resume 继续使用保存配置。
+- streaming=false 保留：WSA 需要随机访问未来帧、子任务终点和完整帧索引，
+  不能直接替换成现有顺序 streaming reader；普通 reader 仍按需解码视频。
+- 完整回归 186 passed，1 项官方预处理预期 warning；Ruff F、README 语法/链接和
+  git diff --check 通过。结果：outputs/wsa1_5_discovery_launcher_tests.txt。
+- 真实多层目录发现成功；根数据集 repo_id="." 加载 105 episodes、31023 frames，
+  首样本 32 帧均有效。结果：outputs/wsa1_5_discovery_root_dataset.json。
+  未加载预训练模型，未启动训练。
 
 额度
 用户最后提供剩余 87%、页面显示 3:59 重置。本会话没有账户额度查询接口，无法将

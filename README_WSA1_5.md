@@ -171,6 +171,8 @@ python util_scripts/inspect_wsa1_5_dataset.py "$DATA_ROOT/extra/knit_scarf" \
 
 inspect 只检查默认 schema 的首批，并要求首样本有完整未来 32 帧 motion 和有效 RGB；不适用于缺失 motion 的消融数据，也不代表已经扫描全量数据。
 
+discover 会扫描指定目录本身及任意层级子目录；省略 --root 时扫描当前工作目录。输出为相对于扫描根目录的 JSON repo_id 列表；根目录本身是数据集时包含 `"."`，可直接配合 `dataset.root=该目录` 使用。无 sidecar 的数据集也会列出，缺少 meta/info.json 或 data 目录的不列出，扫描错误会报错。
+
 ## 4. 启动训练
 
 ### 单机
@@ -200,13 +202,20 @@ bash launch/wsa_1_5_pretrain.sh
 
 | 配置 | 默认值 |
 | --- | --- |
-| RGB_LR / MOTION_LR | `1e-5` / `5e-5` |
-| GOAL_LR / HEADS_LR | `5e-5` / `1e-4` |
-| warmup / decay | 2000 / 600000，不随较短的 STEPS 自动缩放 |
+| RGB_LR / MOTION_LR / GOAL_LR / HEADS_LR | 均为 `5e-5` |
+| LAMBDA_RGB / LAMBDA_MOTION / LAMBDA_3D | `1.0` / `1.0` / `0.01` |
+| FEATURE_MSE_WEIGHT / FEATURE_COSINE_WEIGHT | `1.0` / `1.0`，作用于 3D 特征损失内部 |
+| SCHEDULER_WARMUP_STEPS / SCHEDULER_DECAY_STEPS | 2000 / 600000，不随较短的 STEPS 自动缩放 |
+| SCHEDULER_DECAY_LR_RATIO | `0.1`，每组最终学习率为该组峰值乘此比例 |
+| PROC_PER_NODE | `2` |
 | WSA_CACHE_DIR | 可选的冻结 VAE、文本、teacher 特征缓存目录 |
 | WANDB_ENABLE | `false` |
 
 额外参数直接接在脚本后，例如 `--policy.scheduler_warmup_steps=100 --policy.scheduler_decay_steps=10000`。完整参数见 `python src/lerobot/scripts/lerobot_train.py --help`。
+
+上述默认值对应当前启动脚本；JSON 模板及 policy 类的既有默认值分别保留。也可在启动命令前设置这些环境变量，例如 `LAMBDA_RGB=1 LAMBDA_MOTION=0.5 SCHEDULER_DECAY_LR_RATIO=0.05 bash launch/wsa_1_5_pretrain.sh`。
+
+dataset.streaming 默认 false：当前 WSA adapter 需要随机访问未来窗口、子任务终点及完整帧索引，现有 StreamingLeRobotDataset 是顺序迭代接口，不能直接替换。普通 LeRobot reader 使用 Parquet 内存映射并按需解码视频，false 不表示预先载入全部视频。此版本不支持 streaming=true，设置后会明确报错。
 
 ### 多卡与多节点
 
@@ -227,7 +236,13 @@ bash launch/wsa_1_5_pretrain.sh
 
 ### 3D 消融
 
-默认 ENABLE_3D_SUPERVISION=true：
+3D Query 使用 WSA 默认的 slot_noise：共 3×273=819 个槽位，输入为
+`0.5 × 正弦位置编码 + 0.5 × 0.5 × 标准正态噪声`，sigma 固定为 0.5，不跟随 R/M 的 Flow Matching 时间步。
+G 的时间调制使用 `0.5 × scheduler.num_train_timesteps`，当前默认尺度下为 500，与 WSA 默认模式一致。
+训练且开启梯度时，每个样本、每次前向重新采样噪声；推理或 no_grad 时使用 seed=0 的固定噪声，各样本和去噪步骤复用相同初始 G。
+Query 本身没有可学习参数，3D expert 骨干和 feature heads 通过蒸馏监督学习。每视角的监督槽位仍为 1 camera、16 register、256 patch。
+
+3D 监督由 Query 开关和损失权重决定：
 
 | 配置 | G | Teacher、终点图像、3D loss |
 | --- | --- | --- |
@@ -240,7 +255,9 @@ ENABLE_3D_QUERIES=true LAMBDA_3D=0 \
   OUTPUT_DIR="$PWD/outputs/wsa1_5/queries_no_teacher" bash launch/wsa_1_5_pretrain.sh
 ```
 
-ENABLE_3D_SUPERVISION=false 或两项 feature loss 权重同时为零也关闭监督。无监督 G 冻结并移出优化器；R/M 不读取 G，因此 R/M loss 不训练无监督 G，其输出不能当成已蒸馏几何表征。
+两项 feature loss 权重同时为零也关闭监督。无监督 G 冻结并移出优化器；R/M 不读取 G，因此 R/M loss 不训练无监督 G，其输出不能当成已蒸馏几何表征。已删除 enable_3d_supervision 字段，旧 JSON/CLI 中应移除该项；需要关闭监督时设置 lambda_3d=0。
+
+若旧配置的 enable_3d_supervision=false，迁移时应同时将 lambda_3d 设为 0，以保持关闭监督的行为。
 
 训练只做一次 O/R/M/G 联合前向：R/M 使用带噪训练状态，G 读取同次隐藏特征；不额外采样未来。推理每个去噪步也包含已启用的 G。关闭 RGB/3D 时，对应预测为 None、有效性 mask 为全 False；关闭 motion 时 future_motion 为 None。
 
@@ -256,6 +273,8 @@ accelerate launch --num_processes=1 --mixed_precision=bf16 \
 ```
 
 JSON 不展开 shell 环境变量。Policy 注册名是 WSA_1_5，dataset 名是 wsa1_5。改变 queries、expert 尺寸或优化器分组应新开实验，不要修改旧 checkpoint 配置强行续训。
+
+本版已移除旧可学习的 query_tokens，旧版 query_token checkpoint 与 optimizer 状态不能直接续训；严格加载会拒绝该旧参数，应从原始 Wan 权重开启新实验。
 
 ### 服务器验证与缓存
 
