@@ -1,260 +1,151 @@
-"""Configuration and transform pipelines for the WSA1.5 policy."""
+"""Configuration registered with InternVLA's actual draccus policy mechanism."""
+from dataclasses import dataclass, field
+import math
 
-from __future__ import annotations
-
-import logging
-from dataclasses import dataclass, field, replace
-from typing import ClassVar
-
-from lerobot.configs.default import DatasetConfig, VQADatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets.synthetic_embodiment import HUMAN_EEF_EMBODIMENT
-from lerobot.datasets.wsa1_5 import (
-    CANONICAL_DIM,
-    DEFAULT_HUMAN_ACTION_FILE,
-    FUTURE_2D_SOURCE_KEY,
-    FUTURE_3D_SOURCE_KEY,
-    WSA15_DATAFLOW_NAME,
-    PrepareWSA15MotionTargetsFn,
-    UnifyWSA15InputsFn,
-    UnifyWSA15VQAInputsFn,
-    build_wsa15_data_transforms,
-)
-from lerobot.policies.internvla_a1_5.configuration_internvla_a1_5 import (
-    InternVLAA15Config,
-    InternVLAA15DatasetConfig,
-    InternVLAA15VQADatasetConfig,
-)
-from lerobot.policies.wsa1_5.transform_wsa1_5 import (
-    WSA15ChatProcessorTransformFn,
-    WSA15VQAProcessorTransformFn,
-)
-from lerobot.transforms.core import (
-    DeltaActionTransformFn,
-    ResizeVQAImagesWithPadFn,
-    TransformGroup,
-)
+from lerobot.optim.optimizers import AdamWConfig
+from lerobot.optim.schedulers import MultiGroupCosineDecayWithWarmupSchedulerConfig
 
 
-def _robot_transforms() -> TransformGroup:
-    return TransformGroup(
-        inputs=[
-            *build_wsa15_data_transforms(),
-            WSA15ChatProcessorTransformFn(),
-            UnifyWSA15InputsFn(),
-        ],
-        outputs=[],
-    )
-
-
-def build_wsa15_robot_transforms(
-    *,
-    action_mode: str,
-    max_prompt_length: int,
-    mode: str,
-    chunk_size: int,
-    num_video_frames: int,
-    video_height: int,
-    video_width: int,
-    num_subtask_tokens: int,
-    transforms: TransformGroup | None = None,
-) -> TransformGroup:
-    """Configure one WSA batch pipeline for regular or synthetic datasets."""
-
-    group = transforms or _robot_transforms()
-    inputs = list(group.inputs)
-    delta_transforms = [
-        transform for transform in inputs if isinstance(transform, DeltaActionTransformFn)
-    ]
-    inputs = [transform for transform in inputs if not isinstance(transform, DeltaActionTransformFn)]
-    if action_mode == "delta":
-        inputs.insert(0, delta_transforms[0] if delta_transforms else DeltaActionTransformFn())
-
-    processor = WSA15ChatProcessorTransformFn(
-        max_length=max_prompt_length,
-        mode=mode,
-        num_subtask_tokens=num_subtask_tokens,
-    )
-    inputs = [
-        transform for transform in inputs if not isinstance(transform, WSA15ChatProcessorTransformFn)
-    ]
-    processor_index = next(
-        (index for index, transform in enumerate(inputs) if isinstance(transform, UnifyWSA15InputsFn)),
-        len(inputs),
-    )
-    inputs.insert(processor_index, processor)
-
-    if num_video_frames < 1:
-        raise ValueError("WSA1.5 num_video_frames must be positive")
-    for transform in inputs:
-        if isinstance(transform, (PrepareWSA15MotionTargetsFn, UnifyWSA15InputsFn)):
-            transform.num_future_frames = num_video_frames
-            transform.height = video_height
-            transform.width = video_width
-            if isinstance(transform, UnifyWSA15InputsFn):
-                transform.num_subtask_tokens = num_subtask_tokens
-    return replace(group, inputs=inputs)
-
-
-@DatasetConfig.register_subclass("wsa1_5")
+@PreTrainedConfig.register_subclass("WSA_1_5")
 @dataclass
-class WSA15DatasetConfig(InternVLAA15DatasetConfig):
-    """Mixed robot/human LeRobot v3 data-flow config for WSA1.5."""
+class WSA1_5Config(PreTrainedConfig):
+    wan_model_path: str = ""
+    vae_path: str = ""
+    text_encoder_path: str = ""
+    tokenizer_path: str = ""
+    omega_checkpoint_path: str = ""
+    dtype: str = "bfloat16"
+    trainable_weights_fp32: bool = True  # FP32 master parameters with BF16 autocast.
+    rgb_hidden_dim: int = 3072
+    rgb_ffn_dim: int = 14336
+    motion_hidden_dim: int = 1024
+    motion_ffn_dim: int = 4096
+    goal_hidden_dim: int = 768
+    goal_ffn_dim: int = 3072
+    num_layers: int = 30
+    num_heads: int = 24
+    head_dim: int = 128
+    latent_channels: int = 48
+    text_dim: int = 4096
+    freq_dim: int = 256
+    max_text_length: int = 512
+    rgb_height: int = 384
+    rgb_width: int = 320
+    motion_height: int = 192
+    motion_width: int = 160
+    future_frames: int = 32
+    teacher_layers: tuple[int, ...] = (4, 11, 17, 23)
+    student_layers: tuple[int, ...] | None = None
+    enable_rgb: bool = True
+    enable_motion: bool = True
+    enable_3d: bool = True
+    lambda_rgb: float = 1.0
+    lambda_motion: float = 1.0
+    lambda_3d: float = 1.0
+    feature_mse_weight: float = 1.0
+    feature_cosine_weight: float = 1.0
+    freeze_rgb: bool = False
+    freeze_motion: bool = False
+    freeze_3d: bool = False
+    freeze_heads: bool = False
+    motion_initialization: str = "wan_width_interpolation"
+    goal_initialization: str = "wan_width_interpolation"
+    attention_backend: str = "sdpa"
+    gradient_checkpointing: bool = True
+    gradient_accumulation_steps: int = 1
+    flow_shift: float = 5.0
+    sampler_steps: int = 20
+    goal_sampler_steps: int = 8
+    # Sole supported training mode: generate from independent noise, then
+    # recompute differentiable representations; no noisy-target estimates.
+    goal_conditioning: str = "generated"
+    cache_dir: str | None = None
+    # Saved with the policy: these frozen weights are included in the complete
+    # checkpoint, so resume/inference can reuse artifacts without source .pth files.
+    frozen_asset_fingerprints: dict[str, str] = field(default_factory=dict)
+    rgb_lr: float = 1e-5
+    motion_lr: float = 5e-5
+    goal_lr: float = 5e-5
+    heads_lr: float = 1e-4
+    optimizer_weight_decay: float = 0.01
+    scheduler_warmup_steps: int = 2000
+    scheduler_decay_steps: int = 600000
 
-    dataflow: ClassVar[str] = WSA15_DATAFLOW_NAME
-    max_state_dim: int = CANONICAL_DIM
-    max_action_dim: int = CANONICAL_DIM
-    tokenize_state: bool = False
-    use_fast_action_tokens: bool = False
-    num_subtask_tokens: int = 16
-    video_width: int = 224
-    human_action_file: str = DEFAULT_HUMAN_ACTION_FILE
-    human_stats_dir: str | None = None
-    human_embodiments: list[str] = field(default_factory=lambda: [HUMAN_EEF_EMBODIMENT])
-    human_annotation_row_group_cache_size: int = 0
-    data_transforms: TransformGroup = field(default_factory=_robot_transforms)
-    supplemental_video_keys: tuple[str, ...] = (FUTURE_2D_SOURCE_KEY, FUTURE_3D_SOURCE_KEY)
-
-    def __post_init__(self) -> None:
-        # Do not call InternVLAA15DatasetConfig.__post_init__: it intentionally
-        # replaces subclasses of its processor with the base A1.5 processor.
-        DatasetConfig.__post_init__(self)
-        if self.max_state_dim != CANONICAL_DIM or self.max_action_dim != CANONICAL_DIM:
-            raise ValueError(f"WSA1.5 uses a fixed {CANONICAL_DIM}D semantic state/action representation")
-        if self.tokenize_state:
-            raise ValueError(
-                "WSA1.5 sends semantic state tokens to the action expert; tokenize_state must be false"
-            )
-        if self.use_fast_action_tokens:
-            raise ValueError(
-                "WSA1.5 predicts actions with flow matching; FAST action-token labels are disabled"
-            )
-        if self.streaming:
-            raise ValueError("WSA1.5 human action annotations do not support streaming")
-        if self.human_annotation_row_group_cache_size < 0:
-            raise ValueError("human_annotation_row_group_cache_size must be non-negative")
-        if len(set(self.human_embodiments)) != len(self.human_embodiments):
-            raise ValueError("human_embodiments contains duplicate names")
-        self.data_transforms = build_wsa15_robot_transforms(
-            action_mode=self.action_mode,
-            max_prompt_length=self.max_prompt_length,
-            mode=self.mode,
-            chunk_size=self.chunk_size,
-            num_video_frames=self.num_video_frames,
-            video_height=self.video_height,
-            video_width=self.video_width,
-            num_subtask_tokens=self.num_subtask_tokens,
-            transforms=self.data_transforms,
-        )
-        logging.info("Configured WSA1.5 mixed robot/human data flow")
-
-
-def _vqa_transforms() -> TransformGroup:
-    return TransformGroup(
-        inputs=[
-            ResizeVQAImagesWithPadFn(height=224, width=224),
-            WSA15VQAProcessorTransformFn(),
-            UnifyWSA15VQAInputsFn(),
-        ],
-        outputs=[],
-    )
-
-
-@VQADatasetConfig.register_subclass("wsa1_5")
-@dataclass
-class WSA15VQADatasetConfig(InternVLAA15VQADatasetConfig):
-    max_state_dim: int = CANONICAL_DIM
-    max_action_dim: int = CANONICAL_DIM
-    video_width: int = 224
-    num_subtask_tokens: int = 16
-    data_transforms: TransformGroup = field(default_factory=_vqa_transforms)
-
-    def __post_init__(self) -> None:
-        inputs = list(self.data_transforms.inputs)
-        inputs = [
-            transform for transform in inputs if not isinstance(transform, WSA15VQAProcessorTransformFn)
-        ]
-        unify_index = next(
-            (index for index, transform in enumerate(inputs) if isinstance(transform, UnifyWSA15VQAInputsFn)),
-            len(inputs),
-        )
-        inputs.insert(unify_index, WSA15VQAProcessorTransformFn())
-        for transform in inputs:
-            if isinstance(transform, UnifyWSA15VQAInputsFn):
-                transform.num_future_frames = self.num_video_frames
-                transform.height = self.video_height
-                transform.width = self.video_width
-                transform.num_subtask_tokens = self.num_subtask_tokens
-        self.data_transforms = replace(self.data_transforms, inputs=inputs)
-
-
-@PreTrainedConfig.register_subclass("wsa1_5")
-@dataclass
-class WSA15Config(InternVLAA15Config):
-    """WSA1.5: Qwen3.5 context + planning expert + action expert."""
-
-    max_state_dim: int = CANONICAL_DIM
-    max_action_dim: int = CANONICAL_DIM
-    tokenize_state: bool = False
-    video_width: int = 224
-    num_subtask_tokens: int = 16
-    # One 8x8 2D planning grid and one 12x12 future-3D query grid.  The latter
-    # follows WSA-L's default per-view query count; this dataset has one view.
-    num_future_2d_tokens: int = 64
-    num_future_3d_tokens: int = 144
-    future_query_init_std: float = 0.02
-    subtask_loss_weight: float = 1.0
-    supplemental_video_keys: tuple[str, ...] = (FUTURE_2D_SOURCE_KEY, FUTURE_3D_SOURCE_KEY)
-
-    def __post_init__(self) -> None:
-        self.num_learnable_tokens = self.num_future_2d_tokens + self.num_future_3d_tokens
+    def __post_init__(self):
         super().__post_init__()
-        if self.max_state_dim != CANONICAL_DIM or self.max_action_dim != CANONICAL_DIM:
-            raise ValueError(f"WSA1.5 policy max_state_dim/max_action_dim must both be {CANONICAL_DIM}")
-        if self.num_subtask_tokens < 1:
-            raise ValueError("num_subtask_tokens must be positive")
-        if self.num_future_2d_tokens < 1 or self.num_future_3d_tokens < 1:
-            raise ValueError("future 2D/3D query counts must be positive")
-        if self.num_future_3d_tokens < self.num_video_frames:
-            raise ValueError("num_future_3d_tokens must be at least num_video_frames")
-        if self.future_query_init_std <= 0:
-            raise ValueError("future_query_init_std must be positive")
-        if self.subtask_loss_weight < 0:
-            raise ValueError("subtask_loss_weight must be non-negative")
-        if self.tokenize_state:
-            raise ValueError("WSA1.5 requires tokenize_state=False")
-        if self.inference_action_type != "fm":
-            raise ValueError("WSA1.5 action inference is flow matching; inference_action_type must be 'fm'")
-        if self.inference_backend == "optimized":
-            raise ValueError("WSA1.5 three-expert inference does not support inference_backend='optimized'")
-        if self.compile_model:
-            raise ValueError("WSA1.5 does not yet support compile_model=True for three-expert execution")
+        scalars = ["lambda_rgb", "lambda_motion", "lambda_3d", "feature_mse_weight", "feature_cosine_weight",
+                   "rgb_lr", "motion_lr", "goal_lr", "heads_lr", "optimizer_weight_decay", "flow_shift"]
+        for name in scalars:
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        dimensions = ["rgb_hidden_dim", "rgb_ffn_dim", "motion_hidden_dim", "motion_ffn_dim",
+                      "goal_hidden_dim", "goal_ffn_dim", "latent_channels", "text_dim", "freq_dim", "max_text_length",
+                      "num_layers", "num_heads", "head_dim", "gradient_accumulation_steps", "sampler_steps",
+                      "goal_sampler_steps", "rgb_height", "rgb_width", "motion_height", "motion_width"]
+        if any(type(getattr(self, name)) is not int or getattr(self, name) <= 0 for name in dimensions):
+            raise ValueError("Model dimensions and step counts must be positive integers")
+        if self.freq_dim % 2:
+            raise ValueError("Wan sinusoidal frequency dimension must be even")
+        if self.flow_shift <= 0 or self.optimizer_weight_decay < 0:
+            raise ValueError("Flow shift must be positive and weight decay non-negative")
+        if (type(self.scheduler_warmup_steps) is not int or type(self.scheduler_decay_steps) is not int
+                or self.scheduler_warmup_steps < 0 or self.scheduler_decay_steps <= self.scheduler_warmup_steps):
+            raise ValueError("Scheduler requires integer 0 <= warmup < decay steps")
+        if self.dtype not in {"float32", "bfloat16", "float16"}:
+            raise ValueError("Unsupported WSA dtype")
+        if self.future_frames != 32 or self.n_obs_steps != 1:
+            raise ValueError("WSA1.5 first version requires one observation and 32 future frames")
+        if not any((self.enable_rgb, self.enable_motion, self.enable_3d)):
+            raise ValueError("Enable at least one supervised modality")
+        if self.goal_conditioning != "generated":
+            raise ValueError("Only target-independent generated-future 3D conditioning is supported")
+        if self.motion_initialization not in {"wan_width_interpolation", "random"} or self.goal_initialization not in {"wan_width_interpolation", "random"}:
+            raise ValueError("Unknown expert initialization rule")
+        if self.attention_backend not in {"sdpa", "math", "reference"}:
+            raise ValueError("Attention backend must preserve explicit masks")
+        if min(self.num_layers, self.num_heads, self.head_dim, self.gradient_accumulation_steps,
+               self.sampler_steps, self.goal_sampler_steps) <= 0:
+            raise ValueError("Depth, attention geometry, accumulation and sampler steps must be positive")
+        rope_width = (self.head_dim - 2 * (self.head_dim // 3)) // 2 + 2 * ((self.head_dim // 3) // 2)
+        if self.head_dim % 2 or rope_width != self.head_dim // 2:
+            raise ValueError("head_dim must support the Wan three-axis RoPE partition")
+        if self.teacher_layers != (4, 11, 17, 23):
+            raise ValueError("Audited Omega checkpoint caches layers (4,11,17,23)")
+        if any(size <= 0 or size % 32 for size in [self.rgb_height, self.rgb_width, self.motion_height, self.motion_width]):
+            raise ValueError("Image dimensions must be positive multiples of VAE factor 16 * patch size 2")
+        if min(self.lambda_rgb, self.lambda_motion, self.lambda_3d, self.feature_mse_weight, self.feature_cosine_weight) < 0:
+            raise ValueError("Loss weights cannot be negative")
+        if min(self.rgb_lr, self.motion_lr, self.goal_lr, self.heads_lr) <= 0:
+            raise ValueError("Per-module learning rates must be positive")
+        effective = [self.lambda_rgb if self.enable_rgb else 0, self.lambda_motion if self.enable_motion else 0,
+                     self.lambda_3d * (self.feature_mse_weight + self.feature_cosine_weight) if self.enable_3d else 0]
+        if not any(weight > 0 for weight in effective):
+            raise ValueError("At least one enabled modality must have positive effective loss weight")
 
+    @property
+    def observation_delta_indices(self):
+        return None
 
-# Keep old local launch files/checkpoints usable without restoring the removed
-# wsa_pretrain implementation.  New runs should use type=wsa1_5.
-@DatasetConfig.register_subclass("wsa_pretrain")
-@dataclass
-class WSAPretrainDatasetCompatibilityConfig(WSA15DatasetConfig):
-    pass
+    @property
+    def action_delta_indices(self):
+        return None
 
+    @property
+    def reward_delta_indices(self):
+        return None
 
-@VQADatasetConfig.register_subclass("wsa_pretrain")
-@dataclass
-class WSAPretrainVQADatasetCompatibilityConfig(WSA15VQADatasetConfig):
-    pass
+    def validate_features(self):
+        # World-model pretraining requires no action or robot-state feature.
+        if self.n_obs_steps != 1:
+            raise ValueError("Only one observed RGB timepoint is supported")
 
+    def get_optimizer_preset(self):
+        return AdamWConfig(lr=self.motion_lr, weight_decay=self.optimizer_weight_decay, grad_clip_norm=1.0)
 
-@PreTrainedConfig.register_subclass("wsa_pretrain")
-@dataclass
-class WSAPretrainCompatibilityConfig(WSA15Config):
-    pass
-
-
-__all__ = [
-    "WSA15Config",
-    "WSA15DatasetConfig",
-    "WSA15VQADatasetConfig",
-    "WSAPretrainCompatibilityConfig",
-    "build_wsa15_robot_transforms",
-]
+    def get_scheduler_preset(self):
+        rates = {"rgb": self.rgb_lr, "motion": self.motion_lr, "3d": self.goal_lr, "heads": self.heads_lr}
+        return MultiGroupCosineDecayWithWarmupSchedulerConfig(auto_scale_to_training_steps=False, group_schedules={name: {
+            "peak_lr": lr, "decay_lr": lr * 0.1, "num_warmup_steps": self.scheduler_warmup_steps,
+            "num_decay_steps": self.scheduler_decay_steps,
+        } for name, lr in rates.items()})

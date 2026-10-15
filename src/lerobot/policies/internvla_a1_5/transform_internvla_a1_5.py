@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoProcessor
-from transformers.models.qwen3_5 import Qwen3_5Tokenizer
 from transformers.models.qwen3_vl import Qwen3VLProcessor
 from transformers.utils import cached_file
 
@@ -393,6 +392,10 @@ class FASTInternVLAA15ActionTokenizerTransformFn(DataTransformFn):
         self.action_tokenizer.time_horizon = self.chunk_size
         self.action_tokenizer.action_dim = self.max_action_dim
         # Load Qwen3.5 tokenizer
+        # Keep Qwen-specific dependencies local to the Qwen processor. Other
+        # policies can register their configs without requiring Qwen3.5.
+        from transformers.models.qwen3_5 import Qwen3_5Tokenizer
+
         self.qwen35_tokenizer = Qwen3_5Tokenizer.from_pretrained(
             self.qwen35_model_name
         )

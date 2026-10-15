@@ -1,0 +1,67 @@
+WSA1.5 第二次检查：训练数值、兜底与默认值
+
+范围
+仅检查和修改代码，执行小型随机张量 forward/backward、数据读取与静态检查。
+没有加载任何预训练模型，没有运行真实 Wan VAE/UMT5/Omega，没有执行训练、optimizer.step 或模型 checkpoint 重载。
+没有阅读其他 Markdown。保留仓库原有未提交修改。
+
+修正
+1. 数据解码：声明存在的视频解码失败、形状错误、非有限值、超出 [0,1] 均报错，不再转成全零有效性占位。
+   显式空相机槽和 schema 中不存在的可选 motion 仍返回全 False mask 的占位。
+2. 相机映射：未知 robot_type 必须显式配置 view_keys；歧义映射、显式键拼写错误、没有任何 RGB 相机均报错。
+3. 标注索引：非空非法 sidecar 索引、非整数索引、越界边界均报错；不再取整或静默丢弃非法数值。
+   缺失/null 标注仍使用空文本与无效 3D 标签，并记录日志。
+4. 配置：拒绝非有限 loss 权重、LR、weight decay、flow shift；检查正整数尺寸、偶数频率维度、warmup/decay 顺序。
+   至少一个已启用模态具有正的有效 loss 权重。
+   显式 external stats、image transforms、自定义 transform groups 不再被忽略，当前不支持时直接报错。
+5. 时间精度：连续时间步、sigma/noise 混合、训练噪声/velocity target、Euler 积分状态和 delta 均保持 FP32。
+   BF16/FP16 用于 Transformer autocast；不再提前把连续时间和积分状态量化。
+   拒绝非 FP32/非有限/越界时间步、不匹配噪声 shape、零时间权重的有效 Flow 监督和非有限采样 velocity。
+6. Mask：训练必须提供 observed_valid；输入 RGB、Flow、未来帧、teacher、query 和文本 context 的有效性均检查布尔类型。
+   禁止把浮点 mask 隐式转成 True；tokenizer 的整数 attention mask 转换前验证有限且为 0/1。
+   padding mask 不齐全的 attention group、没有 key 的结构、缺少 text context mask 均报错。
+   全屏蔽 query 的安全 softmax 仍保留，输出严格为零，避免 padding 导致 NaN。
+7. VAE：检查输入和输出有限性、batch/channel/time/spatial 的完整 latent shape；推理 decode 输出非有限即报错。
+   因果历史中出现缺失帧后，后续依赖该历史的 clean latent 也不参与监督。
+8. Loss：即使被 mask 屏蔽，也不允许 prediction/target 中 NaN/Inf 悄悄被隐藏。
+   检查 teacher/student 特征范数是否有限；有效 teacher 的零/退化范数报错。
+   3D 监督与当前相机有效性取交集，缺失相机没有有效 G query 时不能监督其 projection bias。
+   整批没有任何正权重有效监督时，policy 直接报错，阻止零 loss 后仍执行 AdamW weight decay。
+9. Cache：写入和读取检查有限性；读取核对 tensor shape、dtype、内容 SHA256。
+   内容损坏不静默重算。缓存版本更新为 v2，旧版未校验缓存不能被直接复用。
+10. 权重：转换固定 latent channel、patch、text/frequency width、attention head geometry 不允许插值改变。
+    拒绝非有限 checkpoint tensors、转换后的重复 key、VACE/未知 adapter 参数；拒绝多个歧义 state 容器。
+    WSA from_pretrained 强制 strict=True，不能用随机缺失参数继续训练。
+    Future3D 新 queries/heads 的随机初始化仍是明确设计；backbone 缺失 key 的白名单检查保留。
+11. 训练精度：外部 Accelerator precision 和 accumulation 必须与 policy 一致。
+    teacher 计算精度显式使用 policy dtype，不再在 CUDA 上无条件使用 BF16。
+12. LR：WSA preset 禁止按短训练总步数自动缩放 warmup/decay。
+    共享 scheduler 原有默认行为保持兼容；只有 WSA preset 显式关闭自动缩放。
+    服务器诊断工具明确设置其短测试 LR 计划，生产配置保持原始步数。
+
+保留的数值机制
+ImageNet mean/std 是用户要求的明确归一化，不是推测的 XYZ 物理解码。
+固定 normalized-zero motion t0 是显式 padding，不是观测 motion 或真实未来条件。
+每个缺失模态的 loss 可为零；安全分母只避免该模态除零，全 batch 是否有监督另行严格检查。
+F.normalize epsilon、Wan norm epsilon、scheduler epsilon 是数值稳定参数，不能替代非法输入检查。
+训练与推理的 O/R/M/G 因果依赖保持不变；3D 继续读取从独立噪声生成的未来，不读取真实未来或 teacher 输入。
+
+验证
+完整回归：93 passed，1 warning（官方 Omega 对不同尺寸图像做 padding 的预期提示）。
+日志：outputs/wsa1_5_numerical_tests.txt。
+新增 tests/test_wsa1_5_numerical_contracts.py 覆盖 NaN/Inf 配置、无监督 batch、BF16 时间精度、非法 mask、
+损坏 cache、固定权重维度、非法标注、严格恢复和 LR 不自动缩放；全部为小型张量或数据合同测试。
+Ruff F 检查、Python 编译、git diff --check 通过；Git 的 LF/CRLF 提示不是 diff 错误。
+真实 knit_scarf 样本 2 workers 读取通过；31023 帧，105 episodes。
+独立 PyAV motion 解码 max/mean difference=0，最大时间戳误差 5.563100180516756e-08 秒。
+结果：outputs/wsa1_5_numerical_dataset_check.json。
+
+仍需服务器验证
+真实 Wan/VAE/UMT5/Omega 的 BF16/FP16 数值、完整 forward/backward、真实梯度范数、DDP 和 checkpoint 恢复。
+本地测试通过不能证明这些大型模型的真实训练绝不会出现数值问题。
+原始 XYZ 与物理 scale/offset 不可用，物理单位误差仍不能验证；代码没有默认猜测这些数值。
+遇到全无监督 batch 会明确停止，应检查数据有效性、采样范围和模态权重，再继续训练。
+
+额度
+最后一次用户提供的状态：剩余 87%，重置时间显示 3:59。
+工具不能读取账户用量；没有伪造新的精确百分比或推定已经重置。

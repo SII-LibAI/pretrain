@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -330,7 +329,6 @@ class SyntheticEmbodimentDataset(Dataset):
         embodiments: Sequence[str] | None = None,
         row_group_cache_size: int = 0,
         transforms: Sequence[DataTransformFn] | None = None,
-        require_wsa15_layout: bool = False,
     ) -> None:
         if chunk_size < 1:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
@@ -353,48 +351,6 @@ class SyntheticEmbodimentDataset(Dataset):
         schema_prefix = embodiment_schema_prefix(base_dataset.meta.robot_type)
         self.embodiment_schemas = load_embodiment_schemas(self.annotations.specs, schema_prefix)
 
-        if require_wsa15_layout:
-            from lerobot.datasets.wsa1_5 import validate_wsa15_action_layout
-
-            compatible_names = []
-            rejected = []
-            for spec, schema in zip(
-                self.annotations.specs, self.embodiment_schemas, strict=True
-            ):
-                try:
-                    required_state = _reorder_output_dim(schema.state_reorder, spec.dim)
-                    required_action = _reorder_output_dim(schema.action_reorder, spec.dim)
-                    if required_state > max_state_dim or required_action > max_action_dim:
-                        raise ValueError(
-                            f"requires state/action {required_state}/{required_action}, "
-                            f"configured {max_state_dim}/{max_action_dim}"
-                        )
-                    validate_wsa15_action_layout(list(schema.action_layout))
-                except ValueError as error:
-                    rejected.append(f"{spec.name}: {error}")
-                else:
-                    compatible_names.append(spec.name)
-
-            if rejected and embodiments is not None:
-                raise ValueError(
-                    "Explicit synthetic embodiments are incompatible with WSA1.5: "
-                    + "; ".join(rejected)
-                )
-            if embodiments is None and rejected:
-                logging.info(
-                    "WSA1.5 excluded incompatible synthetic embodiments: %s",
-                    "; ".join(rejected),
-                )
-                if not compatible_names:
-                    raise ValueError("No WSA1.5-compatible synthetic embodiments were discovered")
-                self.annotations = SyntheticActionTable.from_parquet(
-                    annotation_path,
-                    compatible_names,
-                    row_group_cache_size=row_group_cache_size,
-                )
-                self.embodiment_schemas = load_embodiment_schemas(
-                    self.annotations.specs, schema_prefix
-                )
         self.embodiment_stats = load_embodiment_stats(stats_dir, self.annotations.specs)
 
         required_state_dim = max(
@@ -437,7 +393,6 @@ class SyntheticEmbodimentDataset(Dataset):
 
         source_transforms = list(transforms or [])
         if source_transforms:
-            from lerobot.datasets.wsa1_5 import CanonicalStateActionTransformFn
             from lerobot.transforms.core import (
                 DeltaActionTransformFn,
                 NormalizeTransformFn,
@@ -448,35 +403,21 @@ class SyntheticEmbodimentDataset(Dataset):
 
             chat_transform_names = {
                 "InternVLAA15ChatProcessorTransformFn",
-                "WSA15ChatProcessorTransformFn",
             }
 
-            uses_semantic_canonicalizer = any(
-                isinstance(transform, CanonicalStateActionTransformFn)
-                for transform in source_transforms
-            )
             pose_types = (
                 DeltaActionTransformFn,
                 NormalizeTransformFn,
                 PadStateAndActionTransformFn,
                 ReorderStateActionTransform,
             )
-            if uses_semantic_canonicalizer:
-                # WSA1.5 canonicalization is schema-aware and must remain after
-                # ComposeFieldsTransform. Delta/Normalize remain standard
-                # transforms; the codec replaces only legacy pad/reorder.
-                pose_sources = []
-                remaining_transforms = source_transforms
-            else:
-                pose_sources = []
-                for transform_type in pose_types:
-                    matches = [t for t in source_transforms if isinstance(t, transform_type)]
-                    if len(matches) != 1:
-                        raise ValueError(f"Expected one {transform_type.__name__} in dataset transforms")
-                    pose_sources.append(matches[0])
-                remaining_transforms = [
-                    t for t in source_transforms if not isinstance(t, pose_types)
-                ]
+            pose_sources = []
+            for transform_type in pose_types:
+                matches = [t for t in source_transforms if isinstance(t, transform_type)]
+                if len(matches) != 1:
+                    raise ValueError(f"Expected one {transform_type.__name__} in dataset transforms")
+                pose_sources.append(matches[0])
+            remaining_transforms = [t for t in source_transforms if not isinstance(t, pose_types)]
             self._pose_transforms = []
             self._transforms = []
             for spec, schema in zip(
@@ -494,24 +435,17 @@ class SyntheticEmbodimentDataset(Dataset):
                     },
                 )
                 view = SyntheticDatasetHydrationView(self, body_meta)
-                if uses_semantic_canonicalizer:
-                    self._pose_transforms.append(_identity)
-                else:
-                    delta, normalize, pad, reorder = pose_sources
-                    self._pose_transforms.append(
-                        compose(
-                            [
-                                delta.hydrate(view),
-                                normalize.hydrate(view),
-                                replace(
-                                    pad,
-                                    max_state_dim=max_state_dim,
-                                    max_action_dim=max_action_dim,
-                                ),
-                                reorder.hydrate(view),
-                            ]
-                        )
+                delta, normalize, pad, reorder = pose_sources
+                self._pose_transforms.append(
+                    compose(
+                        [
+                            delta.hydrate(view),
+                            normalize.hydrate(view),
+                            replace(pad, max_state_dim=max_state_dim, max_action_dim=max_action_dim),
+                            reorder.hydrate(view),
+                        ]
                     )
+                )
                 hydrated = []
                 for transform in remaining_transforms:
                     if type(transform).__name__ in chat_transform_names:

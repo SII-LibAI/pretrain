@@ -146,8 +146,11 @@ class MultiGroupCosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
     # uses its own warmup value from ``group_schedules``.
     num_warmup_steps: int = 0
     group_schedules: dict[str, dict[str, float | int]] = field(default_factory=dict)
+    auto_scale_to_training_steps: bool = True
 
     def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        if type(num_training_steps) is not int or num_training_steps <= 0:
+            raise ValueError("Training steps must be a positive integer")
         def make_lr_lambda(group_name: str, schedule: dict[str, float | int]):
             required = {"peak_lr", "decay_lr", "num_warmup_steps", "num_decay_steps"}
             missing = required - schedule.keys()
@@ -160,6 +163,9 @@ class MultiGroupCosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
             decay_lr = float(schedule["decay_lr"])
             configured_warmup_steps = int(schedule["num_warmup_steps"])
             configured_decay_steps = int(schedule["num_decay_steps"])
+
+            if not math.isfinite(peak_lr) or not math.isfinite(decay_lr):
+                raise ValueError(f"Non-finite learning rate for optimizer group {group_name!r}")
 
             if peak_lr <= 0:
                 raise ValueError(f"peak_lr for optimizer group {group_name!r} must be positive")
@@ -174,7 +180,7 @@ class MultiGroupCosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
 
             # Preserve the existing scheduler behavior: when a run is shorter
             # than the configured schedule, fit the full curve into the run.
-            if num_training_steps < configured_decay_steps:
+            if self.auto_scale_to_training_steps and num_training_steps < configured_decay_steps:
                 scale = num_training_steps / configured_decay_steps
                 warmup_steps = int(configured_warmup_steps * scale)
                 decay_steps = num_training_steps
@@ -190,6 +196,8 @@ class MultiGroupCosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
                 warmup_steps = configured_warmup_steps
                 decay_steps = configured_decay_steps
 
+            if not self.auto_scale_to_training_steps and warmup_steps >= decay_steps:
+                raise ValueError("Explicit scheduler requires warmup < decay steps")
             warmup_steps = min(warmup_steps, decay_steps)
             min_lr_ratio = decay_lr / peak_lr
 

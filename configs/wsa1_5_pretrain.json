@@ -1,0 +1,26 @@
+{
+  "policy": {
+    "type": "WSA_1_5",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "push_to_hub": false,
+    "wan_model_path": "weights/Wan2.2-TI2V-5B",
+    "vae_path": "weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+    "text_encoder_path": "weights/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",
+    "tokenizer_path": "weights/Wan2.2-TI2V-5B/google/umt5-xxl",
+    "omega_checkpoint_path": "weights/VGGT-Omega-1B-256-Text-Alignment/model.pt"
+  },
+  "dataset": {
+    "type": "wsa1_5",
+    "root": "data",
+    "repo_id": ["extra/knit_scarf"],
+    "video_backend": "pyav"
+  },
+  "output_dir": "outputs/wsa1_5/server_validation",
+  "batch_size": 1,
+  "num_workers": 4,
+  "steps": 600000,
+  "log_freq": 10,
+  "save_freq": 10000,
+  "wandb": {"enable": false}
+}

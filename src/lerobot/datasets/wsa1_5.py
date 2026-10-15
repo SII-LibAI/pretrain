@@ -1,731 +1,307 @@
-"""WSA1.5 unified data-flow transforms.
+"""A thin, target-isolating adapter over the existing LeRobot V3 reader.
 
-Standard LeRobot state/action fields are mapped into fixed semantic slots.  A
-dataset may additionally provide subtask and motion annotations; missing
-annotations produce explicit validity masks instead of making it unloadable.
+All timestamps come from the source frame table. Missing media is accompanied
+by masks; decoding failures never become unmarked ground truth.
 """
-
 from __future__ import annotations
 
-import bisect
+import hashlib
 import json
-from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: N812
-from torch import Tensor
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torch.utils.data._utils.collate import default_collate
 
-from lerobot.dataset_schemas import get_schema
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-from lerobot.transforms.core import (
-    ComposeFieldsTransform,
-    DataDict,
-    DataTransformFn,
-    DeltaActionTransformFn,
-    LoadActionTextFromJsonlTransformFn,
-    NormalizeTransformFn,
-    RemapImageKeyTransformFn,
-    ResizeImagesWithPadFn,
-    UnNormalizeTransformFn,
-)
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.dataset_schemas import get_registry, get_schema
+from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
+from lerobot.datasets.video_utils import decode_video_frames
 
-FUTURE_2D_SOURCE_KEY = "observation.mask"
-FUTURE_3D_SOURCE_KEY = "observation.motion"
-WSA15_DATAFLOW_NAME = "wsa1_5"
-WSA15_SOURCE_ROBOT = "robot"
-WSA15_SOURCE_HUMAN = "human"
-DEFAULT_HUMAN_ACTION_FILE = "meta/annotations/action.parquet"
-WSA15_VIDEO_STORAGE_ALIASES = {
-    FUTURE_2D_SOURCE_KEY: "mask",
-    FUTURE_3D_SOURCE_KEY: "motion",
-}
-FUTURE_2D_TARGET_KEY = "wsa.future_motion_mask"
-FUTURE_2D_VALID_KEY = "wsa.future_motion_mask_valid"
-FUTURE_3D_TARGET_KEY = "wsa.future_motion_mask_ids"
-FUTURE_3D_VALID_KEY = "wsa.future_motion_mask_ids_valid"
-PHYSICAL_TARGET_VALID_KEY = "physical_target_valid"
-SUBTASK_TEXT_KEY = "wsa.subtask_text"
-SUBTASK_VALID_KEY = "wsa.subtask_valid"
-SUBTASK_TARGET_KEY = "wsa.subtask_token_ids"
-SUBTASK_TARGET_MASK_KEY = "wsa.subtask_token_mask"
+PROMPT_VERSION = "wsa1_5.task-subtask-hand-scene.v1"
+HAND_NAMES = {0: "left hand", 1: "right hand", 2: "both hands"}
 
 
-def is_wsa15_human_robot_type(robot_type: str) -> bool:
-    """Human sources are identified solely by the source metadata robot_type."""
-
-    return "ego" in robot_type.lower()
-
-
-def wsa15_source_kind(robot_type: str) -> str:
-    """Classify one LeRobotV3 source using its declared ``robot_type``."""
-
-    return WSA15_SOURCE_HUMAN if is_wsa15_human_robot_type(robot_type) else WSA15_SOURCE_ROBOT
+def imagenet_normalize(x):
+    mean = x.new_tensor([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+    std = x.new_tensor([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+    return (x - mean) / std
 
 
-def wsa15_future_indices(chunk_size: int, num_future_frames: int) -> list[int]:
-    """Return uniformly spaced future-frame offsets inside an action horizon."""
-
-    if chunk_size < 1:
-        raise ValueError("chunk_size must be positive")
-    if num_future_frames < 1:
-        raise ValueError("num_future_frames must be positive")
-    return [chunk_size * index // num_future_frames for index in range(1, num_future_frames + 1)]
+def imagenet_denormalize(x):
+    return x * x.new_tensor([0.229, 0.224, 0.225]).reshape(3, 1, 1) + x.new_tensor(
+        [0.485, 0.456, 0.406]).reshape(3, 1, 1)
 
 
-def resolve_wsa15_video_key_mapping(dataset_metadata: Any) -> dict[str, str]:
-    """Resolve the two documented supplemental-video storage aliases.
+def compose_rgb_views(views, valid, height=384, width=320):
+    """Official WSA robotwin layout: top 2/3, then left/right bottom 1/3."""
+    if len(views) != 3 or len(valid) != 3 or height % 3 or width % 2:
+        raise ValueError("Expected three ordered views and a valid WSA canvas size")
+    sizes = [(height * 2 // 3, width), (height // 3, width // 2), (height // 3, width // 2)]
+    patches, masks = [], []
+    for view, is_valid, size in zip(views, valid, sizes, strict=True):
+        if view.ndim != 4 or view.shape[1] != 3:
+            raise ValueError("Each view must have shape [T,3,H,W]")
+        patch = F.interpolate(view.float(), size=size, mode="bilinear", align_corners=False)
+        mask = torch.as_tensor(is_valid, device=view.device)
+        if mask.dtype != torch.bool:
+            raise TypeError("RGB view validity must be boolean")
+        mask = mask.expand(view.shape[0]).reshape(-1, 1, 1, 1)
+        patches.append(patch.masked_fill(~mask, 0))
+        masks.append(mask.expand(-1, 1, *size))
+    return (torch.cat([patches[0], torch.cat(patches[1:], -1)], -2),
+            torch.cat([masks[0], torch.cat(masks[1:], -1)], -2))
 
-    Supplements expose logical feature names such as ``observation.mask`` in
-    ``info.json`` while their episode columns and video directories can use
-    ``mask``. Standard LeRobot videos use the
-    same key in both locations. Both layouts are explicit and supported; any
-    third layout is a malformed dataset rather than a path to guess.
+
+def build_inference_condition(observed_rgb, text, *, observed_valid=None):
+    """Explicit signature prevents accepting motion or target fields as conditions."""
+    condition = {"observed_rgb": observed_rgb, "condition_text": text}
+    if observed_valid is not None:
+        condition["observed_valid"] = observed_valid
+    return condition
+
+
+@dataclass(frozen=True)
+class Segment:
+    episode: int
+    first: int  # Relative index in the actual loaded HF table.
+    last: int  # Inclusive endpoint.
+    subtask: int
+    text: str
+    metadata_valid: bool
+
+
+def condition_text(episode, subtask):
+    # Only read fields verified in the real sample. Unknown optional fields are empty.
+    task = episode.get("task_instruction", "") or ""
+    instruction = subtask.get("subtask_text", "") or ""
+    hand = HAND_NAMES.get(subtask.get("hand_used"), "")
+    scene = episode.get("scene", "") or ""
+    return f"Task: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
+
+
+class LoadedEpisodeMetadata:
+    """Expose loaded-sample offsets to existing mixing/sampling code.
+
+    Video path methods stay bound to the original LeRobot metadata, preserving
+    global episode IDs and chunk offsets after an episodes=[...] filter.
     """
-
-    if not dataset_metadata.episodes:
-        return {}
-    episode = dataset_metadata.episodes[0]
-    mapping: dict[str, str] = {}
-    for logical_key, storage_key in WSA15_VIDEO_STORAGE_ALIASES.items():
-        feature = dataset_metadata.features.get(logical_key)
-        if feature is None or feature.get("dtype") != "video":
-            continue
-        logical_column = f"videos/{logical_key}/chunk_index"
-        storage_column = f"videos/{storage_key}/chunk_index"
-        if logical_column in episode:
-            continue
-        if storage_column not in episode:
-            raise KeyError(
-                f"{logical_key!r} is declared as video but episode metadata contains neither "
-                f"{logical_column!r} nor {storage_column!r}"
-            )
-        mapping[logical_key] = storage_key
-    return mapping
-
-
-def resolve_wsa15_delta_timestamps(
-    dataset_config: Any,
-    dataset_metadata: Any,
-    *,
-    human_source: bool,
-) -> dict[str, list[float]] | None:
-    """Build the WSA1.5 query plan without depending on a policy config.
-
-    Robot sources read the future action chunk from the standard LeRobotV3
-    parquet. Human sources deliberately do not query that action column because
-    :class:`SyntheticEmbodimentDataset` replaces it with ``action.parquet``.
-    RGB inputs are current-frame observations. Optional motion videos are read
-    only at the uniformly spaced future offsets used as supervision.
-    """
-
-    schema = get_schema(dataset_metadata.robot_type)
-    features = dataset_metadata.features
-    fps = dataset_metadata.fps
-    chunk_size = int(dataset_config.chunk_size)
-    num_future_frames = int(dataset_config.num_video_frames)
-    action_indices = list(range(chunk_size))
-    future_indices = wsa15_future_indices(chunk_size, num_future_frames)
-    timestamps: dict[str, list[float]] = {}
-
-    if not human_source:
-        for key in schema.get_action_keys():
-            if key in features:
-                timestamps[key] = [index / fps for index in action_indices]
-
-    for key in schema.image_mapping:
-        if key in features:
-            timestamps[key] = [0.0]
-
-    for key in (FUTURE_2D_SOURCE_KEY, FUTURE_3D_SOURCE_KEY):
-        feature = features.get(key)
-        if feature is not None and feature.get("dtype") == "video":
-            timestamps[key] = [index / fps for index in future_indices]
-
-    return timestamps or None
-
-# Compact semantic state/action representation derived from Qwen-RobotManip's
-# fixed-slot principle but adapted to this repository's embodiments.  The flat
-# vector is [left 16 | right 16], and each side is
-# [joint 7 | EEF xyz 3 | EEF quaternion xyzw 4 | gripper 2].
-CANONICAL_DIM = 32
-ARM_DIM = 16
-JOINT_DIM = 7
-EEF_POSITION_START = 7
-EEF_QUATERNION_START = 10
-GRIPPER_START = 14
-GRIPPER_DIM = 2
-STATE_VALID_MASK_KEY = "wsa.state_valid_mask"
-ACTION_VALID_MASK_KEY = "wsa.action_valid_mask"
-ACTION_DECODE_MATRIX_KEY = "wsa.action_decode_matrix"
-ACTION_DECODE_BIAS_KEY = "wsa.action_decode_bias"
-ACTION_RAW_DIM_KEY = "wsa.action_raw_dim"
-
-
-def build_wsa15_data_transforms(
-    *,
-    action_mode: str = "abs",
-    num_future_frames: int = 4,
-    height: int = 224,
-    width: int = 224,
-) -> list[DataTransformFn]:
-    """The shared, ordered preprocessing pipeline before tokenization.
-
-    Training and the data inspector use this same list. ``hydrate(dataset)``
-    binds schema mappings and statistics once; ``__call__(sample)`` applies
-    those mappings to each sampled frame.
-    """
-
-    if action_mode not in {"abs", "delta"}:
-        raise ValueError("action_mode must be 'abs' or 'delta'")
-    transforms: list[DataTransformFn] = []
-    if action_mode == "delta":
-        transforms.append(DeltaActionTransformFn())
-    return [
-        *transforms,
-        PrepareWSA15MotionTargetsFn(num_future_frames=num_future_frames, height=height, width=width),
-        ResizeImagesWithPadFn(height=height, width=width),
-        RemapImageKeyTransformFn(),
-        SelectWSA15CurrentObservationFn(),
-        NormalizeTransformFn(),
-        ComposeFieldsTransform(),
-        CanonicalStateActionTransformFn(),
-        LoadActionTextFromJsonlTransformFn(),
-        LoadWSA15PhysicalAnnotationsFn(),
-    ]
-
-
-def wrap_wsa15_dataset(
-    base_dataset: LeRobotDataset,
-    dataset_config: Any,
-    transforms: Sequence[DataTransformFn],
-):
-    """Select one storage adapter for training and data inspection.
-
-    Source classification always uses the base LeRobot metadata, before any
-    synthetic embodiment schema replaces ``robot_type`` during hydration.
-    """
-
-    from lerobot.datasets.synthetic_embodiment import SyntheticEmbodimentDataset
-    from lerobot.datasets.transformed_dataset import TransformedLeRobotDataset
-
-    if not is_wsa15_human_robot_type(base_dataset.meta.robot_type):
-        return TransformedLeRobotDataset.from_base(base_dataset, transforms)
-    if dataset_config.human_stats_dir is None:
-        raise ValueError(f"Human dataset {base_dataset.repo_id!r} requires human_stats_dir")
-    return SyntheticEmbodimentDataset(
-        base_dataset,
-        annotation_file=dataset_config.human_action_file,
-        stats_dir=dataset_config.human_stats_dir,
-        chunk_size=dataset_config.chunk_size,
-        max_state_dim=CANONICAL_DIM,
-        max_action_dim=CANONICAL_DIM,
-        embodiments=dataset_config.human_embodiments or None,
-        row_group_cache_size=dataset_config.human_annotation_row_group_cache_size,
-        transforms=transforms,
-        require_wsa15_layout=True,
-    )
-
-
-def validate_wsa15_action_layout(action_layout: list[dict[str, Any]]) -> None:
-    """Fail early when an embodiment cannot fit the compact WSA1.5 slots."""
-
-    occupied: set[int] = set()
-    for block in action_layout:
-        name = str(block["name"])
-        slots = CanonicalStateActionTransformFn._slot_indices(name, int(block["size"]))
-        overlap = occupied.intersection(slots)
-        if overlap:
-            raise ValueError(f"Semantic action block {name!r} overlaps canonical slots {sorted(overlap)}")
-        occupied.update(slots)
-
-
-def _side_base(side: str) -> int:
-    return 0 if side == "left" else ARM_DIM
-
-
-def _layout_side(name: str) -> str | None:
-    lowered = name.lower()
-    if lowered.startswith("left") or ".left" in lowered:
-        return "left"
-    if lowered.startswith("right") or ".right" in lowered:
-        return "right"
-    return None
-
-
-def validate_wsa15_normalization_stats(dataset) -> None:
-    """Require real mean/std for every schema state/action source feature.
-
-    The repository normalizer owns the arithmetic. This WSA boundary check
-    prevents its generic missing-feature skip from admitting unnormalized
-    state/action into a mixed training batch.
-    """
-
-    schema = get_schema(dataset.meta.robot_type)
-    stats = dataset.meta.stats
-    for key in schema.get_state_keys() + schema.get_action_keys():
-        if stats is None or key not in stats:
-            raise ValueError(f"{schema.robot_type}: missing normalization stats for {key!r}")
-        for statistic in ("mean", "std"):
-            if statistic not in stats[key]:
-                raise ValueError(f"{schema.robot_type}: missing stats[{key!r}][{statistic!r}]")
-            values = np.asarray(stats[key][statistic])
-            if not np.isfinite(values).all() or (statistic == "std" and (values < 0).any()):
-                raise ValueError(f"{schema.robot_type}: invalid {key!r} {statistic} statistics")
-
-
-def _reorder_matrix(raw_dim: int, spec: list[list[int]] | None) -> torch.Tensor:
-    """Map raw vectors to a compact semantic vector, removing legacy gap slots."""
-
-    if not spec:
-        return torch.eye(raw_dim)
-    target_dim = max(int(item[3]) for item in spec)
-    expanded = torch.zeros(target_dim, raw_dim)
-    covered = torch.zeros(target_dim, dtype=torch.bool)
-    for src_start, src_end, dst_start, dst_end in spec:
-        if src_end - src_start != dst_end - dst_start:
-            raise ValueError(f"Invalid reorder entry: {[src_start, src_end, dst_start, dst_end]}")
-        expanded[dst_start:dst_end, src_start:src_end] = torch.eye(src_end - src_start)
-        covered[dst_start:dst_end] = True
-    return expanded[covered]
-
-
-@DataTransformFn.register_subclass("wsa1_5_canonical_state_action")
-@dataclass
-class CanonicalStateActionTransformFn(DataTransformFn):
-    """Encode heterogeneous embodiments into Qwen-RobotManip semantic slots.
-
-    Unlike ``PadStateAndActionTransformFn``, zeros here mean *structurally
-    absent* fields and are paired with binary masks.  They are never treated as
-    action targets.  Absolute-versus-delta conversion is deliberately outside
-    this codec and is controlled only by ``DeltaActionTransformFn`` plus the
-    dataset schema's ``action_mask_spec``. Inputs are already normalized by
-    the repository's ``NormalizeTransformFn``. This transform only reorders,
-    fills semantic slots, and emits decode metadata derived using the
-    repository's ``UnNormalizeTransformFn``.
-    """
-
-    normalization_mode: str = "mean_std"
-    action_layout: list[dict[str, Any]] = field(default_factory=list)
-    action_reorder: list[list[int]] | None = None
-    state_reorder: list[list[int]] | None = None
-    action_decode_scale: Tensor | None = None
-    action_decode_bias: Tensor | None = None
-    robot_type: str = ""
-
-    def hydrate(self, dataset: LeRobotDataset | StreamingLeRobotDataset) -> CanonicalStateActionTransformFn:
-        schema = get_schema(dataset.meta.robot_type)
-        validate_wsa15_normalization_stats(dataset)
-        action_keys = schema.get_action_keys()
-        stats = dataset.meta.stats
-        unnormalize = UnNormalizeTransformFn(
-            selected_keys=action_keys, mode=self.normalization_mode, norm_stats=stats
-        )
-        zeros = {key: torch.zeros_like(torch.as_tensor(stats[key]["mean"]), dtype=torch.float64) for key in action_keys}
-        ones = {key: torch.ones_like(value) for key, value in zeros.items()}
-        decoded_zeros = unnormalize(zeros)
-        decoded_ones = unnormalize(ones)
-        decode_bias = torch.cat([decoded_zeros[key].flatten() for key in action_keys])
-        decode_scale = torch.cat([decoded_ones[key].flatten() for key in action_keys]) - decode_bias
-        return replace(
-            self,
-            action_layout=list(schema.action_layout),
-            action_reorder=schema.action_reorder,
-            state_reorder=schema.state_reorder,
-            action_decode_scale=decode_scale,
-            action_decode_bias=decode_bias,
-            robot_type=schema.robot_type,
-        )
-
-    @staticmethod
-    def _slot_indices(name: str, size: int) -> list[int]:
-        side = _layout_side(name)
-        if side is None:
-            raise ValueError(f"Semantic action block {name!r} must declare a left/right side")
-
-        base = _side_base(side)
-        lowered = name.lower()
-        if "eef_position" in lowered or "ee_pos" in lowered:
-            if size != 3:
-                raise ValueError(f"EEF position block {name!r} must have 3 values")
-            return list(range(base + EEF_POSITION_START, base + EEF_QUATERNION_START))
-        if "quaternion" in lowered:
-            if size != 4:
-                raise ValueError(f"EEF quaternion block {name!r} must use xyzw with 4 values")
-            return list(range(base + EEF_QUATERNION_START, base + GRIPPER_START))
-        if "eef_rotation" in lowered or "ee_rot" in lowered:
-            raise ValueError(f"EEF rotation block {name!r} is unsupported: WSA1.5 requires quaternion_xyzw")
-        if "gripper" in lowered or "grasp" in lowered:
-            if size > GRIPPER_DIM:
-                raise ValueError(f"Gripper block {name!r} has {size} values; canonical capacity is 2")
-            return list(range(base + GRIPPER_START, base + GRIPPER_START + size))
-        if "hand" in lowered:
-            raise ValueError(f"Dexterous-hand block {name!r} is not part of the compact WSA1.5 action space")
-        if "arm" in lowered or "joint" in lowered:
-            if size > JOINT_DIM:
-                raise ValueError(f"Arm joint block {name!r} has {size} values; canonical capacity is 7")
-            return list(range(base, base + size))
-        raise ValueError(f"Unknown semantic action block {name!r}; add an explicit WSA1.5 mapping")
-
-    def _logical_layout(self, raw_dim: int, reorder: list[list[int]] | None) -> tuple[torch.Tensor, int]:
-        matrix = _reorder_matrix(raw_dim, reorder)
-        declared = sum(int(block["size"]) for block in self.action_layout)
-        if declared and matrix.shape[0] != declared:
-            raise ValueError(
-                f"{self.robot_type}: action_layout declares {declared} values but reorder yields "
-                f"{matrix.shape[0]}"
-            )
-        return matrix, matrix.shape[0]
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if not self.action_layout:
-            raise ValueError(
-                f"{self.robot_type or 'dataset'} has no action_layout. WSA1.5 requires semantic blocks; "
-                "it deliberately refuses dimension-only padding."
-            )
-        state_raw = data[OBS_STATE].float()
-        action_raw = data[ACTION].float()
-        if state_raw.ndim != 1 or action_raw.ndim not in (1, 2):
-            raise ValueError(
-                f"Canonical transform expects state [D] and action [D] or [T,D], got "
-                f"{tuple(state_raw.shape)} and {tuple(action_raw.shape)}"
-            )
-        action_raw = action_raw.unsqueeze(0) if action_raw.ndim == 1 else action_raw
-
-        state_map, _ = self._logical_layout(state_raw.shape[-1], self.state_reorder)
-        action_map, action_logical_dim = self._logical_layout(action_raw.shape[-1], self.action_reorder)
-        state_map = state_map.to(state_raw)
-        action_map = action_map.to(action_raw)
-        state_logical = state_map @ state_raw
-        action_logical = action_raw @ action_map.transpose(0, 1)
-
-        # A directly constructed codec is a pure slot map. Hydrated dataset
-        # codecs always derive physical-unit decoding from the loaded stats.
-        action_scale_raw = (
-            self.action_decode_scale.to(action_raw)
-            if self.action_decode_scale is not None else action_raw.new_ones(action_raw.shape[-1])
-        )
-        action_bias_raw = (
-            self.action_decode_bias.to(action_raw)
-            if self.action_decode_bias is not None else action_raw.new_zeros(action_raw.shape[-1])
-        )
-        action_scale = action_map.abs() @ action_scale_raw
-        action_bias = action_map @ action_bias_raw
-
-        state = state_raw.new_zeros(CANONICAL_DIM)
-        actions = action_raw.new_zeros(action_raw.shape[0], CANONICAL_DIM)
-        state_valid = torch.zeros(CANONICAL_DIM, dtype=torch.bool, device=state_raw.device)
-        action_valid = torch.zeros(CANONICAL_DIM, dtype=torch.bool, device=action_raw.device)
-        decode_matrix = action_raw.new_zeros(CANONICAL_DIM, CANONICAL_DIM)
-        decode_bias = action_raw.new_zeros(CANONICAL_DIM)
-
-        offset = 0
-        for block in self.action_layout:
-            name = str(block["name"])
-            size = int(block["size"])
-            logical_slice = slice(offset, offset + size)
-            slots = self._slot_indices(name, size)
-            if slots:
-                if len(slots) != size:
-                    raise RuntimeError(f"Internal canonical slot mismatch for {name!r}")
-                slot_tensor = torch.tensor(slots, device=state_raw.device)
-                state[slot_tensor] = state_logical[logical_slice]
-                actions[:, slot_tensor] = action_logical[:, logical_slice]
-                state_valid[slot_tensor] = True
-                action_valid[slot_tensor] = True
-                for logical_index, canonical_index in zip(range(offset, offset + size), slots, strict=True):
-                    decode_matrix[logical_index, canonical_index] = action_scale[logical_index]
-                    decode_bias[logical_index] = action_bias[logical_index]
-            offset += size
-
-        # Convert logical-order decode rows back to the repository's raw order.
-        logical_to_raw = action_map.transpose(0, 1)
-        full_logical_to_raw = action_raw.new_zeros(CANONICAL_DIM, CANONICAL_DIM)
-        full_logical_to_raw[: action_raw.shape[-1], :action_logical_dim] = logical_to_raw
-        decode_matrix = full_logical_to_raw @ decode_matrix
-        decode_bias = full_logical_to_raw @ decode_bias
-
-        data[OBS_STATE] = state
-        data[ACTION] = actions
-        data[STATE_VALID_MASK_KEY] = state_valid
-        data[ACTION_VALID_MASK_KEY] = action_valid
-        data[ACTION_DECODE_MATRIX_KEY] = decode_matrix
-        data[ACTION_DECODE_BIAS_KEY] = decode_bias
-        data[ACTION_RAW_DIM_KEY] = torch.tensor(action_raw.shape[-1], dtype=torch.long)
-        return data
-
-
-def decode_canonical_actions(
-    canonical: Tensor,
-    metadata: DataDict,
-    fallback_output_dim: int = CANONICAL_DIM,
-) -> Tensor:
-    """Decode predicted canonical actions to the dataset's original interface."""
-
-    matrix = metadata.get(ACTION_DECODE_MATRIX_KEY)
-    if matrix is None:
-        return canonical[..., :fallback_output_dim]
-    if matrix.ndim == 2:
-        matrix = matrix.unsqueeze(0).expand(canonical.shape[0], -1, -1)
-    matrix = matrix.to(canonical)
-    bias = metadata[ACTION_DECODE_BIAS_KEY]
-    if bias.ndim == 1:
-        bias = bias.unsqueeze(0).expand(canonical.shape[0], -1)
-    bias = bias.to(canonical)
-    decoded = torch.einsum("bij,btj->bti", matrix, canonical) + bias[:, None]
-
-    raw_dims = metadata.get(ACTION_RAW_DIM_KEY)
-    output_dim = (
-        int(raw_dims.flatten()[0].item())
-        if raw_dims is not None and int(raw_dims.flatten()[0].item()) > 0
-        else fallback_output_dim
-    )
-    return decoded[..., :output_dim]
-
-
-def _as_int(value: Any) -> int:
-    return int(value.item()) if isinstance(value, torch.Tensor) else int(value)
-
-
-@DataTransformFn.register_subclass("wsa1_5_physical_annotations")
-@dataclass
-class LoadWSA15PhysicalAnnotationsFn(DataTransformFn):
-    """Attach the sidecar's discrete subtask target when available.
-
-    WSA1.5 intentionally leaves episodic memory unspecified.  Pose annotations
-    are therefore not serialized into language and cannot leak into context.
-    """
-
-    sidecar_file: str = ""
-    output_key: str = "sub_task"
-    _segments: dict[int, tuple[list[int], list[tuple[int, int, str]]]] = field(
-        default_factory=dict, init=False, repr=False
-    )
-    _instructions: dict[int, str] = field(default_factory=dict, init=False, repr=False)
-
-    def hydrate(self, dataset: LeRobotDataset | StreamingLeRobotDataset) -> LoadWSA15PhysicalAnnotationsFn:
-        root = Path(str(getattr(dataset, "root", "")))
-        sidecar = Path(self.sidecar_file) if self.sidecar_file else root / "meta" / "sidecar.json"
-        hydrated = replace(self, sidecar_file=str(sidecar))
-        hydrated._load_sidecar()
-        return hydrated
-
-    def _load_sidecar(self) -> None:
-        path = Path(self.sidecar_file)
-        if not path.is_file():
-            return
-        payload = json.loads(path.read_text(encoding="utf-8"))
-
-        episodes = payload if isinstance(payload, list) else payload.get("episodes", [])
-        for episode in episodes:
-            episode_index = int(episode["episode_index"])
-            instruction = str(episode.get("task_instruction", "")).strip()
-            if instruction:
-                self._instructions[episode_index] = instruction
-            segments = sorted(
-                (
-                    int(segment["start_frame"]),
-                    int(segment["end_frame"]),
-                    str(segment.get("subtask_text", "")).strip(),
-                )
-                for segment in episode.get("subtasks", [])
-            )
-            if segments:
-                self._segments[episode_index] = ([segment[0] for segment in segments], segments)
-
-    def _subtask(self, episode_index: int, frame_index: int) -> str:
-        cached = self._segments.get(episode_index)
-        if cached is None:
-            return ""
-        starts, segments = cached
-        position = bisect.bisect_right(starts, frame_index) - 1
-        if position < 0:
-            return ""
-        start, end, text = segments[position]
-        return text if start <= frame_index <= end else ""
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if "episode_index" not in data or "frame_index" not in data:
-            data[PHYSICAL_TARGET_VALID_KEY] = torch.tensor(False)
-            data[SUBTASK_TEXT_KEY] = ""
-            data[SUBTASK_VALID_KEY] = torch.tensor(False)
-            return data
-
-        episode_index = _as_int(data["episode_index"])
-        frame_index = _as_int(data["frame_index"])
-        subtask = self._subtask(episode_index, frame_index)
-
-        existing = str(data.get(self.output_key, "")).strip()
-        target = subtask or existing
-        if target:
-            data[self.output_key] = target
-        instruction = self._instructions.get(episode_index)
-        if instruction:
-            data["task"] = instruction
-        valid = torch.tensor(bool(target), dtype=torch.bool)
-        data[PHYSICAL_TARGET_VALID_KEY] = valid
-        data[SUBTASK_TEXT_KEY] = target
-        data[SUBTASK_VALID_KEY] = valid
-        return data
-
-
-@DataTransformFn.register_subclass("wsa1_5_select_current_observation")
-@dataclass
-class SelectWSA15CurrentObservationFn(DataTransformFn):
-    """Keep current RGB for Qwen without discarding future motion targets."""
-
-    num_views: int = 3
-
-    def __call__(self, data: DataDict) -> DataDict:
-        for index in range(self.num_views):
-            key = f"{OBS_IMAGES}.image{index}"
-            value = data.get(key)
-            if isinstance(value, torch.Tensor) and value.ndim == 4:
-                data[key] = value[0]
-        return data
-
-
-def _as_video(value: torch.Tensor) -> torch.Tensor:
-    if value.ndim == 3:
-        value = value.unsqueeze(0)
-    if value.ndim != 4:
-        raise ValueError(f"Motion target must be [C,H,W] or [T,C,H,W], got {tuple(value.shape)}")
-    value = value.float()
-    if value.numel() and value.max() > 1.0:
-        value = value / 255.0
-    return value.clamp(0.0, 1.0)
-
-
-@DataTransformFn.register_subclass("wsa1_5_motion_targets")
-@dataclass
-class PrepareWSA15MotionTargetsFn(DataTransformFn):
-    """Prepare independent future 2D mask and 3D motion image targets."""
-
-    num_future_frames: int = 4
-    height: int = 224
-    width: int = 224
-
-    def _prepare(self, value: torch.Tensor, mode: str) -> torch.Tensor:
-        video = _as_video(value)
-        if video.shape[0] != self.num_future_frames:
-            raise ValueError(
-                "WSA1.5 future video query returned "
-                f"{video.shape[0]} frames, expected {self.num_future_frames}"
-            )
-        kwargs = {"align_corners": False} if mode != "nearest" else {}
-        video = F.interpolate(video, size=(self.height, self.width), mode=mode, **kwargs)
-        return video.mul(2.0).sub(1.0)
-
-    def __call__(self, data: DataDict) -> DataDict:
-        mask = data.get(FUTURE_2D_SOURCE_KEY)
-        motion = data.get(FUTURE_3D_SOURCE_KEY)
-
-        def empty() -> torch.Tensor:
-            return -torch.ones(self.num_future_frames, 3, self.height, self.width)
-
-        data[FUTURE_2D_TARGET_KEY] = (
-            self._prepare(mask, "nearest") if mask is not None else empty()
-        )
-        data[FUTURE_2D_VALID_KEY] = torch.tensor(mask is not None, dtype=torch.bool)
-        data[FUTURE_3D_TARGET_KEY] = (
-            self._prepare(motion, "bilinear") if motion is not None else empty()
-        )
-        data[FUTURE_3D_VALID_KEY] = torch.tensor(motion is not None, dtype=torch.bool)
-        return data
-
-
-@DataTransformFn.register_subclass("unify_wsa1_5_inputs")
-@dataclass
-class UnifyWSA15InputsFn(DataTransformFn):
-    """Return a stable batch schema across fully and sparsely annotated data."""
-
-    num_future_frames: int = 4
-    height: int = 224
-    width: int = 224
-    num_subtask_tokens: int = 16
-
-    def __call__(self, data: DataDict) -> DataDict:
-        input_ids = data[f"{OBS_STR}.input_ids"]
-        output = {
-            OBS_STATE: data[OBS_STATE],
-            ACTION: data[ACTION],
-            f"{OBS_STR}.pixel_values": data[f"{OBS_STR}.pixel_values"],
-            f"{OBS_STR}.image_grid_thw": data[f"{OBS_STR}.image_grid_thw"],
-            f"{OBS_STR}.input_ids": input_ids,
-            f"{OBS_STR}.attention_mask": data[f"{OBS_STR}.attention_mask"],
-            f"{OBS_STR}.fast_token_mask": data.get(
-                f"{OBS_STR}.fast_token_mask", torch.zeros_like(input_ids, dtype=torch.bool)
-            ),
-            "vqa_type": data.get("vqa_type", torch.tensor(0, dtype=torch.long)),
-            "VQA.labels": data.get("VQA.labels", torch.full_like(input_ids, -100)),
-            "label_mode": data.get("label_mode", torch.tensor(0, dtype=torch.long)),
-            FUTURE_2D_TARGET_KEY: data[FUTURE_2D_TARGET_KEY],
-            FUTURE_2D_VALID_KEY: data[FUTURE_2D_VALID_KEY],
-            FUTURE_3D_TARGET_KEY: data[FUTURE_3D_TARGET_KEY],
-            FUTURE_3D_VALID_KEY: data[FUTURE_3D_VALID_KEY],
-            PHYSICAL_TARGET_VALID_KEY: data.get(PHYSICAL_TARGET_VALID_KEY, torch.tensor(False)),
-            SUBTASK_TARGET_KEY: data.get(
-                SUBTASK_TARGET_KEY, torch.full((self.num_subtask_tokens,), -100, dtype=torch.long)
-            ),
-            SUBTASK_TARGET_MASK_KEY: data.get(
-                SUBTASK_TARGET_MASK_KEY, torch.zeros(self.num_subtask_tokens, dtype=torch.bool)
-            ),
+    def __init__(self, source, episode_indices):
+        self.source = source
+        self.entries = {}
+        cursor = 0
+        for ep in np.unique(episode_indices):
+            count = int((episode_indices == ep).sum())
+            self.entries[int(ep)] = {**source.episodes[int(ep)], "dataset_from_index": cursor,
+                                     "dataset_to_index": cursor + count}
+            cursor += count
+        self.total_frames = cursor
+        self.total_episodes = len(self.entries)
+        self.episodes = self
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "source"), name)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return [entry[key] for entry in self.entries.values()]
+        return self.entries[int(key)]
+
+
+class WSA1_5Dataset(Dataset):
+    def __init__(self, base, config: WSA1_5DatasetConfig):
+        self.base, self.config = base, config
+        self.repo_id = base.repo_id
+        self.meta = base.meta
+        self.root = Path(base.root)
+        base._ensure_hf_dataset_loaded()
+        self.timestamps = np.asarray([float(v) for v in base.hf_dataset["timestamp"]], dtype=np.float64)
+        if not np.isfinite(self.timestamps).all():
+            raise ValueError("Dataset timestamps must be finite")
+        self.frame_indices = np.asarray([int(v) for v in base.hf_dataset["frame_index"]], dtype=np.int64)
+        self.episode_indices = np.asarray([int(v) for v in base.hf_dataset["episode_index"]], dtype=np.int64)
+        if config.view_keys:
+            self.view_keys = list(config.view_keys)
+            absent = [key for key in self.view_keys if key and key not in self.meta.features]
+            if absent:
+                raise ValueError(f"Explicit RGB keys absent from schema: {absent}; use an empty slot for a missing view")
+        else:
+            if base.meta.robot_type not in get_registry().list_available():
+                raise ValueError(f"Unknown robot_type {base.meta.robot_type!r}; specify ordered view_keys instead of a default mapping")
+            schema = get_schema(base.meta.robot_type)
+            self.view_keys = []
+            for name in config.view_names:
+                candidates = [source for source, target in schema.image_mapping.items()
+                              if target == name and source in self.meta.features]
+                if len(candidates) > 1:
+                    raise ValueError(f"Ambiguous RGB slot {name}: {candidates}; specify view_keys")
+                self.view_keys.append(candidates[0] if candidates else "")
+        if not any(key and key in self.meta.features for key in self.view_keys):
+            raise ValueError("WSA requires at least one declared RGB observation view")
+        for key in self.view_keys:
+            if key and key in base.meta.features and base.meta.features[key]["dtype"] != "video":
+                raise ValueError(f"WSA V3 adapter expects a video feature for {key}")
+        sidecar_path = self.root / config.sidecar_file
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8")) if sidecar_path.exists() else []
+        if not isinstance(sidecar, list):
+            raise ValueError("Verified sidecar schema is a list of episode objects")
+        annotations = {}
+        for row in sidecar:
+            if not isinstance(row, dict) or row.get("episode_index") is None:
+                logging.warning("[WSA sidecar] dropped annotation without episode_index")
+                continue
+            try:
+                ep = int(row["episode_index"])
+            except (TypeError, ValueError):
+                raise ValueError("Invalid non-null sidecar episode_index") from None
+            if isinstance(row["episode_index"], bool) or isinstance(row["episode_index"], float) and row["episode_index"] != ep:
+                raise ValueError("Sidecar episode_index must be integral, never rounded")
+            if ep in annotations:
+                raise ValueError(f"Duplicate sidecar episode_index {ep}")
+            annotations[ep] = row
+        self.sidecar_digest = hashlib.sha256(sidecar_path.read_bytes() if sidecar_path.exists() else b"").hexdigest()
+        self.segments = []
+        self.sample_indices = []
+        self.segment_for_sample = []
+        self._build_segments(annotations)
+        self.meta = LoadedEpisodeMetadata(base.meta, self.episode_indices)
+        self._motion_reads = 0
+        logging.info("[WSA data] repo=%s samples=%d views=%s sidecar_sha256=%s",
+                     self.repo_id, len(self), self.view_keys, self.sidecar_digest)
+
+    def _build_segments(self, annotations):
+        for ep in np.unique(self.episode_indices):
+            positions = np.flatnonzero(self.episode_indices == ep)
+            if not np.array_equal(positions, np.arange(positions[0], positions[-1] + 1)):
+                raise ValueError(f"Episode {ep} rows are not contiguous")
+            frames = self.frame_indices[positions]
+            if not np.array_equal(frames, np.arange(len(frames))):
+                raise ValueError(f"Episode {ep} must contain contiguous frame indices starting at zero")
+            if np.any(np.diff(self.timestamps[positions]) <= 0):
+                raise ValueError(f"Episode {ep} has non-increasing timestamps")
+            annotation = annotations.get(int(ep), {})
+            occupied = np.zeros(len(frames), dtype=bool)
+            ids = set()
+            subtasks = annotation.get("subtasks")
+            if subtasks is not None and not isinstance(subtasks, list):
+                raise ValueError(f"Episode {ep} subtasks must be a list or null")
+            for subtask in subtasks or []:
+                required = {"start_frame", "end_frame", "subtask_id"}
+                if not isinstance(subtask, dict) or not required.issubset(subtask):
+                    logging.warning("[WSA sidecar] ep=%s missing subtask fields; masked", ep)
+                    continue
+                if any(subtask[k] is None for k in required):
+                    logging.warning("[WSA sidecar] ep=%s null subtask bounds; masked", ep)
+                    continue
+                try:
+                    first, last, sid = (int(subtask[k]) for k in ["start_frame", "end_frame", "subtask_id"])
+                except (TypeError, ValueError):
+                    raise ValueError(f"Episode {ep} has invalid non-null subtask indices") from None
+                for key, value in zip(["start_frame", "end_frame", "subtask_id"], [first, last, sid], strict=True):
+                    raw = subtask[key]
+                    if isinstance(raw, bool) or isinstance(raw, float) and raw != value:
+                        raise ValueError(f"Episode {ep} {key} must be integral, never rounded")
+                if first < 0 or last < first or last >= len(frames) or sid < 0:
+                    raise ValueError(f"Episode {ep} subtask {sid} bounds [{first},{last}] exceed length {len(frames)}")
+                if sid in ids or occupied[first:last + 1].any():
+                    raise ValueError(f"Episode {ep} has duplicate/overlapping subtasks")
+                ids.add(sid)
+                occupied[first:last + 1] = True
+                self._add_segment(Segment(int(ep), int(positions[first]), int(positions[last]),
+                                          sid, condition_text(annotation, subtask), True))
+            # Missing labels: blank condition, bounded interval, no endpoint/3D supervision.
+            missing = np.flatnonzero(~occupied)
+            for run in np.split(missing, np.flatnonzero(np.diff(missing) > 1) + 1):
+                if len(run):
+                    self._add_segment(Segment(int(ep), int(positions[run[0]]), int(positions[run[-1]]),
+                                              -1, "", False))
+
+    def _add_segment(self, segment):
+        sid = len(self.segments)
+        self.segments.append(segment)
+        self.sample_indices.extend(range(segment.first, segment.last + 1))
+        self.segment_for_sample.extend([sid] * (segment.last - segment.first + 1))
+
+    @property
+    def num_frames(self):
+        return len(self.sample_indices)
+
+    @property
+    def num_episodes(self):
+        return len(np.unique(self.episode_indices))
+
+    def __len__(self):
+        return self.num_frames
+
+    def _decode(self, key, timestamps, ep):
+        feature = self.meta.features.get(key)
+        if not key or feature is None:
+            return torch.zeros(len(timestamps), 3, 16, 16), torch.zeros(len(timestamps), dtype=torch.bool)
+        h, w, c = feature["shape"]
+        if c != 3:
+            raise ValueError(f"Expected 3-channel video: {key}")
+        entry = self.meta.episodes[ep]
+        query_ts = [float(t) + float(entry[f"videos/{key}/from_timestamp"]) for t in timestamps]
+        path = self.root / self.meta.get_video_file_path(ep, key)
+        try:
+            frames = decode_video_frames(path, query_ts, self.base.tolerance_s, self.base.video_backend)
+            if (frames.shape != (len(timestamps), 3, h, w) or not torch.isfinite(frames).all()
+                    or (frames < 0).any() or (frames > 1).any()):
+                raise ValueError(f"Bad decoded shape/values for {key}: {tuple(frames.shape)}")
+            return frames, torch.ones(len(timestamps), dtype=torch.bool)
+        except (OSError, RuntimeError, ValueError, AssertionError) as error:
+            raise RuntimeError(f"WSA video decode failed: ep={ep} key={key} path={path}") from error
+
+    def __getitem__(self, index):
+        idx = self.sample_indices[index]
+        segment = self.segments[self.segment_for_sample[index]]
+        requested = idx + np.arange(1, 33) * self.config.frame_stride
+        valid_time = torch.from_numpy(requested <= segment.last)
+        future_indices = np.minimum(requested, segment.last)
+        future_ts = self.timestamps[future_indices]
+        all_ts = np.concatenate(([self.timestamps[idx]], future_ts, [self.timestamps[segment.last]]))
+        views, view_valid = zip(*(self._decode(key, all_ts, segment.episode) for key in self.view_keys), strict=True)
+        canvas, pixels_valid = compose_rgb_views(views, view_valid, self.config.rgb_height, self.config.rgb_width)
+        normalized = imagenet_normalize(canvas)
+        normalized = normalized.masked_fill(~pixels_valid, 0)
+        motion, motion_valid = self._decode(self.config.motion_key, future_ts, segment.episode)
+        self._motion_reads += 1
+        if self.config.motion_log_every > 0 and self._motion_reads % self.config.motion_log_every == 1:
+            logging.info("[WSA motion codec] repo=%s ep=%s decoded=[%.6f,%.6f] mean=%.6f std=%.6f "
+                         "uint8_quantization_bound=%.6f physical_scale=unknown",
+                         self.repo_id, segment.episode, motion.min(), motion.max(), motion.mean(), motion.std(), 0.5 / 255)
+        motion = F.interpolate(motion, size=(self.config.motion_height, self.config.motion_width),
+                               mode="bilinear", align_corners=False)
+        motion_valid &= valid_time
+        motion = imagenet_normalize(motion).masked_fill(~motion_valid[:, None, None, None], 0)
+        targets = {
+            "future_rgb": normalized[1:33], "future_motion": motion,
+            "goal_rgb_views": [view[-1] for view in views],  # Raw [0,1], native sizes.
+            "rgb_valid": pixels_valid[1:33] & valid_time[:, None, None, None],
+            "motion_valid": motion_valid,
+            "goal_view_valid": torch.tensor([bool(mask[-1]) and segment.metadata_valid for mask in view_valid]),
         }
-        for key in (
-            STATE_VALID_MASK_KEY,
-            ACTION_VALID_MASK_KEY,
-            ACTION_DECODE_MATRIX_KEY,
-            ACTION_DECODE_BIAS_KEY,
-            ACTION_RAW_DIM_KEY,
-        ):
-            output[key] = data[key]
-        return output
-
-
-@DataTransformFn.register_subclass("unify_wsa1_5_vqa_inputs")
-@dataclass
-class UnifyWSA15VQAInputsFn(DataTransformFn):
-    """Match external VQA batches to the WSA1.5 robot batch schema."""
-
-    num_future_frames: int = 4
-    height: int = 224
-    width: int = 224
-    num_subtask_tokens: int = 16
-
-    def __call__(self, data: DataDict) -> DataDict:
-        input_ids = data[f"{OBS_STR}.input_ids"]
         return {
-            OBS_STATE: torch.zeros(CANONICAL_DIM),
-            ACTION: torch.zeros_like(data[ACTION]).new_zeros(data[ACTION].shape[:-1] + (CANONICAL_DIM,)),
-            f"{OBS_STR}.pixel_values": data[f"{OBS_STR}.pixel_values"],
-            f"{OBS_STR}.image_grid_thw": data[f"{OBS_STR}.image_grid_thw"],
-            f"{OBS_STR}.input_ids": input_ids,
-            f"{OBS_STR}.attention_mask": data[f"{OBS_STR}.attention_mask"],
-            f"{OBS_STR}.fast_token_mask": data.get(
-                f"{OBS_STR}.fast_token_mask", torch.zeros_like(input_ids, dtype=torch.bool)
-            ),
-            "vqa_type": torch.tensor(1, dtype=torch.long),
-            "VQA.labels": data["VQA.labels"],
-            "label_mode": data.get("label_mode", torch.tensor(1, dtype=torch.long)),
-            FUTURE_2D_TARGET_KEY: -torch.ones(
-                self.num_future_frames, 3, self.height, self.width
-            ),
-            FUTURE_2D_VALID_KEY: torch.tensor(False),
-            FUTURE_3D_TARGET_KEY: -torch.ones(
-                self.num_future_frames, 3, self.height, self.width
-            ),
-            FUTURE_3D_VALID_KEY: torch.tensor(False),
-            PHYSICAL_TARGET_VALID_KEY: torch.tensor(False),
-            SUBTASK_TARGET_KEY: torch.full((self.num_subtask_tokens,), -100, dtype=torch.long),
-            SUBTASK_TARGET_MASK_KEY: torch.zeros(self.num_subtask_tokens, dtype=torch.bool),
-            STATE_VALID_MASK_KEY: torch.zeros(CANONICAL_DIM, dtype=torch.bool),
-            ACTION_VALID_MASK_KEY: torch.zeros(CANONICAL_DIM, dtype=torch.bool),
-            ACTION_DECODE_MATRIX_KEY: torch.zeros(CANONICAL_DIM, CANONICAL_DIM),
-            ACTION_DECODE_BIAS_KEY: torch.zeros(CANONICAL_DIM),
-            ACTION_RAW_DIM_KEY: torch.tensor(0, dtype=torch.long),
+            **build_inference_condition(normalized[0], segment.text, observed_valid=pixels_valid[0]),
+            "targets": targets, "sample_id": f"{self.repo_id}:{segment.episode}:{int(self.frame_indices[idx])}",
+            "episode_index": segment.episode, "subtask_id": segment.subtask,
+            "start_timestamp": float(self.timestamps[idx]), "goal_timestamp": float(self.timestamps[segment.last]),
+            "frame_timestamps": torch.from_numpy(future_ts.copy()), "future_frame_valid": valid_time,
+            "metadata_valid": segment.metadata_valid, "sidecar_digest": self.sidecar_digest,
+            "prompt_version": PROMPT_VERSION,
         }
+
+
+def wsa1_5_collate(samples):
+    """Native teacher view shapes may differ between cameras and datasets."""
+    if not samples:
+        raise ValueError("Cannot collate an empty WSA batch")
+    out = default_collate([{k: v for k, v in sample.items() if k not in {"targets", "repo_id", "dataset_index"}}
+                           for sample in samples])
+    out["targets"] = default_collate([{k: v for k, v in sample["targets"].items() if k != "goal_rgb_views"}
+                                      for sample in samples])
+    out["targets"]["goal_rgb_views"] = [sample["targets"]["goal_rgb_views"] for sample in samples]
+    return out

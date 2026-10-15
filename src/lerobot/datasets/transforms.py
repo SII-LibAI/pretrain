@@ -266,7 +266,7 @@ class ImageTransformsConfig:
 
     # Set this flag to `true` to enable transforms during training
     enable: bool = False
-    # Optional named preset. ``pi05`` is handled inside the WSA pretrain data pipeline.
+    # Optional named augmentation preset metadata.
     preset: str | None = None
     # This is the maximum number of transforms (sampled from these below) that will be applied to each frame.
     # It's an integer in the interval [1, number_of_available_transforms].

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -17,26 +16,10 @@ from lerobot.datasets.synthetic_embodiment import (
     SyntheticEmbodimentDataset,
     load_embodiment_stats,
 )
-from lerobot.datasets.wsa1_5 import (
-    ACTION_VALID_MASK_KEY,
-    DEFAULT_HUMAN_ACTION_FILE,
-    FUTURE_2D_VALID_KEY,
-    FUTURE_3D_VALID_KEY,
-    SUBTASK_VALID_KEY,
-    build_wsa15_data_transforms,
-    decode_canonical_actions,
-    wrap_wsa15_dataset,
-)
-from lerobot.transforms.core import DeltaActionTransformFn, NormalizeTransformFn
 from util_scripts.compute_synthetic_embodiment_stats import (
     RunningVectorStats,
     compute_embodiment_stats,
     write_embodiment_stats,
-)
-from util_scripts.inspect_wsa1_5_dataflow import (
-    INSPECTION_KEY,
-    InspectWSA15NormalizationFn,
-    InspectWSA15StateActionFn,
 )
 
 
@@ -135,42 +118,6 @@ def _register_test_schema(
     )
 
 
-@pytest.mark.parametrize("action_mode", ["abs", "delta"])
-def test_shared_wsa_human_pipeline_collates_without_optional_annotations(
-    tmp_path: Path, action_mode: str
-) -> None:
-    root = tmp_path / "dataset"
-    poses = [[float(frame + joint) for joint in range(18)] for frame in range(4)]
-    _write_annotations(root, {"franka": poses}, {"franka": [True] * 4})
-    stats_dir = tmp_path / "stats"
-    _write_unit_stats(stats_dir, {"franka": 18})
-    config = SimpleNamespace(
-        chunk_size=2,
-        human_action_file=DEFAULT_HUMAN_ACTION_FILE,
-        human_stats_dir=stats_dir,
-        human_embodiments=["franka"],
-        human_annotation_row_group_cache_size=0,
-    )
-    dataset = wrap_wsa15_dataset(
-        _FakeBaseDataset(root, 4),
-        config,
-        build_wsa15_data_transforms(action_mode=action_mode, num_future_frames=2, height=8, width=8),
-    )
-    sample = dataset[0]
-    assert sample["observation.images.image0"].shape == (3, 8, 8)
-    assert sample["action"].shape == (2, 32)
-    assert sample[ACTION_VALID_MASK_KEY].sum() == 18
-    torch.testing.assert_close(sample["action"][0, 0], torch.tensor(10.0 if action_mode == "abs" else 1.0))
-    # Gripper dimensions retain the raw target in both modes per schema mask.
-    torch.testing.assert_close(sample["action"][0, 14], torch.tensor(17.0))
-    assert not sample[SUBTASK_VALID_KEY]
-    assert not sample[FUTURE_2D_VALID_KEY]
-    assert not sample[FUTURE_3D_VALID_KEY]
-    batch = next(iter(torch.utils.data.DataLoader(dataset, batch_size=2)))
-    assert batch["observation.state"].shape == (2, 32)
-    assert batch["action"].shape == (2, 2, 32)
-
-
 def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     alpha = [[float(i), float(i) + 0.5] for i in range(6)]
@@ -245,78 +192,6 @@ def test_adapter_filters_invalid_windows_and_shifts_raw_action(tmp_path: Path) -
     assert beta_sample["task"].startswith("Current robot embodiment: beta;")
     assert alpha_sample["task"].startswith("Current robot embodiment: alpha;")
     assert beta_sample["task"] != alpha_sample["task"]
-
-
-@pytest.mark.parametrize("action_mode", ["abs", "delta"])
-def test_wsa_uses_repository_normalizer_and_decoder_with_real_stats(tmp_path: Path, action_mode: str) -> None:
-    root = tmp_path / "dataset"
-    values = [[float(frame + joint) for joint in range(18)] for frame in range(4)]
-    _write_annotations(root, {"franka": values}, {"franka": [True] * 4})
-    stats_dir = tmp_path / "stats"
-    _write_unit_stats(stats_dir, {"franka": 18})
-    stats_path = stats_dir / "franka" / "stats.json"
-    payload = json.loads(stats_path.read_text(encoding="utf-8"))
-    payload["observation.state"].update(mean=[2.0] * 18, std=[4.0] * 18)
-    payload["action"].update(mean=[3.0] * 18, std=[2.0] * 18)
-    payload["action"]["std"][9] = 0.0
-    stats_path.write_text(json.dumps(payload), encoding="utf-8")
-    dataset = wrap_wsa15_dataset(
-        _FakeBaseDataset(root, 4),
-        SimpleNamespace(
-            chunk_size=2, human_action_file=DEFAULT_HUMAN_ACTION_FILE,
-            human_stats_dir=stats_dir, human_embodiments=["franka"],
-            human_annotation_row_group_cache_size=0,
-        ),
-        build_wsa15_data_transforms(action_mode=action_mode, num_future_frames=2, height=8, width=8),
-    )
-    sample = dataset[0]
-    reference = {"observation.state": torch.tensor(values[0]), "action": torch.tensor(values[1:3])}
-    if action_mode == "delta":
-        DeltaActionTransformFn().hydrate(
-            SimpleNamespace(meta=SimpleNamespace(robot_type="egodex_synthetic_franka"))
-        )(reference)
-    physical_actions = reference["action"].clone()
-    reference = NormalizeTransformFn(
-        selected_keys=["observation.state", "action"],
-        norm_stats={
-            key: {name: np.asarray(payload[key][name], dtype=np.float32) for name in ("mean", "std")}
-            for key in ("observation.state", "action")
-        },
-    )(reference)
-    torch.testing.assert_close(sample["observation.state"][:7], reference["observation.state"][9:16])
-    torch.testing.assert_close(sample["action"][:, :7], reference["action"][:, 9:16])
-    torch.testing.assert_close(
-        decode_canonical_actions(sample["action"][None], sample)[0], physical_actions
-    )
-
-
-def test_wsa_random_choice_is_limited_to_configured_valid_bodies(tmp_path: Path, monkeypatch) -> None:
-    root = tmp_path / "dataset"
-    values = {name: [[float(frame + joint) for joint in range(dim)] for frame in range(4)]
-              for name, dim in (("franka", 18), ("xarm7", 14))}
-    _write_annotations(root, values, {"franka": [True, False, True, True], "xarm7": [True] * 4})
-    stats_dir = tmp_path / "stats"
-    _write_unit_stats(stats_dir, {"franka": 18, "xarm7": 14})
-    dataset = wrap_wsa15_dataset(
-        _FakeBaseDataset(root, 4),
-        SimpleNamespace(
-            chunk_size=1, human_action_file=DEFAULT_HUMAN_ACTION_FILE,
-            human_stats_dir=stats_dir, human_embodiments=["franka", "xarm7"],
-            human_annotation_row_group_cache_size=0,
-        ),
-        build_wsa15_data_transforms(num_future_frames=1, height=8, width=8),
-    )
-    assert dataset.candidate_embodiments(0) == ("xarm7",)
-    assert dataset.candidate_embodiments(2) == ("franka", "xarm7")
-    choices = iter((0, 1))
-
-    def choose_body(high, size):
-        assert high == 2
-        return torch.tensor(next(choices))
-
-    monkeypatch.setattr(torch, "randint", choose_body)
-    assert dataset[2]["synthetic_embodiment"] == "franka"
-    assert dataset[2]["synthetic_embodiment"] == "xarm7"
 
 
 def test_sources_use_separate_schemas_and_shared_stats(tmp_path: Path) -> None:
@@ -412,35 +287,23 @@ def test_native_human_eef_is_loaded_only_from_action_parquet(tmp_path: Path) -> 
         max_state_dim=32,
         max_action_dim=32,
         embodiments=["human_eef"],
-        transforms=[InspectWSA15NormalizationFn(), InspectWSA15StateActionFn()],
-        require_wsa15_layout=True,
+        transforms=[],
     )
 
     assert dataset.candidate_embodiments(0) == ("human_eef",)
     sample = dataset[0]
-    assert sample["observation.state"].shape == (32,)
-    # The native columns are right-first; the schema writes left/right into
-    # their canonical EEF/gripper slots without changing the quaternions.
-    torch.testing.assert_close(
-        sample["observation.state"][7:10], torch.tensor([10.0, 11.0, 12.0])
+    assert sample["observation.state"].shape == (16,)
+    assert sample["action"].shape == (1, 16)
+    # The raw adapter preserves the right-first annotation order and xyzw
+    # quaternions. Semantic model-specific slotting is not part of this loader.
+    expected_state = torch.tensor(
+        [0.0, 1.0, 2.0, *right_quaternion, 0.25, 10.0, 11.0, 12.0, *left_quaternion, 0.75]
     )
-    torch.testing.assert_close(
-        sample["observation.state"][10:14], torch.tensor(left_quaternion)
+    expected_action = torch.tensor(
+        [[1.0, 1.0, 2.0, *right_quaternion, 0.25, 11.0, 11.0, 12.0, *left_quaternion, 0.75]]
     )
-    torch.testing.assert_close(sample["observation.state"][14:15], torch.tensor([0.75]))
-    torch.testing.assert_close(
-        sample["observation.state"][23:26], torch.tensor([0.0, 1.0, 2.0])
-    )
-    torch.testing.assert_close(
-        sample["observation.state"][26:30], torch.tensor(right_quaternion)
-    )
-    assert sample["action"].shape == (1, 32)
-    inspection = sample[INSPECTION_KEY]
-    assert inspection["state"]["valid_indices"] == list(range(7, 15)) + list(range(23, 31))
-    assert inspection["state"]["dimensions"][0]["source_index"] == 8
-    assert inspection["state"]["dimensions"][0]["semantic"] == "left_eef_position_absolute.x"
-    assert inspection["state"]["normalization"]["verified"]
-    assert inspection["action"]["normalization"]["verified"]
+    torch.testing.assert_close(sample["observation.state"], expected_state)
+    torch.testing.assert_close(sample["action"], expected_action)
 
 
 def test_stats_are_aggregated_from_valid_rows_only(tmp_path: Path) -> None:

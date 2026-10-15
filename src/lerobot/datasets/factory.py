@@ -29,6 +29,7 @@ from lerobot.dataset_schemas import get_schema
 from lerobot.datasets.configuration_synthetic_embodiment import (
     SyntheticEmbodimentDatasetConfig,
 )
+from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
@@ -49,13 +50,6 @@ from lerobot.datasets.vqa_dataset import (
     MultiVQADataset,
     TransformedVQADataset,
     VQADataset,
-)
-from lerobot.datasets.wsa1_5 import (
-    WSA15_DATAFLOW_NAME,
-    is_wsa15_human_robot_type,
-    resolve_wsa15_delta_timestamps,
-    resolve_wsa15_video_key_mapping,
-    wrap_wsa15_dataset,
 )
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_PREFIX, REWARD
 
@@ -321,27 +315,7 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
 
         if key in image_keys and hasattr(cfg, "image_delta_indices") and cfg.image_delta_indices is not None:
-            # WSA1.5 obtains its future world targets from supplemental motion
-            # streams; ordinary RGB cameras remain current-observation inputs.
-            indices = [0] if getattr(cfg, "supplemental_video_keys", ()) else cfg.image_delta_indices
-            delta_timestamps[key] = [i / ds_meta.fps for i in indices]
-
-    # WSA1.5 supervision streams are intentionally not camera inputs in the
-    # robot schema. Query their future frames without exposing them to the VLM.
-    supplemental_video_keys = getattr(cfg, "supplemental_video_keys", ())
-    image_delta_indices = getattr(cfg, "image_delta_indices", None)
-    if image_delta_indices is not None:
-        future_image_delta_indices = [index for index in image_delta_indices if index > 0]
-        for key in supplemental_video_keys:
-            feature = ds_meta.features.get(key)
-            if (
-                feature is not None
-                and feature.get("dtype") == "video"
-                and future_image_delta_indices
-            ):
-                delta_timestamps[key] = [
-                    index / ds_meta.fps for index in future_image_delta_indices
-                ]
+            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.image_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -399,30 +373,23 @@ def _build_single_dataset(
         robot_type
     """
 
-    use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
-    use_wsa15_dataflow = getattr(cfg.dataset, "dataflow", None) == WSA15_DATAFLOW_NAME
-    input_transforms = cfg.dataset.data_transforms.inputs
-    policy_type = getattr(cfg.policy, "type", None)
-    if use_synthetic_embodiments and policy_type in {"wsa1_5", "wsa_pretrain"}:
-        # ``synthetic_embodiment`` is a storage adapter, not a model-specific
-        # batch format.  Use the WSA transforms so regular and synthetic data
-        # reach the policy with exactly the same keys and semantic slots.
-        from lerobot.policies.wsa1_5.configuration_wsa1_5 import (
-            build_wsa15_robot_transforms,
-        )
+    if isinstance(cfg.dataset, WSA1_5DatasetConfig):
+        from lerobot.datasets.wsa1_5 import WSA1_5Dataset
 
-        input_transforms = build_wsa15_robot_transforms(
-            action_mode=cfg.dataset.action_mode,
-            max_prompt_length=cfg.dataset.max_prompt_length,
-            mode=cfg.dataset.mode,
-            chunk_size=cfg.policy.chunk_size,
-            num_video_frames=cfg.policy.num_video_frames,
-            video_height=cfg.policy.video_height,
-            video_width=cfg.policy.video_width,
-            num_subtask_tokens=cfg.policy.num_subtask_tokens,
-        ).inputs
+        if cfg.policy.type != "WSA_1_5":
+            raise ValueError("wsa1_5 dataset targets require the WSA_1_5 policy")
+        for name in ["rgb_height", "rgb_width", "motion_height", "motion_width", "future_frames"]:
+            if getattr(cfg.dataset, name) != getattr(cfg.policy, name):
+                raise ValueError(f"Dataset and policy disagree on {name}")
+        root = Path(cfg.dataset.root) / repo_id if cfg.dataset.root else HF_LEROBOT_HOME / repo_id
+        base = LeRobotDataset(repo_id, root=root, episodes=cfg.dataset.episodes,
+                             revision=cfg.dataset.revision, video_backend=cfg.dataset.video_backend)
+        return WSA1_5Dataset(base, cfg.dataset), base.meta.stats.copy(), base.meta.robot_type
+
+    use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
+    input_transforms = cfg.dataset.data_transforms.inputs
     dataset_root = cfg.dataset.root
-    if use_synthetic_embodiments or (use_wsa15_dataflow and cfg.dataset.root is not None):
+    if use_synthetic_embodiments:
         dataset_root = Path(cfg.dataset.root) / repo_id
 
     # Load metadata + determine delta timestamps
@@ -431,25 +398,7 @@ def _build_single_dataset(
         root=dataset_root,
         revision=cfg.dataset.revision,
     )
-    use_human_actions = use_wsa15_dataflow and is_wsa15_human_robot_type(
-        ds_meta.robot_type
-    )
-    if use_wsa15_dataflow:
-        logging.info(
-            "[wsa1_5] repo_id=%s robot_type=%s source=%s",
-            repo_id,
-            ds_meta.robot_type,
-            "human/meta-action" if use_human_actions else "robot/lerobot-v3",
-        )
-        delta_timestamps = resolve_wsa15_delta_timestamps(
-            cfg.dataset,
-            ds_meta,
-            human_source=use_human_actions,
-        )
-        video_key_mapping = resolve_wsa15_video_key_mapping(ds_meta)
-    else:
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-        video_key_mapping = None
+    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
     if use_synthetic_embodiments and delta_timestamps is not None:
         for action_key in get_schema(ds_meta.robot_type).get_action_keys():
             delta_timestamps.pop(action_key, None)
@@ -489,12 +438,9 @@ def _build_single_dataset(
             image_transforms=image_transforms,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,
-            video_key_mapping=video_key_mapping,
         )
-        _apply_dataset_stats_overrides(cfg, base_ds, include_external=not use_human_actions)
-        if use_wsa15_dataflow:
-            transformed_ds = wrap_wsa15_dataset(base_ds, cfg.dataset, input_transforms)
-        elif use_synthetic_embodiments:
+        _apply_dataset_stats_overrides(cfg, base_ds)
+        if use_synthetic_embodiments:
             transformed_ds = SyntheticEmbodimentDataset(
                 base_ds,
                 annotation_file=cfg.dataset.annotation_file,
@@ -505,7 +451,6 @@ def _build_single_dataset(
                 embodiments=cfg.dataset.embodiments or None,
                 row_group_cache_size=cfg.dataset.annotation_row_group_cache_size,
                 transforms=input_transforms,
-                require_wsa15_layout=policy_type in {"wsa1_5", "wsa_pretrain"},
             )
         else:
             transformed_ds = TransformedLeRobotDataset.from_base(
@@ -516,7 +461,7 @@ def _build_single_dataset(
     robot_type = base_ds.meta.robot_type
     stats_copy = (
         transformed_ds.checkpoint_stats
-        if use_synthetic_embodiments or use_human_actions
+        if use_synthetic_embodiments
         else base_ds.meta.stats.copy()
     )
 
@@ -577,15 +522,12 @@ def make_dataset(cfg: TrainPipelineConfig):
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    wsa_pretrain_pi05_image_aug = (
-        getattr(cfg.policy, "type", None) in {"wsa1_5", "wsa_pretrain"}
-        and cfg.dataset.image_transforms.enable
-        and cfg.dataset.image_transforms.preset in {"pi05", "pi0.5", "pi05_style"}
-    )
+    if isinstance(cfg.dataset, WSA1_5DatasetConfig) and cfg.vqa_dataset is not None and cfg.vqa_dataset.repo_id:
+        raise ValueError("WSA world targets cannot be collated with action/VQA samples")
+    if cfg.policy.type == "WSA_1_5" and not isinstance(cfg.dataset, WSA1_5DatasetConfig):
+        raise ValueError("WSA_1_5 requires --dataset.type=wsa1_5")
     image_transforms = (
-        None
-        if wsa_pretrain_pi05_image_aug
-        else ImageTransforms(cfg.dataset.image_transforms)
+        ImageTransforms(cfg.dataset.image_transforms)
         if cfg.dataset.image_transforms.enable
         else None
     )
@@ -713,10 +655,14 @@ def make_dataloader(
     num_workers = cfg.num_workers
     prefetch = 2 if num_workers > 0 else None
     use_mm_collate = (
-        getattr(cfg.policy, "type", None) in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}
+        getattr(cfg.policy, "type", None) == "internvla_a1_5"
         and bool(getattr(cfg.policy, "enable_vqa_loss", False))
     )
     collate_fn = _multimodal_collate if use_mm_collate else None
+    if isinstance(cfg.dataset, WSA1_5DatasetConfig):
+        from lerobot.datasets.wsa1_5 import wsa1_5_collate
+
+        collate_fn = wsa1_5_collate
 
     if (
         not cfg.dataset.streaming

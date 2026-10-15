@@ -114,7 +114,9 @@ def update_policy(
     accelerator.backward(loss)
 
     # Clip gradients if specified
-    if grad_clip_norm > 0:
+    if not accelerator.sync_gradients:
+        grad_norm = torch.zeros((), device=loss.device)
+    elif grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -122,13 +124,15 @@ def update_policy(
         )
 
     # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
-
-    optimizer.zero_grad()
+    if accelerator.sync_gradients:
+        if getattr(accelerator.unwrap_model(policy), "name", None) == "WSA_1_5" and not torch.isfinite(grad_norm):
+            raise FloatingPointError("Non-finite WSA gradients; optimizer update was not applied")
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
+        optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and accelerator.sync_gradients:
         lr_scheduler.step()
 
     # Update internal buffers if policy has update method
@@ -148,6 +152,9 @@ def update_policy(
         train_metrics.loss_subtask = output_dict["loss_subtask"]
     if "loss_physical" in output_dict:
         train_metrics.loss_physical = output_dict["loss_physical"]
+    for key in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature"]:
+        if key in output_dict:
+            setattr(train_metrics, key, output_dict[key])
     train_metrics.grad_norm = grad_norm.item()
     group_lrs = {
         group["name"]: group["lr"]
@@ -202,8 +209,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             timeout=timedelta(hours=2)
         )
 
+        wsa_options = {}
+        if cfg.policy.type == "WSA_1_5":
+            from accelerate.utils import GradientAccumulationPlugin
+            wsa_options = {
+                "mixed_precision": {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}[cfg.policy.dtype],
+                "gradient_accumulation_plugin": GradientAccumulationPlugin(
+                    num_steps=cfg.policy.gradient_accumulation_steps, sync_with_dataloader=False),
+            }
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
+            **wsa_options,
             kwargs_handlers=[
                 ddp_kwargs,
                 nccl_timeout_kwargs,
@@ -211,6 +227,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
     init_logging(accelerator=accelerator)
+    accumulation_steps = getattr(cfg.policy, "gradient_accumulation_steps", 1) if cfg.policy.type == "WSA_1_5" else 1
+    if cfg.policy.type == "WSA_1_5" and accelerator.gradient_accumulation_steps != accumulation_steps:
+        raise ValueError("Provided Accelerator gradient accumulation disagrees with WSA policy config")
+    if cfg.policy.type == "WSA_1_5":
+        expected_precision = {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}[cfg.policy.dtype]
+        if accelerator.mixed_precision != expected_precision:
+            raise ValueError("Provided Accelerator precision disagrees with WSA policy config")
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
@@ -303,14 +326,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         num_frames = dataset.num_frames
         num_episodes = dataset.num_episodes
     num_processes = accelerator.num_processes
-    effective_bs = cfg.batch_size * num_processes
+    effective_bs = cfg.batch_size * num_processes * accumulation_steps
 
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"\033[91m\033[1mnum_frames={num_frames} ({format_big_number(num_frames)})\033[0m")
         logging.info(f"\033[91m\033[1mnum_episodes={num_episodes} ({format_big_number(num_episodes)})\033[0m")
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} x {accumulation_steps} = {effective_bs}")
         logging.info(f"policy info:\n{policy}")
 
     # create dataloader for offline training
@@ -332,7 +355,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     policy.train()
 
-    if cfg.policy.type in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}:
+    if cfg.policy.type == "internvla_a1_5":
         train_metrics = {
             "loss": AverageMeter("loss", ":.3f"),
             "loss_action": AverageMeter("loss_action", ":.3f"),
@@ -354,18 +377,20 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics["loss_vqa"] = AverageMeter("loss_vqa", ":.3f")
         train_metrics["loss_action"] = AverageMeter("loss_action", ":.3f")
     
-    if cfg.policy.type in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}:
+    if cfg.policy.type == "internvla_a1_5":
         train_metrics["loss_video"] = AverageMeter("loss_video", ":.3f")
 
-    if cfg.policy.type in {"internvla_a1_5", "wsa1_5", "wsa_pretrain"}:
+    if cfg.policy.type == "internvla_a1_5":
         train_metrics["loss_fast"] = AverageMeter("loss_fast", ":.3f")
         train_metrics["loss_subtask"] = AverageMeter("loss_subtask", ":.3f")
-    if cfg.policy.type == "wsa1_5":
-        train_metrics["loss_physical"] = AverageMeter("loss_physical", ":.3f")
+
+    if cfg.policy.type == "WSA_1_5":
+        for metric in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature"]:
+            train_metrics[metric] = AverageMeter(metric, ":.3f")
 
 
     # Use effective batch size for proper epoch calculation in distributed training
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    effective_batch_size = cfg.batch_size * accelerator.num_processes * accumulation_steps
     train_tracker = MetricsTracker(
         effective_batch_size,
         num_frames,
@@ -381,21 +406,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     input_tokenizer = None
     for _ in range(step, cfg.steps):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        if cfg.dataset.dist_loading or dl_self_managed:
-            batch = send_to_device(batch, accelerator.device, non_blocking=True)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-        )
+        for _micro_step in range(accumulation_steps):
+            start_time = time.perf_counter()
+            batch = next(dl_iter)
+            if cfg.dataset.dist_loading or dl_self_managed:
+                batch = send_to_device(batch, accelerator.device, non_blocking=True)
+            train_tracker.dataloading_s = time.perf_counter() - start_time
+            accumulation_context = accelerator.accumulate(policy) if cfg.policy.type == "WSA_1_5" else nullcontext()
+            with accumulation_context:
+                train_tracker, output_dict = update_policy(
+                    train_tracker,
+                    policy,
+                    batch,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=lr_scheduler,
+                )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.

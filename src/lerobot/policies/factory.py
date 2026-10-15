@@ -10,26 +10,22 @@ from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.wsa1_5.configuration_wsa1_5 import (
-    WSA15Config,
-    WSAPretrainCompatibilityConfig,
-)
+from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config
 
 AVAILABLE_POLICIES = (
     "pi0",
     "pi0_fast",
     "pi05",
     "internvla_a1_5",
-    "wsa1_5",
-    "wsa_pretrain",
+    "WSA_1_5",
 )
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
-    if name in {"wsa1_5", "wsa_pretrain"}:
-        from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA15Policy
+    if name in {"WSA_1_5", "wsa1_5", "wsa_1_5"}:
+        from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy
 
-        return WSA15Policy
+        return WSA1_5_Policy
     if name == "internvla_a1_5":
         from lerobot.policies.internvla_a1_5.modeling_internvla_a1_5 import InternVLAA15Policy
 
@@ -51,10 +47,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
 
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
-    if policy_type == "wsa1_5":
-        return WSA15Config(**kwargs)
-    if policy_type == "wsa_pretrain":
-        return WSAPretrainCompatibilityConfig(**kwargs)
+    if policy_type in {"WSA_1_5", "wsa1_5", "wsa_1_5"}:
+        return WSA1_5Config(**kwargs)
     if policy_type == "internvla_a1_5":
         return InternVLAA15Config(**kwargs)
     if policy_type == "pi0":
