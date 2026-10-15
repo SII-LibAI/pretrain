@@ -44,7 +44,7 @@ else
         --policy.lambda_motion="${LAMBDA_MOTION:-1.0}"
         --policy.lambda_3d="${LAMBDA_3D:-0.01}"
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
-        --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-1.0}"
+        --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-0.0}"
         --policy.dtype=bfloat16
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
