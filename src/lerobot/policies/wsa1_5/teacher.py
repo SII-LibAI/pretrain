@@ -1,5 +1,6 @@
-"""Official Omega preprocessing and a lazily loaded, frozen server-side teacher."""
+"""Official Omega preprocessing and a frozen server-side teacher."""
 from dataclasses import dataclass
+import logging
 
 import numpy as np
 from PIL import Image
@@ -89,9 +90,9 @@ class FeatureAligner3D:
 class OmegaTeacher:
     """Not an nn.Module child: teacher weights are excluded from policy checkpoints.
 
-    Lazy construction occurs only during training target extraction. Inference
-    never imports or initializes VGGTOmega. Calling train() on the student cannot
-    enable teacher dropout or gradients.
+    The training entry loads weights before optimization; standalone target
+    extraction retains lazy loading. Inference never initializes VGGTOmega.
+    Calling train() on the student cannot enable teacher dropout or gradients.
     """
     def __init__(self, checkpoint_path, layers=(4, 11, 17, 23), use_checkpoint=False, dtype=torch.bfloat16):
         self.checkpoint_path, self.layers = checkpoint_path, tuple(layers)
@@ -105,9 +106,10 @@ class OmegaTeacher:
     def _load(self, device):
         if self.model is None:
             if not self.checkpoint_path:
-                raise ValueError("Uncached 3D targets require an Omega checkpoint")
+                raise ValueError("Enabled 3D supervision requires an Omega checkpoint")
+            logging.info("[WSA teacher] loading VGGT-Omega from %s", self.checkpoint_path)
             from vggt_omega.models import VGGTOmega
-            # Lazy teacher initialization must not consume the student's RNG:
+            # Teacher initialization must not consume the student's RNG:
             # whether endpoint labels exist cannot alter its noise trajectory.
             rng_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
             with torch.random.fork_rng(devices=rng_devices):
@@ -115,8 +117,10 @@ class OmegaTeacher:
             load_report(model, read_checkpoint(self.checkpoint_path), name="VGGT-Omega", strict=True)
             if model.aggregator.patch_token_start != 17 or not set(self.layers).issubset(model.aggregator.cached_layer_indices):
                 raise ValueError("Omega token order/cached layers differ from audited official source")
-            self.model = model.eval().requires_grad_(False)
-        self.model.to(device).eval()
+            self.model = model.to(device).eval().requires_grad_(False)
+            logging.info("[WSA teacher] VGGT-Omega ready device=%s compute_dtype=%s frozen=True", device, self.dtype)
+        else:
+            self.model.to(device).eval()
 
     def features(self, views_by_sample, view_valid, device):
         if view_valid.dtype != torch.bool or view_valid.shape != (len(views_by_sample), 3):

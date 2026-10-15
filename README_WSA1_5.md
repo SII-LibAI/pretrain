@@ -261,6 +261,10 @@ ENABLE_3D_QUERIES=true LAMBDA_3D=0 \
 
 训练只做一次 O/R/M/G 联合前向：R/M 使用带噪训练状态，G 读取同次隐藏特征；不额外采样未来。推理每个去噪步也包含已启用的 G。关闭 RGB/3D 时，对应预测为 None、有效性 mask 为全 False；关闭 motion 时 future_motion 为 None。
 
+正式训练入口在首次更新前加载启用的 VGGT-Omega，日志明确输出 checkpoint 路径、加载校验结果及 ready 状态；lambda_3d=0 或关闭 Query 时不创建/加载 teacher。Teacher 保持冻结、eval，独立于 policy checkpoint 和优化器；推理不加载 teacher。
+
+训练前仅主进程按 RGB/Observation、Motion、Future3D（含 feature heads）、Wan VAE、UMT5、VGGT-Omega 汇总 total/trainable 参数量，单位 B（十亿）。不再打印逐层参数、逐参数插值规则或完整模型结构。启用 3D 监督时，即使目标缓存命中，正式训练入口也会先加载 teacher；缓存仍用于避免重复特征前向。
+
 ## 5. 配置、验证与恢复
 
 ### JSON 配置

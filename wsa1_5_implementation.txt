@@ -57,8 +57,8 @@ WSA1.5 本地开发交付记录 — 2026-10-15
     G 可保留参与联合前向并输出特征，但无监督的 3D 参数冻结并移出优化器。
     factory 同时关闭 dataset 的终点图像/goal mask 加载；collate 支持不含 3D 标签的 batch。
     采样 helper 的 return_features 只决定返回值，不再决定已初始化的 G 是否参加每步联合前向。
-    OmegaTeacher 仅在监督有效时创建，冻结/eval/inference_mode，训练 target extraction 才懒加载。
-    不注册为 policy 子模块，teacher 权重不进入 policy checkpoint。懒初始化保护 RNG，
+    OmegaTeacher 仅在监督有效时创建，冻结/eval/inference_mode；正式训练前加载，独立工具保留懒加载。
+    不注册为 policy 子模块，teacher 权重不进入 policy checkpoint。初始化保护 RNG，
     有无 endpoint 标签不能改变 student 的随机噪声轨迹。推理不加载或调用 teacher。
 12. 按用户最新澄清，O/R/M/G 在同一次 MoT 前向中联合计算。
     训练时 R/M 使用标准 flow matching 带噪状态，G 从同次前向的隐藏表征预测几何特征。
@@ -245,6 +245,24 @@ RGB/Motion 返回反归一化后的三通道视频数值；Motion 物理单位�
 - 真实多层目录发现成功；根数据集 repo_id="." 加载 105 episodes、31023 frames，
   首样本 32 帧均有效。结果：outputs/wsa1_5_discovery_root_dataset.json。
   未加载预训练模型，未启动训练。
+
+本轮参数日志与 Teacher 加载调整
+- 删除 load_report 的逐子模块/逐层参数统计和逐参数插值规则输出；保留 missing/
+  unexpected keys、shape 和有限性校验。WSA 不再打印完整 policy 模型结构。
+- 正式训练创建优化器前调用 prepare_for_training；每个 rank 加载启用的 Omega，
+  主进程按 RGB/Observation、Motion、Future3D（含 heads）、Wan VAE、UMT5、
+  VGGT-Omega 输出一次 total/trainable 参数量，单位 B=10^9。未启用的模块标记 disabled。
+- Omega 明确记录 checkpoint 路径与加载完成状态，保持 frozen/eval；权重不进入
+  policy checkpoint 或优化器，初始化保护学生 RNG。lambda_3d=0 时仍不创建/加载。
+- 正式训练即使 teacher 目标缓存命中也会提前加载 teacher，缓存继续省去重复特征前向；
+  独立 cache-only 工具保留按需加载，推理不加载 teacher。中文 README 已同步。
+- 定向 42 项通过；其余 WSA 与数据回归 181 passed，1 项官方预处理预期 warning。
+  全套收集被现有 test_wsa1_5_launch.py 阻断：该测试仍引用当前工作区已删除的
+  util_scripts/discover_wsa1_5_datasets.py；没有恢复用户删除的工具或改动当前启动脚本。
+  本轮回归排除该旧测试，日志为 outputs/wsa1_5_logging_teacher_tests.txt。
+- Ruff F、compileall、README 语法/链接和 git diff --check 通过。
+  本地仅使用微型随机测试组件和 Omega 替身，未加载真实权重、未启动训练；
+  真实 Omega 加载、GPU 显存和分布式运行仍需服务器验证。未改变超参数值。
 
 额度
 用户最后提供剩余 87%、页面显示 3:59 重置。本会话没有账户额度查询接口，无法将

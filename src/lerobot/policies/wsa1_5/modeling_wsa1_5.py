@@ -65,9 +65,23 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.cache = ArtifactCache(config.cache_dir) if config.cache_dir else None
         self._fingerprints = {}
         self._freeze_modules()
-        for name, module in self.named_children():
-            logging.info("[WSA policy parameters] %s total=%d trainable=%d", name,
-                         sum(p.numel() for p in module.parameters()), sum(p.numel() for p in module.parameters() if p.requires_grad))
+
+    def prepare_for_training(self, device, *, log_parameters=True):
+        """Load the enabled teacher on each rank and summarize main modules once."""
+        if self.teacher is not None:
+            self.teacher._load(device)
+        if not log_parameters:
+            return
+        modules = {"RGB/Observation": self.flow.rgb, "Motion": self.flow.motion,
+                   "Future3D": self.future_3d, "Wan VAE": self.vae, "UMT5": self.text_encoder,
+                   "VGGT-Omega": self.teacher.model if self.teacher is not None else None}
+        for name, module in modules.items():
+            if module is None:
+                logging.info("[WSA parameters] %s disabled", name)
+                continue
+            logging.info("[WSA parameters] %s total=%.3fB trainable=%.3fB", name,
+                         sum(p.numel() for p in module.parameters()) / 1e9,
+                         sum(p.numel() for p in module.parameters() if p.requires_grad) / 1e9)
 
     def _build_components(self, initialize):
         cfg = self.config
@@ -97,16 +111,14 @@ class WSA1_5_Policy(PreTrainedPolicy):
             state = wan_video_dit_state_dict_converter(read_checkpoint(cfg.wan_model_path))
             load_report(rgb, state, name="RGB Wan DiT", strict=True)
             if motion is not None and cfg.motion_initialization == "wan_width_interpolation":
-                converted, rules = interpolate_wan_state(state, motion.state_dict())
-                logging.info("[WSA motion interpolation] rules=%s", rules)
+                converted, _ = interpolate_wan_state(state, motion.state_dict())
                 load_report(motion, converted, name="Motion Wan DiT", strict=True)
             if student is not None and cfg.goal_initialization == "wan_width_interpolation":
                 # Slot/noise buffers are deterministic; only Wan-compatible
                 # backbone keys are transplanted, leaving new feature heads random.
                 backbone = {key: value for key, value in student.state_dict().items()
                             if key.startswith(("blocks.", "time_embedding.", "time_projection."))}
-                converted, rules = interpolate_wan_state(state, backbone)
-                logging.info("[WSA 3D interpolation] rules=%s", rules)
+                converted, _ = interpolate_wan_state(state, backbone)
                 expected_missing = set(student.state_dict()) - set(backbone)
                 report = load_report(student, converted, name="Future3D Wan backbone", strict=False)
                 if set(report.missing_keys) != expected_missing or report.unexpected_keys:

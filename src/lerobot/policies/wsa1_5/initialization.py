@@ -111,11 +111,6 @@ def load_report(module, state, *, name, strict=True):
         if key in expected and (not torch.is_tensor(value) or not torch.isfinite(value).all()):
             raise ValueError(f"Invalid/non-finite {name} checkpoint tensor {key}")
     report = module.load_state_dict(state, strict=False)
-    for child_name, child in module.named_children():
-        logging.info("[WSA parameters] %s.%s=%d", name, child_name, sum(p.numel() for p in child.parameters()))
-    if hasattr(module, "blocks"):
-        for index, block in enumerate(module.blocks):
-            logging.info("[WSA layer parameters] %s.blocks.%d=%d", name, index, sum(p.numel() for p in block.parameters()))
     if strict and (report.missing_keys or report.unexpected_keys):
         raise RuntimeError(f"Incomplete {name} checkpoint: missing={report.missing_keys}, unexpected={report.unexpected_keys}")
     return report

@@ -306,6 +306,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     policy = make_policy(
         cfg=cfg.policy,
     )
+    if cfg.policy.type == "WSA_1_5":
+        policy.prepare_for_training(device, log_parameters=is_main_process)
 
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
@@ -334,7 +336,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"\033[91m\033[1mnum_frames={num_frames} ({format_big_number(num_frames)})\033[0m")
         logging.info(f"\033[91m\033[1mnum_episodes={num_episodes} ({format_big_number(num_episodes)})\033[0m")
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} x {accumulation_steps} = {effective_bs}")
-        logging.info(f"policy info:\n{policy}")
+        if cfg.policy.type != "WSA_1_5":
+            logging.info(f"policy info:\n{policy}")
 
     # create dataloader for offline training
     dataloader, dl_self_managed = make_dataloader(cfg, dataset)

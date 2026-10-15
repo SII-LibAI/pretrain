@@ -107,6 +107,7 @@ def main():
         args.report.write_text(json.dumps({"cached_batches": count, "cache_dir": cfg.policy.cache_dir}, indent=2), encoding="utf-8")
         return
 
+    policy.prepare_for_training(accelerator.device, log_parameters=accelerator.is_main_process)
     optimizer, scheduler = make_optimizer_and_scheduler(cfg, policy)
     policy, optimizer, scheduler = accelerator.prepare(policy, optimizer, scheduler)
     metrics = {key: AverageMeter(key, ":.6f") for key in [
@@ -152,6 +153,7 @@ def main():
                 assert prediction[name].shape[1:] == size
         if prediction["goal_3d_features"] is not None:
             assert prediction["goal_3d_features"].shape[1:] == (3, 273, 2048)
+        restored.prepare_for_training(accelerator.device, log_parameters=accelerator.is_main_process)
         optimizer, scheduler = make_optimizer_and_scheduler(cfg, restored)
         resumed_step, optimizer, scheduler = load_training_state(checkpoint, optimizer, scheduler)
         assert resumed_step == args.steps
