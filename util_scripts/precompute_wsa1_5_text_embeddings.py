@@ -38,28 +38,32 @@ def dataset_prompts(root, sidecar_file="meta/sidecar.json"):
 
 @torch.no_grad()
 def precompute_dataset(root, encoder, tokenizer, device, *, max_length=512, text_dim=4096,
-                       sidecar_file="meta/sidecar.json", embedding_dir="meta/wsa1_5_text_embeddings"):
+                       sidecar_file="meta/sidecar.json", embedding_dir="meta/wsa1_5_text_embeddings", batch_size=8):
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("Text encoding batch_size must be a positive integer")
     directory = Path(root) / embedding_dir
     directory.mkdir(parents=True, exist_ok=True)
     prompts = dataset_prompts(root, sidecar_file)
-    for text in prompts:
-        context, valid = encode_text(encoder, tokenizer, [text], device, max_length, text_dim)
-        context = context[0].to(device="cpu", dtype=torch.bfloat16)
-        valid = valid[0].cpu()
+    for offset in range(0, len(prompts), batch_size):
+        texts = prompts[offset:offset + batch_size]
+        context, valid = encode_text(encoder, tokenizer, texts, device, max_length, text_dim)
+        context = context.to(device="cpu", dtype=torch.bfloat16)
+        valid = valid.cpu()
         if not torch.isfinite(context).all():
             raise FloatingPointError("Non-finite UMT5 embedding after BF16 conversion")
-        length = valid.nonzero()[-1].item() + 1
-        metadata = {"prompt_version": PROMPT_VERSION, "text": text,
-                    "max_length": str(max_length), "text_dim": str(text_dim)}
-        path = text_embedding_path(directory, text)
-        with tempfile.NamedTemporaryFile(dir=directory, suffix=".tmp", delete=False) as handle:
-            temporary = Path(handle.name)
-        try:
-            save_file({"context": context[:length].contiguous(), "valid": valid[:length].contiguous()},
-                      temporary, metadata=metadata)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        for text, embedding, mask in zip(texts, context, valid, strict=True):
+            length = mask.nonzero()[-1].item() + 1
+            metadata = {"prompt_version": PROMPT_VERSION, "text": text,
+                        "max_length": str(max_length), "text_dim": str(text_dim)}
+            path = text_embedding_path(directory, text)
+            with tempfile.NamedTemporaryFile(dir=directory, suffix=".tmp", delete=False) as handle:
+                temporary = Path(handle.name)
+            try:
+                save_file({"context": embedding[:length].contiguous(), "valid": mask[:length].contiguous()},
+                          temporary, metadata=metadata)
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
     print(f"[WSA text] {root}: {len(prompts)} prompts -> {directory}", flush=True)
     return len(prompts)
 
@@ -71,11 +75,14 @@ def main():
     parser.add_argument("--tokenizer-path", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-text-length", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=8, help="每批编码的文本数量")
     parser.add_argument("--sidecar-file", default="meta/sidecar.json")
     parser.add_argument("--embedding-dir", default="meta/wsa1_5_text_embeddings")
     args = parser.parse_args()
     if args.max_text_length <= 0:
         parser.error("--max-text-length must be positive")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
     repos = subprocess.check_output(
         ["bash", str(PROJECT_ROOT / "util_scripts/discover_wsa1_5_datasets.sh"), str(args.data_root)],
         encoding="utf-8",
@@ -96,7 +103,7 @@ def main():
     for repo in repos:
         precompute_dataset(args.data_root / repo, encoder, tokenizer, args.device,
                            max_length=args.max_text_length, sidecar_file=args.sidecar_file,
-                           embedding_dir=args.embedding_dir)
+                           embedding_dir=args.embedding_dir, batch_size=args.batch_size)
 
 
 if __name__ == "__main__":

@@ -60,7 +60,17 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.tokenizer = components.tokenizer
         self.teacher = OmegaTeacher(config.omega_checkpoint_path, config.teacher_layers,
                                     dtype=self.model_dtype) if config.use_3d_supervision else None
+        self._motion_placeholder_latent = None
+        self._motion_placeholder_key = None
         self._freeze_modules()
+
+    def _apply(self, fn, recurse=True):
+        self._motion_placeholder_latent = None
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._motion_placeholder_latent = None
+        return super()._load_from_state_dict(*args, **kwargs)
 
     def prepare_for_training(self, device, *, log_parameters=True):
         """Load the enabled teacher on each rank and summarize main modules once."""
@@ -260,8 +270,14 @@ class WSA1_5_Policy(PreTrainedPolicy):
         return latent, context, context_valid, spatial[:, :, None], pixel_valid
 
     def _placeholder(self, batch_size, device):
-        zero = torch.zeros(batch_size, 3, 1, self.config.motion_height, self.config.motion_width, device=device)
-        return self._encode_video(zero)
+        key = (id(self.vae), torch.device(device), self.model_dtype, self.config.motion_height, self.config.motion_width)
+        if self._motion_placeholder_latent is None or self._motion_placeholder_key != key:
+            # Keep a normal detached tensor, even when first called under inference_mode.
+            with torch.inference_mode(False), torch.no_grad():
+                zero = torch.zeros(1, 3, 1, self.config.motion_height, self.config.motion_width, device=device)
+                self._motion_placeholder_latent = self._encode_video(zero).detach()
+            self._motion_placeholder_key = key
+        return self._motion_placeholder_latent.expand(batch_size, -1, -1, -1, -1)
 
     def _shapes(self, batch_size):
         cfg = self.config

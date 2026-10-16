@@ -181,16 +181,21 @@ export DATA_ROOT=/data/Egodex-LerobotV3
 python util_scripts/precompute_wsa1_5_text_embeddings.py \
   --data-root "$DATA_ROOT" \
   --text-encoder-path "$TEXT_ENCODER_PATH" \
-  --tokenizer-path "$TOKENIZER_PATH"
+  --tokenizer-path "$TOKENIZER_PATH" \
+  --batch-size 8
 ```
 
 `--data-root` 可以是单个数据集，也可以是合集目录。文本预计算与训练统一调用 [find 发现脚本](util_scripts/discover_wsa1_5_datasets.sh)，扫描该目录本身及任意层级子目录，通过 `meta/info.json`、`data/` 和 `videos/` 识别数据集；Python 文本模块不再保留另一套 discover。扫描错误、找不到数据集、错误的标注结构都会报错。
 
-每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；另计算一个用于缺失标注帧的空文本 embedding。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
+每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；另计算一个用于缺失标注帧的空文本 embedding。`--batch-size` 默认为 8，整批调用 tokenizer 和 UMT5，末批不足时按实际数量编码，再逐条保存。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
 
 默认 `max_text_length=512`，使用 Wan 的 4096 维 UMT5 特征。更改长度时，预计算用 `--max-text-length`，训练同步设置 `--policy.max_text_length`。自定义标注位置时，两边同步指定 `--sidecar-file` 和 `--dataset.sidecar_file`；缓存位置分别用 `--embedding-dir` 和 `--dataset.text_embedding_dir`。
 
-缓存不存在或不匹配时明确报错，不在线补算、不加载 UMT5、不换成零文本。只保留这一种缓存：VAE latent 和 Omega 特征每批在线提取，没有旧版 `policy.cache_dir`、权重指纹或其他缓存兼容路径。重复运行预计算会原子替换对应文本文件；标注已固定时无需再次运行。生成缓存后，训练节点不再需要 UMT5/tokenizer 文件，仍需 Wan/VAE 及启用的 Omega 权重。
+缓存不存在或不匹配时明确报错，不在线补算、不加载 UMT5、不换成零文本。只保留这一种磁盘缓存：RGB/motion 的 VAE latent 和 Omega 特征每批在线提取，没有旧版 `policy.cache_dir`、权重指纹或其他缓存兼容路径。重复运行预计算会原子替换对应文本文件；标注已固定时无需再次运行。生成缓存后，训练节点不再需要 UMT5/tokenizer 文件，仍需 Wan/VAE 及启用的 Omega 权重。
+
+VAE 对每个模态的完整 `[B,3,T,H,W]` 一次编码，不再逐样本调用；其因果时间块仍按原有顺序处理，每次编码前后清空内部时序缓存。Omega 采用 WSA-L 的缺失视角处理：用同一样本的第一个有效视角替换缺失视角，统一以 `[B_valid,3,3,256,256]` 一次送入教师，不按视角组合或数量分组。`B_valid` 只包含至少一个有效目标视角的样本，不同样本的 batch 维保持独立。原始视角 mask 保留，复制视角的输出不参与损失；复制图像会进入同一样本的教师跨视角注意力，这是与此前排除缺失视角方案的语义变化。在线 `load_text_encoder=true` 时，tokenizer 和 UMT5 同样整批执行。
+
+固定零 motion 占位图只用冻结 VAE 真实编码一次，将单样本 latent 在 batch 维扩展复用；这不是直接填零 latent，也不缓存样本的真实 motion。该运行时常量不写入 checkpoint，加载 policy 权重、迁移设备或精度后会重新编码；VAE 实例、计算 dtype 或 motion 分辨率变化时也会重新编码。批量执行可能增加编码阶段的显存峰值，需要在服务器确认实际吞吐和显存。
 
 ## 5. 启动训练
 
@@ -260,7 +265,7 @@ G 使用 WSA 默认 slot_noise：819 个槽位，每视角 1 camera、16 registe
 
 Omega 的每个有效目标视角都从原始 `[0,1]` 浮点张量直接双线性缩放至 `256×256`（`mode="bilinear"`、`align_corners=false`），不裁剪、不补白，也不转成 uint8/PIL。完整画面映射到正方形，非正方形原图会改变宽高比。Omega 内部自行做 ImageNet 标准化，外部不重复归一化。
 
-教师每层直接输出 `[1,V,273,2048]`，按原顺序与学生的 `1 camera + 16 register + 16×16 patch` 槽位对应；已删除 `FeatureAligner3D`，不再对教师特征插值或重排。有效视角的全部 273 个 token 都参与监督，不再生成空间 padding mask；缺失视角直接跳过教师前向，整组 token 屏蔽。训练时仍要求对应的当前观测视角有效，缺少子任务标注时仍关闭该样本的 3D 监督。
+教师每层直接输出 `[B_valid,3,273,2048]`，按原顺序与学生的 `1 camera + 16 register + 16×16 patch` 槽位对应；已删除 `FeatureAligner3D`，不再对教师特征插值或重排。有效视角的全部 273 个 token 都参与监督，不再生成空间 padding mask；缺失视角使用首个有效视角的图像替换，整组输出屏蔽，不伪造有效标签。完全没有有效目标视角的样本跳过教师前向。训练时仍要求对应的当前观测视角有效，缺少子任务标注时仍关闭该样本的 3D 监督。
 
 例如 `480×640`（高×宽）直接缩放到 `256×256` 后输入教师，得到固定 273 个 token，按相同索引监督学生。该流程改变了 3D 标签的空间对应关系，不应把旧特征插值或补白方案下的实验当作同一配置直接续训。
 

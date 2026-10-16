@@ -124,8 +124,8 @@ def test_teacher_uses_native_fixed_tokens_without_feature_resampling(monkeypatch
     from types import SimpleNamespace
     teacher = OmegaTeacher("unused", layers=(4, 11), dtype=torch.float32)
     views = [torch.zeros(3, 80, 160), torch.full((3, 16, 16), float("nan")), torch.zeros(3, 100, 100)]
-    expected_images = preprocess_omega_views([views[0], views[2]])
-    native = torch.arange(2 * 273 * 2048, dtype=torch.float32).reshape(1, 2, 273, 2048)
+    expected_images = preprocess_omega_views([views[0], views[0], views[2]])
+    native = torch.arange(3 * 273 * 2048, dtype=torch.float32).reshape(1, 3, 273, 2048)
     calls = []
 
     def aggregator(images):
@@ -138,9 +138,9 @@ def test_teacher_uses_native_fixed_tokens_without_feature_resampling(monkeypatch
     teacher.model = SimpleNamespace(aggregator=aggregator)
     monkeypatch.setattr(teacher, "_load", lambda device: None)
     targets, valid = teacher.features([views], torch.tensor([[True, False, True]]), torch.device("cpu"))
-    assert calls == [torch.Size([1, 2, 3, 256, 256])]
+    assert calls == [torch.Size([1, 3, 3, 256, 256])]
     for layer, expected in [(4, native), (11, native + 11)]:
-        torch.testing.assert_close(targets[layer][:, [0, 2]], expected, atol=0, rtol=0)
+        torch.testing.assert_close(targets[layer][:, [0, 2]], expected[:, [0, 2]], atol=0, rtol=0)
         assert not targets[layer][:, 1].any() and not targets[layer].requires_grad
     assert valid.dtype == torch.bool and valid[0, [0, 2]].all()
     assert not valid[:, 1].any()
@@ -157,7 +157,7 @@ def test_teacher_uses_native_fixed_tokens_without_feature_resampling(monkeypatch
 def test_teacher_rejects_wrong_fixed_sequence_or_nonfinite_features(monkeypatch, tokens, dim, start, bad_value):
     from types import SimpleNamespace
     teacher = OmegaTeacher("unused", layers=(4,), dtype=torch.float32)
-    feature = torch.ones(1, 1, tokens, dim)
+    feature = torch.ones(1, 3, tokens, dim)
     if bad_value:
         feature[..., 0, 0] = float("nan")
     teacher.model = SimpleNamespace(aggregator=lambda images: ({4: feature}, start))

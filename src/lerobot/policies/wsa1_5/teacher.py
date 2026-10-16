@@ -57,37 +57,34 @@ class OmegaTeacher:
             self.model.to(device).eval()
 
     def features(self, views_by_sample, view_valid, device):
-        if view_valid.dtype != torch.bool or view_valid.shape != (len(views_by_sample), 3):
+        if not views_by_sample or view_valid.dtype != torch.bool or view_valid.shape != (len(views_by_sample), 3):
             raise ValueError("Omega target view validity must be boolean [B,3]")
-        results = {layer: [] for layer in self.layers}
-        masks = []
+        valid_rows = view_valid.tolist()
+        samples = [sample for sample, valid in enumerate(valid_rows) if any(valid)]
         with torch.inference_mode():
-            for views, valid in zip(views_by_sample, view_valid, strict=True):
-                indices = [index for index, flag in enumerate(valid.tolist()) if flag]
-                targets = {layer: torch.zeros(3, 273, 2048, device=device) for layer in self.layers}
-                mask = torch.zeros(3, 273, dtype=torch.bool, device=device)
-                if indices:
-                    self._load(device)
-                    # Invalid placeholder cameras must not affect valid cameras
-                    # through teacher inter-frame attention.
-                    images = preprocess_omega_views([views[index] for index in indices])
-                    with torch.autocast(device_type=device.type, dtype=self.dtype,
-                                        enabled=self.dtype != torch.float32 and device.type in {"cpu", "cuda"}):
-                        hidden, start = self.model.aggregator(images[None].to(device))
-                    if start != 17:
-                        raise ValueError("Expected Omega camera + 16 register tokens before patch tokens")
-                    for layer in self.layers:
-                        feature = hidden[layer]
-                        if feature is None or feature.shape != (1, len(indices), 273, 2048):
-                            raise ValueError(f"Missing/wrong Omega intermediate layer {layer}")
-                        if not torch.isfinite(feature).all():
-                            raise FloatingPointError(f"Non-finite Omega intermediate layer {layer}")
-                        targets[layer][indices] = feature[0].float()
-                    mask[indices] = True
-                masks.append(mask)
+            results = {layer: torch.zeros(len(views_by_sample), 3, 273, 2048, device=device) for layer in self.layers}
+            mask = view_valid.to(device)[..., None].expand(-1, -1, 273)
+            if samples:
+                self._load(device)
+                images = []
+                for sample in samples:
+                    valid, views = valid_rows[sample], views_by_sample[sample]
+                    primary = views[valid.index(True)]
+                    # WSA-L repeats the first valid camera; the original mask still gates the loss.
+                    images.append(preprocess_omega_views([views[index] if flag else primary
+                                                          for index, flag in enumerate(valid)]))
+                images = torch.stack(images).to(device)
+                with torch.autocast(device_type=device.type, dtype=self.dtype,
+                                    enabled=self.dtype != torch.float32 and device.type in {"cpu", "cuda"}):
+                    hidden, start = self.model.aggregator(images)
+                if start != 17:
+                    raise ValueError("Expected Omega camera + 16 register tokens before patch tokens")
                 for layer in self.layers:
-                    results[layer].append(targets[layer])
-            stacked = {layer: torch.stack(values) for layer, values in results.items()}
-            stacked_mask = torch.stack(masks)
+                    feature = hidden[layer]
+                    if feature is None or feature.shape != (len(samples), 3, 273, 2048):
+                        raise ValueError(f"Missing/wrong Omega intermediate layer {layer}")
+                    if not torch.isfinite(feature).all():
+                        raise FloatingPointError(f"Non-finite Omega intermediate layer {layer}")
+                    results[layer][samples] = feature.float().masked_fill(~mask[samples, ..., None], 0)
         # Normal tensors can safely be saved by autograd's student loss.
-        return {layer: value.clone() for layer, value in stacked.items()}, stacked_mask.clone()
+        return {layer: value.clone() for layer, value in results.items()}, mask.clone()

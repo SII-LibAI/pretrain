@@ -65,6 +65,35 @@ def test_blank_condition_cache_for_missing_annotations(tmp_path, monkeypatch):
     assert dataset[0]["text_valid"].any()
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 8])
+def test_precompute_batches_texts_and_saves_each_prompt_in_order(tmp_path, monkeypatch, batch_size):
+    dataset, _ = make_data(tmp_path, monkeypatch)
+    prompts = dataset_prompts(tmp_path)
+    calls = []
+
+    def tokenizer(texts, **kwargs):
+        calls.append(list(texts))
+        ids = torch.zeros(len(texts), 4, dtype=torch.long)
+        for row, text in enumerate(texts):
+            ids[row, :prompts.index(text) + 1] = prompts.index(text) + 1
+        return ids, ids != 0
+
+    assert precompute_dataset(tmp_path, TinyEncoder(), tokenizer, "cpu", max_length=4, text_dim=8,
+                              batch_size=batch_size) == len(prompts)
+    assert calls == [prompts[offset:offset + batch_size] for offset in range(0, len(prompts), batch_size)]
+    cache = TextEmbeddingCache(tmp_path / "meta/wsa1_5_text_embeddings", 4, 8)
+    for index, text in enumerate(prompts):
+        context, valid = cache.get(text)
+        assert (context[:index + 1] == index + 1).all()
+        assert valid.sum() == index + 1 and not context[index + 1:].any()
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True])
+def test_precompute_rejects_invalid_batch_size(tmp_path, batch_size):
+    with pytest.raises(ValueError, match="positive integer"):
+        precompute_dataset(tmp_path, TinyEncoder(), tokenize, "cpu", batch_size=batch_size)
+
+
 @pytest.mark.parametrize("corruption", ["nan", "mask", "metadata", "dimension", "dtype"])
 def test_bad_text_cache_is_rejected_without_recomputing(tmp_path, corruption):
     precompute(tmp_path)

@@ -1204,12 +1204,6 @@ class WanVideoVAE(nn.Module):
         return values
 
 
-    def single_encode(self, video, device):
-        video = video.to(device)
-        x = self.model.encode(video, self.scale)
-        return x
-
-
     def single_decode(self, hidden_state, device):
         hidden_state = hidden_state.to(device)
         video = self.model.decode(hidden_state, self.scale)
@@ -1217,21 +1211,11 @@ class WanVideoVAE(nn.Module):
 
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        # videos = [video.to("cpu") for video in videos]
-        hidden_states = []
-        for video in videos:
-            video = video.unsqueeze(0)
-            if tiled:
-                raise NotImplementedError("Tiled encoding is not allowed yet.")
-                tile_size = (tile_size[0] * self.upsampling_factor, tile_size[1] * self.upsampling_factor)
-                tile_stride = (tile_stride[0] * self.upsampling_factor, tile_stride[1] * self.upsampling_factor)
-                hidden_state = self.tiled_encode(video, device, tile_size, tile_stride)
-            else:
-                hidden_state = self.single_encode(video, device)
-            hidden_state = hidden_state.squeeze(0)
-            hidden_states.append(hidden_state)
-        hidden_states = torch.stack(hidden_states)
-        return hidden_states
+        if tiled:
+            raise NotImplementedError("Tiled encoding is not allowed yet.")
+        if not torch.is_tensor(videos) or videos.ndim != 5 or videos.shape[0] == 0 or videos.shape[1] != 3:
+            raise ValueError("Wan VAE encoding requires a non-empty [B,3,T,H,W] tensor")
+        return self.model.encode(videos.to(device), self.scale)
 
 
     def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
