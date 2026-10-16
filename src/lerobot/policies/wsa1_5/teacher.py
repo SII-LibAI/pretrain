@@ -1,88 +1,25 @@
-"""Official Omega preprocessing and a frozen server-side teacher."""
-from dataclasses import dataclass
+"""Fixed-square Omega targets and a frozen server-side teacher."""
 import logging
 
-import numpy as np
-from PIL import Image
 import torch
 import torch.nn.functional as F
 
 from .initialization import load_report, read_checkpoint
-from .vendor.omega_preprocessing import (
-    _crop_to_supported_aspect_ratio, _max_size_target_shape, _pad_images_to_common_size,
-)
-
-
-@dataclass(frozen=True)
-class ViewGeometry:
-    height: int
-    width: int
-    pad_top: int
-    pad_left: int
-    canvas_height: int
-    canvas_width: int
 
 
 def preprocess_omega_views(views):
-    """[0,1] decoded native RGB -> exact official PIL crop/resize/white padding.
-
-    The official loader accepts filenames. This entry point converts decoded
-    uint8-equivalent views to PIL, then calls the same geometry helper functions.
-    Preprocessing may run without constructing any model.
-    """
+    """Resize raw [0,1] RGB directly to 256x256 with bilinear interpolation."""
     if not views:
         raise ValueError("Omega requires at least one valid view")
-    tensors, sizes = [], []
+    tensors = []
     for view in views:
         if view.ndim != 3 or view.shape[0] != 3 or not torch.isfinite(view).all():
             raise ValueError("Teacher views must be finite native [3,H,W] RGB tensors")
         if view.min() < 0 or view.max() > 1:
             raise ValueError("Teacher preprocessing requires raw RGB in [0,1]")
-        pixels = (view.detach().cpu().permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
-        image = _crop_to_supported_aspect_ratio(Image.fromarray(pixels))
-        width, height = image.size
-        target_h, target_w = _max_size_target_shape(height / width, 256, 16)
-        image = image.resize((target_w, target_h), Image.Resampling.BICUBIC)
-        tensors.append(torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1).float() / 255)
-        sizes.append((target_h, target_w))
-    shapes = set(sizes)
-    if len(shapes) > 1:
-        tensors = _pad_images_to_common_size(tensors, shapes)
-    common_h, common_w = tensors[0].shape[-2:]
-    geometry = [ViewGeometry(h, w, (common_h - h) // 2, (common_w - w) // 2, common_h, common_w)
-                for h, w in sizes]
-    return torch.stack(tensors), geometry
-
-
-class FeatureAligner3D:
-    """Copy camera/register tokens; sample patches on a 16x16 content grid."""
-    def __call__(self, features, geometry, patch_token_start=17):
-        if patch_token_start != 17 or features.ndim != 4 or features.shape[1] != len(geometry):
-            raise ValueError("Expected Omega [B,V,N,D] with camera + 16 register tokens")
-        aligned, masks = [], []
-        for view_index, geo in enumerate(geometry):
-            grid_h, grid_w = geo.canvas_height // 16, geo.canvas_width // 16
-            if features.shape[2] != 17 + grid_h * grid_w:
-                raise ValueError("Omega feature length disagrees with actual preprocessed patch grid")
-            special = features[:, view_index, :17]
-            patches = features[:, view_index, 17:].transpose(1, 2).reshape(features.shape[0], -1, grid_h, grid_w)
-            centers = (torch.arange(16, device=features.device, dtype=torch.float32) + 0.5) / 16
-            yy = 2 * (geo.pad_top + centers * geo.height) / geo.canvas_height - 1
-            xx = 2 * (geo.pad_left + centers * geo.width) / geo.canvas_width - 1
-            gy, gx = torch.meshgrid(yy, xx, indexing="ij")
-            grid = torch.stack([gx, gy], -1)[None].expand(features.shape[0], -1, -1, -1)
-            aligned_patches = F.grid_sample(patches.float(), grid, mode="bilinear", padding_mode="border",
-                                           align_corners=False).flatten(2).transpose(1, 2).to(features.dtype)
-            pixel_valid = features.new_zeros(1, 1, geo.canvas_height, geo.canvas_width, dtype=torch.float32)
-            pixel_valid[:, :, geo.pad_top:geo.pad_top + geo.height, geo.pad_left:geo.pad_left + geo.width] = 1
-            patch_valid = F.avg_pool2d(pixel_valid, 16, 16)
-            sampled_valid = F.grid_sample(patch_valid.expand(features.shape[0], -1, -1, -1), grid,
-                                          mode="bilinear", padding_mode="border", align_corners=False)
-            valid = torch.cat([torch.ones(features.shape[0], 17, dtype=torch.bool, device=features.device),
-                               sampled_valid.flatten(1) >= 1 - 1e-6], 1)
-            aligned.append(torch.cat([special, aligned_patches], 1))
-            masks.append(valid)
-        return torch.stack(aligned, 1), torch.stack(masks, 1)
+        tensors.append(F.interpolate(view.detach().float()[None], size=(256, 256),
+                                     mode="bilinear", align_corners=False)[0])
+    return torch.stack(tensors)
 
 
 class OmegaTeacher:
@@ -99,7 +36,6 @@ class OmegaTeacher:
             raise ValueError("Unsupported Omega compute dtype")
         self.dtype = dtype
         self.model = None
-        self.aligner = FeatureAligner3D()
 
     def _load(self, device):
         if self.model is None:
@@ -134,19 +70,20 @@ class OmegaTeacher:
                     self._load(device)
                     # Invalid placeholder cameras must not affect valid cameras
                     # through teacher inter-frame attention.
-                    images, geometry = preprocess_omega_views([views[index] for index in indices])
+                    images = preprocess_omega_views([views[index] for index in indices])
                     with torch.autocast(device_type=device.type, dtype=self.dtype,
                                         enabled=self.dtype != torch.float32 and device.type in {"cpu", "cuda"}):
                         hidden, start = self.model.aggregator(images[None].to(device))
+                    if start != 17:
+                        raise ValueError("Expected Omega camera + 16 register tokens before patch tokens")
                     for layer in self.layers:
                         feature = hidden[layer]
-                        if feature is None or feature.shape[-1] != 2048:
+                        if feature is None or feature.shape != (1, len(indices), 273, 2048):
                             raise ValueError(f"Missing/wrong Omega intermediate layer {layer}")
                         if not torch.isfinite(feature).all():
                             raise FloatingPointError(f"Non-finite Omega intermediate layer {layer}")
-                        aligned, aligned_valid = self.aligner(feature, geometry, start)
-                        targets[layer][indices] = aligned[0].float()
-                        mask[indices] = aligned_valid[0]
+                        targets[layer][indices] = feature[0].float()
+                    mask[indices] = True
                 masks.append(mask)
                 for layer in self.layers:
                     results[layer].append(targets[layer])

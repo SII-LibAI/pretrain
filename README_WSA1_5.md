@@ -140,7 +140,7 @@ bash launch/wsa_1_5_pretrain.sh \
 
 显式列表应用到所有选中的数据集；混合不同相机命名的数据时应注册各自 schema。`egodex_v` 已将 `observation.image` 映射到 image0。
 
-RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。缺失区域在映射后置零，并通过无效 mask 排除监督。Omega 的目标图像保持原始 `[0,1]`，使用教师自身的官方预处理。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
+RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。缺失区域在映射后置零，并通过无效 mask 排除监督。Omega 的目标图像保持原始 `[0,1]`，直接双线性缩放至 `256×256`，再交给教师内部归一化。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
 
 ### 子任务标注
 
@@ -256,6 +256,12 @@ bash launch/wsa_1_5_pretrain.sh
 
 G 使用 WSA 默认 slot_noise：819 个槽位，每视角 1 camera、16 register、256 patch。输入为 `0.5 × 正弦位置编码 + 0.25 × 标准正态噪声`；G 时间步固定为 `0.5 × num_train_timesteps`，当前为 500。训练时每个样本重新采样，推理/no_grad 使用 seed=0 的固定噪声。Query 自身没有可学习参数，骨干和预测头参与学习。
 
+Omega 的每个有效目标视角都从原始 `[0,1]` 浮点张量直接双线性缩放至 `256×256`（`mode="bilinear"`、`align_corners=false`），不裁剪、不补白，也不转成 uint8/PIL。完整画面映射到正方形，非正方形原图会改变宽高比。Omega 内部自行做 ImageNet 标准化，外部不重复归一化。
+
+教师每层直接输出 `[1,V,273,2048]`，按原顺序与学生的 `1 camera + 16 register + 16×16 patch` 槽位对应；已删除 `FeatureAligner3D`，不再对教师特征插值或重排。有效视角的全部 273 个 token 都参与监督，不再生成空间 padding mask；缺失视角直接跳过教师前向，整组 token 屏蔽。训练时仍要求对应的当前观测视角有效，缺少子任务标注时仍关闭该样本的 3D 监督。
+
+例如 `480×640`（高×宽）直接缩放到 `256×256` 后输入教师，得到固定 273 个 token，按相同索引监督学生。该流程改变了 3D 标签的空间对应关系，不应把旧特征插值或补白方案下的实验当作同一配置直接续训。
+
 | 设置 | G 联合计算 | Omega / 终点图像 / 3D loss |
 | --- | --- | --- |
 | ENABLE_3D_QUERIES=false | 不创建 | 关闭 |
@@ -277,7 +283,7 @@ total_loss = LAMBDA_RGB × loss_rgb_flow + LAMBDA_MOTION × loss_motion_flow
            + LAMBDA_3D × loss_3d_feature
 ```
 
-旧公式对 L2 单位向量逐维求 MSE，2048 维随机预测也只有 `2/2048≈0.001`，量级被维数压低。新公式使用 LayerNorm MSE，独立随机特征的基线约为 2；真实初始化结果取决于特征相关性，不强行设定初始 loss。日志中的 `loss_3d_feature` 是乘 `lambda_3d` 前的值；当前启动配置 MSE=1、cosine=0、lambda_3d=0.01，因此 raw loss 约 2 时对总损失的贡献约 0.02。缺失视角和 padding 不参与归约，teacher 不接收梯度。
+旧公式对 L2 单位向量逐维求 MSE，2048 维随机预测也只有 `2/2048≈0.001`，量级被维数压低。新公式使用 LayerNorm MSE，独立随机特征的基线约为 2；真实初始化结果取决于特征相关性，不强行设定初始 loss。日志中的 `loss_3d_feature` 是乘 `lambda_3d` 前的值；当前启动配置 MSE=1、cosine=0、lambda_3d=0.01，因此 raw loss 约 2 时对总损失的贡献约 0.02。缺失视角和缺失标注对应的 3D 特征不参与归约，teacher 不接收梯度。
 
 ### 参数与耗时日志
 

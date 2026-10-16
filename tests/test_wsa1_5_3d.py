@@ -1,11 +1,8 @@
 import pytest
 import torch
-import numpy as np
-from PIL import Image
 
 from lerobot.policies.wsa1_5.future_3d import Future3DExpert, geometric_feature_loss
-from lerobot.policies.wsa1_5.teacher import FeatureAligner3D, OmegaTeacher, preprocess_omega_views
-from lerobot.policies.wsa1_5.vendor.omega_preprocessing import load_and_preprocess_images
+from lerobot.policies.wsa1_5.teacher import OmegaTeacher, preprocess_omega_views
 from lerobot.policies.wsa1_5.vendor.wan_video_dit import sinusoidal_embedding_1d
 from test_wsa1_5_experts import small_flow, inputs
 
@@ -85,47 +82,88 @@ def test_slot_positional_encoding_rejects_odd_hidden_width():
         Future3DExpert(hidden_dim=9)
 
 
-def test_official_preprocessing_geometry():
-    images, geometry = preprocess_omega_views([torch.zeros(3, 40, 400), torch.ones(3, 300, 100)])
+def test_fixed_square_preprocessing_preserves_full_image_without_padding():
+    wide = torch.zeros(3, 40, 400)
+    wide[:, :, :40] = 0.25
+    wide[:, :, -40:] = 0.75
+    tall = wide.transpose(-1, -2)
+    images = preprocess_omega_views([wide, tall])
     assert images.shape == (2, 3, 256, 256)
-    assert (geometry[0].height, geometry[0].width) == (128, 256)
-    assert (geometry[1].height, geometry[1].width) == (256, 128)
-    assert geometry[0].pad_top == 64 and geometry[1].pad_left == 64
-    assert (images[0, :, :64] == 1).all()  # Official white padding.
+    assert (images[0, :, :, :20] == 0.25).all()
+    assert (images[0, :, :, -20:] == 0.75).all()
+    assert (images[1, :, :20] == 0.25).all()
+    assert (images[1, :, -20:] == 0.75).all()
+    assert not images[:, :, 100:150, 100:150].any()
 
 
-def test_pixel_exact_official_preprocessing(tmp_path):
-    rng = np.random.default_rng(31)
-    tensors, files = [], []
-    for index, shape in enumerate([(41, 401, 3), (301, 103, 3), (111, 113, 3)]):
-        pixels = rng.integers(0, 256, shape, dtype=np.uint8)
-        path = tmp_path / f"view{index}.png"
-        Image.fromarray(pixels).save(path)
-        files.append(path)
-        tensors.append(torch.from_numpy(pixels.copy()).permute(2, 0, 1).float() / 255)
-    actual, _ = preprocess_omega_views(tensors)
-    expected = load_and_preprocess_images(files, mode="max_size", image_resolution=256)
+def test_preprocessing_matches_bilinear_without_pixel_quantization():
+    view = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]]).expand(3, -1, -1).clone().requires_grad_()
+    actual = preprocess_omega_views([view])
+    expected = torch.nn.functional.interpolate(view.detach()[None], size=(256, 256),
+                                                mode="bilinear", align_corners=False)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert actual.dtype == torch.float32 and not actual.requires_grad
+    torch.testing.assert_close(actual[0, :, 0, 0], torch.full((3,), 0.1), atol=0, rtol=0)
 
 
-def test_variable_teacher_tokens_and_special_token_order():
-    images, geometry = preprocess_omega_views([torch.zeros(3, 80, 160)] * 3)
-    assert images.shape[-2:] == (128, 256)
-    tokens = 17 + 8 * 16
-    features = torch.randn(2, 3, tokens, 20)
-    aligned, valid = FeatureAligner3D()(features, geometry)
-    assert aligned.shape == (2, 3, 273, 20) and valid.all()
-    torch.testing.assert_close(aligned[:, :, :17], features[:, :, :17], atol=0, rtol=0)
+@pytest.mark.parametrize("height,width", [(80, 160), (160, 80), (100, 100), (150, 160)])
+def test_single_or_identical_views_always_square(height, width):
+    for count in [1, 3]:
+        images = preprocess_omega_views([torch.zeros(3, height, width)] * count)
+        assert images.shape == (count, 3, 256, 256)
+        assert not images.any()
+
+
+@pytest.mark.parametrize("pixel", [float("nan"), -0.1, 1.1])
+def test_teacher_preprocessing_rejects_bad_pixels(pixel):
     with pytest.raises(ValueError):
-        FeatureAligner3D()(features[:, :, :-1], geometry)
+        preprocess_omega_views([torch.full((3, 16, 16), pixel)])
 
 
-def test_square_alignment_identity():
-    _, geometry = preprocess_omega_views([torch.zeros(3, 100, 100)] * 3)
-    x = torch.randn(1, 3, 273, 10)
-    aligned, valid = FeatureAligner3D()(x, geometry)
-    torch.testing.assert_close(aligned, x, atol=1e-6, rtol=1e-5)
-    assert valid.all()
+def test_teacher_uses_native_fixed_tokens_without_feature_resampling(monkeypatch):
+    from types import SimpleNamespace
+    teacher = OmegaTeacher("unused", layers=(4, 11), dtype=torch.float32)
+    views = [torch.zeros(3, 80, 160), torch.full((3, 16, 16), float("nan")), torch.zeros(3, 100, 100)]
+    expected_images = preprocess_omega_views([views[0], views[2]])
+    native = torch.arange(2 * 273 * 2048, dtype=torch.float32).reshape(1, 2, 273, 2048)
+    calls = []
+
+    def aggregator(images):
+        torch.testing.assert_close(images, expected_images[None], atol=0, rtol=0)
+        calls.append(images.shape)
+        hidden = [None] * 24
+        hidden[4], hidden[11] = native, native + 11
+        return hidden, 17
+
+    teacher.model = SimpleNamespace(aggregator=aggregator)
+    monkeypatch.setattr(teacher, "_load", lambda device: None)
+    targets, valid = teacher.features([views], torch.tensor([[True, False, True]]), torch.device("cpu"))
+    assert calls == [torch.Size([1, 2, 3, 256, 256])]
+    for layer, expected in [(4, native), (11, native + 11)]:
+        torch.testing.assert_close(targets[layer][:, [0, 2]], expected, atol=0, rtol=0)
+        assert not targets[layer][:, 1].any() and not targets[layer].requires_grad
+    assert valid.dtype == torch.bool and valid[0, [0, 2]].all()
+    assert not valid[:, 1].any()
+    student = {layer: torch.randn_like(value, requires_grad=True) for layer, value in targets.items()}
+    loss, _ = geometric_feature_loss(student, targets, valid)
+    loss.backward()
+    for value in student.values():
+        assert torch.isfinite(value.grad).all() and value.grad[valid].abs().sum() > 0
+        assert not value.grad[~valid].any()
+
+
+@pytest.mark.parametrize("tokens,dim,start,bad_value", [(272, 2048, 17, False), (273, 1024, 17, False),
+                                                       (273, 2048, 5, False), (273, 2048, 17, True)])
+def test_teacher_rejects_wrong_fixed_sequence_or_nonfinite_features(monkeypatch, tokens, dim, start, bad_value):
+    from types import SimpleNamespace
+    teacher = OmegaTeacher("unused", layers=(4,), dtype=torch.float32)
+    feature = torch.ones(1, 1, tokens, dim)
+    if bad_value:
+        feature[..., 0, 0] = float("nan")
+    teacher.model = SimpleNamespace(aggregator=lambda images: ({4: feature}, start))
+    monkeypatch.setattr(teacher, "_load", lambda device: None)
+    with pytest.raises(FloatingPointError if bad_value else ValueError):
+        teacher.features([[torch.zeros(3, 80, 160)] * 3], torch.tensor([[True, False, False]]), torch.device("cpu"))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
