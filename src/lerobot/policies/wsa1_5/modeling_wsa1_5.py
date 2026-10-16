@@ -122,7 +122,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 # backbone keys are transplanted, leaving new feature heads random.
                 backbone = {key: value for key, value in student.state_dict().items()
                             if key.startswith(("blocks.", "time_embedding.", "time_projection."))}
-                converted, _ = interpolate_wan_state(state, backbone)
+                converted, _ = interpolate_wan_state(state, backbone, apply_alpha_scaling=True)
                 expected_missing = set(student.state_dict()) - set(backbone)
                 report = load_report(student, converted, name="Future3D Wan backbone", strict=False)
                 if set(report.missing_keys) != expected_missing or report.unexpected_keys:

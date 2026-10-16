@@ -256,6 +256,8 @@ bash launch/wsa_1_5_pretrain.sh
 
 G 使用 WSA 默认 slot_noise：819 个槽位，每视角 1 camera、16 register、256 patch。输入为 `0.5 × 正弦位置编码 + 0.25 × 标准正态噪声`；G 时间步固定为 `0.5 × num_train_timesteps`，当前为 500。训练时每个样本重新采样，推理/no_grad 使用 seed=0 的固定噪声。Query 自身没有可学习参数，骨干和预测头参与学习。
 
+默认 `goal_initialization=wan_width_interpolation` 从 Wan 初始化 3D 骨干时，启用与 WSA-L 相同的 Alpha Scaling：对于至少二维且最后一维发生变化的迁移张量，在宽度插值后乘以 `sqrt(源最后一维 / 目标最后一维)`，用 FP32 完成乘法后转换为目标权重 dtype。例如输入宽度 `3072→768` 的 Q/K/V 权重乘以 2；FFN 第二层按其实际 FFN 输入宽度比缩放。三维 modulation 参数也遵循该规则；一维 bias/norm、最后一维不变的张量不缩放。六组时间调制仍分别插值。四个新增特征预测头保持随机初始化，Motion 初始化方式不变。Alpha Scaling 仅在从 Wan 首次迁移时应用，加载完整 policy checkpoint 或断点恢复不会重复缩放；显式 `goal_initialization=random` 仍使用随机初始化。
+
 Omega 的每个有效目标视角都从原始 `[0,1]` 浮点张量直接双线性缩放至 `256×256`（`mode="bilinear"`、`align_corners=false`），不裁剪、不补白，也不转成 uint8/PIL。完整画面映射到正方形，非正方形原图会改变宽高比。Omega 内部自行做 ImageNet 标准化，外部不重复归一化。
 
 教师每层直接输出 `[1,V,273,2048]`，按原顺序与学生的 `1 camera + 16 register + 16×16 patch` 槽位对应；已删除 `FeatureAligner3D`，不再对教师特征插值或重排。有效视角的全部 273 个 token 都参与监督，不再生成空间 padding mask；缺失视角直接跳过教师前向，整组 token 屏蔽。训练时仍要求对应的当前观测视角有效，缺少子任务标注时仍关闭该样本的 3D 监督。

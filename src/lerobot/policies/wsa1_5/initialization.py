@@ -55,8 +55,8 @@ def resize_axes(value, shape):
     return result.to(value.dtype)
 
 
-def interpolate_wan_state(source, target_state):
-    """Named rules preserve all six modulation groups and head output channels."""
+def interpolate_wan_state(source, target_state, *, apply_alpha_scaling=False):
+    """Preserve modulation groups/head geometry; optionally apply WSA last-axis scaling."""
     converted, rules = {}, {}
     for key, target in target_state.items():
         if key not in source:
@@ -80,9 +80,9 @@ def interpolate_wan_state(source, target_state):
         if value.shape == target.shape:
             converted[key], rules[key] = value, "copy"
         elif key == "time_projection.1.weight":
-            value = resize_axes(value.reshape(6, value.shape[0] // 6, value.shape[1]),
-                                (6, target.shape[0] // 6, target.shape[1])).reshape(target.shape)
-            converted[key], rules[key] = value, "six separate modulation matrices"
+            converted[key] = resize_axes(value.reshape(6, value.shape[0] // 6, value.shape[1]),
+                                         (6, target.shape[0] // 6, target.shape[1])).reshape(target.shape)
+            rules[key] = "six separate modulation matrices"
         elif key == "time_projection.1.bias":
             converted[key] = resize_axes(value.reshape(6, -1), (6, target.numel() // 6)).reshape(target.shape)
             rules[key] = "six separate modulation vectors"
@@ -93,6 +93,10 @@ def interpolate_wan_state(source, target_state):
             converted[key], rules[key] = resize_axes(value, target.shape), "preserve latent channels; interpolate hidden input"
         else:
             converted[key], rules[key] = resize_axes(value, target.shape), "axiswise linear width interpolation"
+        if apply_alpha_scaling and value.ndim >= 2 and value.shape[-1] != target.shape[-1]:
+            alpha = (value.shape[-1] / target.shape[-1]) ** 0.5
+            converted[key] = (converted[key].float() * alpha).to(target.dtype)
+            rules[key] += f"; alpha scaling {alpha:.6g}"
     return converted, rules
 
 
