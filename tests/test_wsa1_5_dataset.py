@@ -1,4 +1,5 @@
 import json
+import logging
 from types import SimpleNamespace
 
 import datasets
@@ -8,9 +9,9 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
+from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.utils import load_nested_dataset
-from lerobot.datasets.wsa1_5 import (
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import (
     WSA1_5Dataset, build_inference_condition, compose_rgb_views, wsa1_5_collate,
 )
 
@@ -40,7 +41,7 @@ def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, includ
     def decode(path, times, *args):
         seen.append((str(path), times))
         return torch.tensor(times)[:, None, None, None].expand(-1, 3, 16, 16) / 4
-    monkeypatch.setattr("lerobot.datasets.wsa1_5.decode_video_frames", decode)
+    monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames", decode)
     config = WSA1_5DatasetConfig(repo_id="test", view_keys=["rgb", "", ""], motion_log_every=0,
                                frame_stride=frame_stride)
     return WSA1_5Dataset(base, config, include_3d_targets=include_3d_targets), seen
@@ -68,6 +69,34 @@ def test_boundaries_targets_and_timestamps(tmp_path, monkeypatch):
     assert ds[10]["subtask_id"] == 1
     assert "left hand" in ds[10]["condition_text"]
     assert ds[0]["future_frame_valid"].all()
+
+
+@pytest.mark.parametrize("pixel", [0.0, 0.5, 1.0])
+def test_rgb_motion_use_wan_range_and_teacher_keeps_raw_pixels(tmp_path, monkeypatch, pixel):
+    ds, _ = make_data(tmp_path, monkeypatch)
+    monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames",
+                        lambda path, times, *args: torch.full((len(times), 3, 16, 16), pixel))
+    sample = ds[8]
+    expected = pixel * 2 - 1
+    assert (sample["observed_rgb"][:, :256] == expected).all()
+    assert not sample["observed_rgb"][:, 256:].any()
+    assert not sample["observed_valid"][:, 256:].any()
+    targets = sample["targets"]
+    assert (targets["future_rgb"][:, :, :256] == expected).all()
+    assert not targets["future_rgb"][:, :, 256:].any()
+    assert (targets["future_motion"][:31] == expected).all()
+    assert not targets["future_motion"][31].any()
+    assert not targets["motion_valid"][31]
+    assert (targets["goal_rgb_views"][0] == pixel).all()
+
+
+def test_missing_video_placeholder_warning_formats_repo(tmp_path, monkeypatch, caplog):
+    ds, _ = make_data(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        frames, valid = ds._decode("", [0.0], 0)
+    assert frames.shape == (1, 3, 16, 16) and not frames.any()
+    assert valid.dtype == torch.bool and not valid.any()
+    assert "No motion in test" in caplog.text
 
 
 @pytest.mark.parametrize("frame_stride", [1, 2, 5])
@@ -170,7 +199,7 @@ def test_declared_video_decode_failure_raises(tmp_path, monkeypatch):
     ds, _ = make_data(tmp_path, monkeypatch)
     def fail(*args):
         raise RuntimeError("bad media")
-    monkeypatch.setattr("lerobot.datasets.wsa1_5.decode_video_frames", fail)
+    monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames", fail)
     with pytest.raises(RuntimeError, match="video decode failed"):
         ds[0]
 

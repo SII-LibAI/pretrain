@@ -4,8 +4,8 @@ import json
 import pytest
 import torch
 
-from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
-from lerobot.datasets.wsa1_5 import WSA1_5Dataset
+from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5DatasetConfig
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset
 from lerobot.policies.wsa1_5.attention import build_causal_attention_mask, masked_attention
 from lerobot.policies.wsa1_5.future_3d import geometric_feature_loss
 from lerobot.policies.wsa1_5.initialization import interpolate_wan_state
@@ -146,7 +146,7 @@ def test_view_mapping_and_pixel_range_do_not_default(tmp_path, monkeypatch):
         WSA1_5Dataset(ds.base, WSA1_5DatasetConfig(repo_id="x"))
     with pytest.raises(ValueError, match="absent from schema"):
         WSA1_5Dataset(ds.base, WSA1_5DatasetConfig(repo_id="x", view_keys=["rgb_typo", "", ""]))
-    monkeypatch.setattr("lerobot.datasets.wsa1_5.decode_video_frames",
+    monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames",
                         lambda *args: torch.full((34, 3, 16, 16), 1.5))
     with pytest.raises(RuntimeError, match="video decode failed"):
         ds[0]

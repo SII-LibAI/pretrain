@@ -1,5 +1,7 @@
 """Offline cache tests use a tiny fake encoder; no pretrained assets are loaded."""
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -7,10 +9,12 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
-from lerobot.datasets.wsa1_5 import WSA1_5Dataset, wsa1_5_collate
-from lerobot.datasets.wsa1_5_text import TextEmbeddingCache, text_embedding_path
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset, wsa1_5_collate
+from lerobot.policies.wsa1_5.text_embeddings import TextEmbeddingCache, text_embedding_path
 from util_scripts.precompute_wsa1_5_text_embeddings import dataset_prompts, precompute_dataset
+from util_scripts import precompute_wsa1_5_text_embeddings as precompute_script
 from test_wsa1_5_dataset import make_data
+from test_wsa1_5_launch import add_dataset, bash
 from test_wsa1_5_observation_encoding import make_policy
 
 
@@ -101,3 +105,32 @@ def test_sidecar_schema_errors_are_not_silenced(tmp_path):
         sidecar.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(ValueError):
             dataset_prompts(tmp_path)
+
+
+def test_precompute_main_uses_the_shared_find_script(tmp_path, monkeypatch, bash):
+    root = tmp_path / "dataset collection"
+    add_dataset(root)
+    add_dataset(root / "a/b/c")
+    encoder_path = tmp_path / "fake-encoder.pt"
+    encoder_path.touch()
+    tokenizer_path = tmp_path / "tokenizer"
+    tokenizer_path.mkdir()
+    check_output = precompute_script.subprocess.check_output
+
+    def run_discovery(command, **kwargs):
+        assert command[0] == "bash"
+        assert command[1] == str(precompute_script.PROJECT_ROOT / "util_scripts/discover_wsa1_5_datasets.sh")
+        return check_output([bash, *command[1:]], **kwargs)
+
+    monkeypatch.setattr(precompute_script.subprocess, "check_output", run_discovery)
+    monkeypatch.setitem(sys.modules, "lerobot.policies.wsa1_5.vendor.wan_video_text_encoder",
+                        SimpleNamespace(WanTextEncoder=TinyEncoder, HuggingfaceTokenizer=lambda *args, **kwargs: object()))
+    monkeypatch.setattr("lerobot.policies.wsa1_5.initialization.read_checkpoint", lambda path: {})
+    monkeypatch.setattr("lerobot.policies.wsa1_5.initialization.load_report", lambda *args, **kwargs: None)
+    roots = []
+    monkeypatch.setattr(precompute_script, "precompute_dataset", lambda path, *args, **kwargs: roots.append(path.resolve()))
+    monkeypatch.setattr(sys, "argv", ["precompute", "--data-root", str(root),
+                                     "--text-encoder-path", str(encoder_path),
+                                     "--tokenizer-path", str(tokenizer_path), "--device", "cpu"])
+    precompute_script.main()
+    assert set(roots) == {root.resolve(), (root / "a/b/c").resolve()}

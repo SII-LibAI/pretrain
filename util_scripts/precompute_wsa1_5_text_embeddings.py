@@ -3,16 +3,18 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import torch
 from safetensors.torch import save_file
 
-from lerobot.datasets.wsa1_5 import condition_text
-from lerobot.datasets.wsa1_5_text import PROMPT_VERSION, discover_datasets, encode_text, text_embedding_path
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import condition_text
+from lerobot.policies.wsa1_5.text_embeddings import PROMPT_VERSION, encode_text, text_embedding_path
 
 
 def dataset_prompts(root, sidecar_file="meta/sidecar.json"):
@@ -74,7 +76,10 @@ def main():
     args = parser.parse_args()
     if args.max_text_length <= 0:
         parser.error("--max-text-length must be positive")
-    repos = discover_datasets(args.data_root)
+    repos = subprocess.check_output(
+        ["bash", str(PROJECT_ROOT / "util_scripts/discover_wsa1_5_datasets.sh"), str(args.data_root)],
+        encoding="utf-8",
+    ).split()
     for path in [args.text_encoder_path, args.tokenizer_path]:
         if not path.exists():
             raise FileNotFoundError(path)

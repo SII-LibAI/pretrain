@@ -107,6 +107,28 @@ def test_observation_without_training_targets_still_encodes_single_frame(monkeyp
     assert latent.shape == (1, 4, 1, 6, 2) and valid.all()
 
 
+@pytest.mark.parametrize("decoded_value", [-2.0, -1.0, 0.0, 1.0, 2.0, float("nan"), float("inf"), -float("inf")])
+def test_prediction_converts_both_modalities_to_unit_range_after_finite_check(monkeypatch, decoded_value):
+    policy, _ = make_policy(monkeypatch)
+    rgb = torch.full((1, 4, 9, 6, 2), decoded_value)
+    motion = torch.full((1, 4, 9, 2, 2), decoded_value)
+    monkeypatch.setattr(policy, "sample_generated_latents", lambda *args, **kwargs: (rgb, motion, {}))
+    observed = torch.zeros(1, 3, 96, 32)
+    valid = torch.ones(1, 1, 96, 32, dtype=torch.bool)
+    valid[:, :, 64:, 16:] = False
+    if not torch.isfinite(torch.tensor(decoded_value)):
+        with pytest.raises(FloatingPointError, match="Non-finite decoded"):
+            policy.predict_future(observed, ["move"], observed_valid=valid)
+        return
+    result = policy.predict_future(observed, ["move"], observed_valid=valid)
+    expected = (max(-1, min(1, decoded_value)) + 1) / 2
+    assert result["future_rgb"].shape == (1, 32, 3, 96, 32)
+    assert result["future_motion"].shape == (1, 32, 3, 32, 32)
+    assert (result["future_rgb"][:, :, :, :64] == expected).all()
+    assert not result["future_rgb"][:, :, :, 64:, 16:].any()
+    assert (result["future_motion"] == expected).all()
+
+
 def test_reused_observation_latent_is_validated(monkeypatch):
     policy, vae = make_policy(monkeypatch)
     image = torch.zeros(1, 3, 96, 32)

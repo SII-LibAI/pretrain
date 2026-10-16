@@ -63,7 +63,7 @@ else
         --dataset.root="$DATA_ROOT"
         --dataset.repo_id="$DATASET_REPO_ID"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"
-        --dataset.dist_loading="${DIST_LOADING:-false}"
+        --dataset.dist_loading="${DIST_LOADING:-true}"
         --output_dir="${OUTPUT_DIR:-outputs/wsa1_5/$(date +%Y_%m_%d_%H_%M_%S)}"
         --batch_size="${BATCH_SIZE:-1}"
         --num_workers="${NUM_WORKERS:-4}"

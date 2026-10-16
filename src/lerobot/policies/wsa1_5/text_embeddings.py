@@ -1,6 +1,5 @@
 """The single WSA1.5 cache: frozen, offline UMT5 text embeddings."""
 import hashlib
-import os
 from pathlib import Path
 
 import torch
@@ -8,27 +7,6 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 PROMPT_VERSION = "wsa1_5.task-subtask-hand-scene.v1"
-
-
-def discover_datasets(root):
-    root = Path(root).resolve()
-    if not root.is_dir():
-        raise NotADirectoryError(root)
-    def raise_error(error):
-        raise error
-    found, visited = [], set()
-    for directory, children, _ in os.walk(root, followlinks=True, onerror=raise_error):
-        path = Path(directory)
-        resolved = path.resolve()
-        if resolved in visited:
-            children.clear()
-            continue
-        visited.add(resolved)
-        if (path / "meta/info.json").is_file() and (path / "data").is_dir():
-            found.append(path.relative_to(root).as_posix())
-    if not found:
-        raise FileNotFoundError(f"No LeRobot datasets below {root}")
-    return sorted(found)
 
 
 def text_embedding_path(directory, text):

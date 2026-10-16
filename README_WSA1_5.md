@@ -2,6 +2,15 @@
 
 当前 `WSA_1_5` policy 输入当前 RGB 和文本，预测未来 32 帧 RGB、未来 32 帧三通道 motion，以及可选的子任务终点 3D 特征；不预测 action。
 
+WSA1.5 专用实现统一放在 `src/lerobot/policies/wsa1_5/`：
+
+- [configuration_wsa1_5.py](src/lerobot/policies/wsa1_5/configuration_wsa1_5.py)：集中定义 policy 配置 `WSA1_5Config` 和数据配置 `WSA1_5DatasetConfig`，保留 `policy.type=WSA_1_5`、`dataset.type=wsa1_5` 及既有参数字段。
+- [dataset_wsa1_5.py](src/lerobot/policies/wsa1_5/dataset_wsa1_5.py)：LeRobot adapter、Segment、归一化、mask 和 collate。
+- [text_embeddings.py](src/lerobot/policies/wsa1_5/text_embeddings.py)：文本编码、离线缓存读取和校验。
+- [modeling_wsa1_5.py](src/lerobot/policies/wsa1_5/modeling_wsa1_5.py)：模型、训练前向和推理入口。
+
+通用 `lerobot.datasets.factory` 保留接入路由。原 `lerobot.datasets.configuration_wsa1_5`、`lerobot.datasets.wsa1_5`、`lerobot.datasets.wsa1_5_text` 的 Python 导入位置已迁移，外部脚本需同步更新；训练 JSON/CLI 和文本缓存格式保持不变。
+
 以下安装、下载和训练命令在 **Linux GPU 服务器**执行，统一从本仓库根目录运行。本地开发只做代码、数据及小型随机模块检查。
 
 ## 1. 安装环境
@@ -131,7 +140,7 @@ bash launch/wsa_1_5_pretrain.sh \
 
 显式列表应用到所有选中的数据集；混合不同相机命名的数据时应注册各自 schema。`egodex_v` 已将 `observation.image` 映射到 image0。
 
-RGB/motion 当前均用固定 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
+RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。缺失区域在映射后置零，并通过无效 mask 排除监督。Omega 的目标图像保持原始 `[0,1]`，使用教师自身的官方预处理。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
 
 ### 子任务标注
 
@@ -175,7 +184,7 @@ python util_scripts/precompute_wsa1_5_text_embeddings.py \
   --tokenizer-path "$TOKENIZER_PATH"
 ```
 
-`--data-root` 可以是单个数据集，也可以是合集目录；脚本扫描该目录本身及任意层级子目录，通过 `meta/info.json` 和 `data/` 识别数据集。训练脚本自动发现数据集时使用同一规则。扫描错误、找不到数据集、错误的标注结构都会报错。
+`--data-root` 可以是单个数据集，也可以是合集目录。文本预计算与训练统一调用 [find 发现脚本](util_scripts/discover_wsa1_5_datasets.sh)，扫描该目录本身及任意层级子目录，通过 `meta/info.json`、`data/` 和 `videos/` 识别数据集；Python 文本模块不再保留另一套 discover。扫描错误、找不到数据集、错误的标注结构都会报错。
 
 每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；另计算一个用于缺失标注帧的空文本 embedding。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
 
@@ -190,7 +199,6 @@ conda activate wsa15
 cd /path/to/InternVLA-A-series
 source weights/wsa1_5_weights.env
 export DATA_ROOT=/data/Egodex-LerobotV3
-export DATASET_REPO_IDS='["extra/knit_scarf"]'
 export OUTPUT_DIR="$PWD/outputs/wsa1_5/run_001"
 
 # 只打印启动命令，不加载模型。
@@ -200,7 +208,7 @@ WSA_DRY_RUN=1 bash launch/wsa_1_5_pretrain.sh
 bash launch/wsa_1_5_pretrain.sh
 ```
 
-省略 `DATASET_REPO_IDS` 时扫描 `DATA_ROOT` 下所有匹配的数据集。若 `DATA_ROOT` 本身就是一个数据集，其 repo_id 为 `"."`。多数据集均须提前生成自己的文本缓存。可显式传入 JSON 列表选择子集，路径相对 `DATA_ROOT`。
+只需设置 `DATA_ROOT=父目录`。启动脚本用 `find -L` 递归查找其中所有同时包含 `meta/info.json`、`data/` 和 `videos/` 的数据集，打乱后以空格分隔的相对路径传给训练入口，无需填写子目录列表。若 `DATA_ROOT` 本身就是一个数据集，其 repo_id 为 `.`。不再通过 `DATASET_REPO_ID` / `DATASET_REPO_IDS` 环境变量传 JSON 列表，因此不会将 `['.']` 拼成目录名。父目录可以含空格；数据集的相对路径不能含空白字符，遇到时明确报错。多数据集均须提前生成自己的文本缓存。
 
 启动脚本保留当前已设置的超参数：
 
@@ -299,7 +307,9 @@ unset RESUME_CONFIG
 
 旧版本带 UMT5 参数、通用缓存配置、FP32 optimizer 状态或可学习 query 的 checkpoint 不能直接当作本版继续训练；本轮变更应从 Wan 权重新开实验，不修改旧配置强行恢复。
 
-推理不加载 Omega。默认无文本编码器时，从 `lerobot.datasets.wsa1_5_text.TextEmbeddingCache` 读取对应文本的 `(embedding, valid)`，加 batch 维后传给 `predict_future(..., text_embedding=embedding[None], text_valid=valid[None])`；输入仍只来自当前 RGB 和文本。`load_text_encoder=true` 保留给显式在线冻结编码的实验，其完整 checkpoint 会包含 UMT5；不能仅给默认离线训练所得 checkpoint 改这个开关，严格加载会拒绝缺失的文本编码器参数。
+推理不加载 Omega。当前 RGB 输入也须先执行 `img * 2 - 1`；RGB/motion 预测结果经过 VAE 解码、有限值检查和 `[-1,1]` 截断后，用 `(img + 1) / 2` 返回 `[0,1]`。默认无文本编码器时，从 `lerobot.policies.wsa1_5.text_embeddings.TextEmbeddingCache` 读取对应文本的 `(embedding, valid)`，加 batch 维后传给 `predict_future(..., text_embedding=embedding[None], text_valid=valid[None])`；输入仍只来自当前 RGB 和文本。`load_text_encoder=true` 保留给显式在线冻结编码的实验，其完整 checkpoint 会包含 UMT5；不能仅给默认离线训练所得 checkpoint 改这个开关，严格加载会拒绝缺失的文本编码器参数。
+
+此前使用 ImageNet 输入归一化训练的 checkpoint 与当前输入分布不同，不应直接恢复训练并视为同一实验。
 
 ## 7. 本地检查范围
 

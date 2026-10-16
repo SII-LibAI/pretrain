@@ -239,6 +239,5 @@ class FrozenWanVAE(nn.Module):
 
     @torch.no_grad()
     def decode(self, latent):
-        # Official convenience decode clamps [-1,1]. Inputs here use ImageNet
-        # normalization by request, so preserve the model's numeric output.
+        # Return raw values so the policy can reject non-finite output before clamping.
         return torch.cat([self.vae.model.decode(z[None], self.vae.scale) for z in latent], 0)

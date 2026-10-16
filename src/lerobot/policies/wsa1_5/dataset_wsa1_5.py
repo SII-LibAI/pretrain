@@ -19,23 +19,13 @@ from torch.utils.data import Dataset
 from torch.utils.data._utils.collate import default_collate
 
 from lerobot.dataset_schemas import get_registry, get_schema
-from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
-from lerobot.datasets.wsa1_5_text import PROMPT_VERSION, TextEmbeddingCache
+
+from .configuration_wsa1_5 import WSA1_5DatasetConfig
+from .text_embeddings import PROMPT_VERSION, TextEmbeddingCache
 
 HAND_NAMES = {0: "left hand", 1: "right hand", 2: "both hands"}
-
-
-def imagenet_normalize(x):
-    mean = x.new_tensor([0.485, 0.456, 0.406]).reshape(3, 1, 1)
-    std = x.new_tensor([0.229, 0.224, 0.225]).reshape(3, 1, 1)
-    return (x - mean) / std
-
-
-def imagenet_denormalize(x):
-    return x * x.new_tensor([0.229, 0.224, 0.225]).reshape(3, 1, 1) + x.new_tensor(
-        [0.485, 0.456, 0.406]).reshape(3, 1, 1)
 
 
 def compose_rgb_views(views, valid, height=384, width=320):
@@ -249,7 +239,7 @@ class WSA1_5Dataset(Dataset):
     def _decode(self, key, timestamps, ep):
         feature = self.meta.features.get(key)
         if not key or feature is None:
-            logging.warning("No motion in",self.repo_id)
+            logging.warning("No motion in %s", self.repo_id)
             return torch.zeros(len(timestamps), 3, 16, 16), torch.zeros(len(timestamps), dtype=torch.bool)
         h, w, c = feature["shape"]
         if c != 3:
@@ -279,8 +269,7 @@ class WSA1_5Dataset(Dataset):
             all_ts = np.concatenate((all_ts, [self.timestamps[segment.last]]))
         views, view_valid = zip(*(self._decode(key, all_ts, segment.episode) for key in self.view_keys), strict=True)
         canvas, pixels_valid = compose_rgb_views(views, view_valid, self.config.rgb_height, self.config.rgb_width)
-        normalized = imagenet_normalize(canvas)
-        normalized = normalized.masked_fill(~pixels_valid, 0)
+        normalized = (canvas * 2 - 1).masked_fill(~pixels_valid, 0)
         motion, motion_valid = self._decode(self.config.motion_key, future_ts, segment.episode)
         # self._motion_reads += 1
         # if self.config.motion_log_every > 0 and self._motion_reads % self.config.motion_log_every == 1:
@@ -288,7 +277,7 @@ class WSA1_5Dataset(Dataset):
         motion = F.interpolate(motion, size=(self.config.motion_height, self.config.motion_width),
                                mode="bilinear", align_corners=False)
         motion_valid &= valid_time
-        motion = imagenet_normalize(motion).masked_fill(~motion_valid[:, None, None, None], 0)
+        motion = (motion * 2 - 1).masked_fill(~motion_valid[:, None, None, None], 0)
         targets = {
             "future_rgb": normalized[1:33], "future_motion": motion,
             "rgb_valid": pixels_valid[1:33] & valid_time[:, None, None, None],

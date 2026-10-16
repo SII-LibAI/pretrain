@@ -8,8 +8,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from lerobot.datasets.wsa1_5 import imagenet_denormalize
-from lerobot.datasets.wsa1_5_text import encode_text, validate_text_embedding
 from lerobot.policies.pretrained import PreTrainedPolicy
 
 from .configuration_wsa1_5 import WSA1_5Config
@@ -18,6 +16,7 @@ from .future_3d import Future3DExpert, geometric_feature_loss
 from .initialization import interpolate_wan_state, load_report, read_checkpoint
 from .teacher import OmegaTeacher
 from .temporal import TemporalLayout
+from .text_embeddings import encode_text, validate_text_embedding
 from .timing import StageTimer
 from .validation import require_bool, require_finite
 from .vendor.helpers.state_dict_converters import wan_video_dit_state_dict_converter
@@ -231,7 +230,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
     def encode_observation(self, observed, text, observed_valid=None, *, latent=None,
                            text_embedding=None, text_valid=None):
         if observed.ndim != 4 or observed.shape[1:] != (3, self.config.rgb_height, self.config.rgb_width):
-            raise ValueError("Observed RGB must be [B,3,384,320] in adapter ImageNet-normalized coordinates")
+            raise ValueError("Observed RGB must be [B,3,384,320] in Wan-normalized [-1,1] coordinates")
         if not torch.isfinite(observed).all():
             raise ValueError("Non-finite observed RGB")
         pixel_valid = (torch.ones_like(observed[:, :1], dtype=torch.bool) if observed_valid is None else observed_valid)
@@ -413,7 +412,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 decoded = self.layout.future_from_decoded(self.vae.decode(latent))
                 if not torch.isfinite(decoded).all():
                     raise FloatingPointError(f"Non-finite decoded future {name}")
-                result[f"future_{name}"] = imagenet_denormalize(decoded)
+                result[f"future_{name}"] = (decoded.clamp(-1, 1) + 1) / 2
                 if name == "rgb":
                     result["future_rgb"] = result["future_rgb"].masked_fill(~result["future_rgb_valid"], 0)
             else:

@@ -3,10 +3,9 @@ import pytest
 import torch
 
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.factory import _build_single_dataset
-from lerobot.datasets.wsa1_5 import WSA1_5Dataset, wsa1_5_collate
-from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset, wsa1_5_collate
+from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config, WSA1_5DatasetConfig
 from test_wsa1_5_dataset import make_data
 from test_wsa1_5_observation_encoding import make_policy
 

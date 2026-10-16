@@ -29,7 +29,7 @@ from lerobot.dataset_schemas import get_schema
 from lerobot.datasets.configuration_synthetic_embodiment import (
     SyntheticEmbodimentDatasetConfig,
 )
-from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
+from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata,
@@ -374,7 +374,7 @@ def _build_single_dataset(
     """
 
     if isinstance(cfg.dataset, WSA1_5DatasetConfig):
-        from lerobot.datasets.wsa1_5 import WSA1_5Dataset
+        from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset
 
         if cfg.policy.type != "WSA_1_5":
             raise ValueError("wsa1_5 dataset targets require the WSA_1_5 policy")
@@ -663,7 +663,7 @@ def make_dataloader(
     )
     collate_fn = _multimodal_collate if use_mm_collate else None
     if isinstance(cfg.dataset, WSA1_5DatasetConfig):
-        from lerobot.datasets.wsa1_5 import wsa1_5_collate
+        from lerobot.policies.wsa1_5.dataset_wsa1_5 import wsa1_5_collate
 
         collate_fn = wsa1_5_collate
 

@@ -1,7 +1,8 @@
-"""Configuration registered with InternVLA's actual draccus policy mechanism."""
-from dataclasses import dataclass
+"""Policy and LeRobot adapter configurations for WSA1.5."""
+from dataclasses import dataclass, field
 import math
 
+from lerobot.configs.default import DatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import MultiGroupCosineDecayWithWarmupSchedulerConfig
@@ -110,16 +111,12 @@ class WSA1_5Config(PreTrainedConfig):
         if not any((self.enable_rgb, self.enable_motion, self.enable_3d_queries)):
             raise ValueError("Enable at least one supervised modality")
         # Accept serialized legacy configs while making their new semantics explicit.
-        if self.goal_conditioning == "generated":
-            self.goal_conditioning = "joint"
         if self.goal_conditioning != "joint":
             raise ValueError("Only joint O/R/M/G mixed-attention 3D conditioning is supported")
         if self.motion_initialization not in {"wan_width_interpolation", "random"} or self.goal_initialization not in {"wan_width_interpolation", "random"}:
             raise ValueError("Unknown expert initialization rule")
         if self.goal_hidden_dim % 2:
             raise ValueError("goal_hidden_dim must be even for 3D slot positional encoding")
-        if self.attention_backend not in {"sdpa", "math", "reference"}:
-            raise ValueError("Attention backend must preserve explicit masks")
         rope_width = (self.head_dim - 2 * (self.head_dim // 3)) // 2 + 2 * ((self.head_dim // 3) // 2)
         if self.head_dim % 2 or rope_width != self.head_dim // 2:
             raise ValueError("head_dim must support the Wan three-axis RoPE partition")
@@ -167,3 +164,53 @@ class WSA1_5Config(PreTrainedConfig):
             "peak_lr": lr, "decay_lr": lr * self.scheduler_decay_lr_ratio, "num_warmup_steps": self.scheduler_warmup_steps,
             "num_decay_steps": self.scheduler_decay_steps,
         } for name, lr in rates.items()})
+
+
+@DatasetConfig.register_subclass("wsa1_5")
+@dataclass
+class WSA1_5DatasetConfig(DatasetConfig):
+    # Canonical schema names, in WSA top / bottom-left / bottom-right order.
+    view_names: list[str] = field(default_factory=lambda: [
+        "observation.images.image0", "observation.images.image1", "observation.images.image2"
+    ])
+    # Optional source keys in precisely the same order; empty entries mean absent.
+    view_keys: list[str] = field(default_factory=list)
+    future_frames: int = 32
+    frame_stride: int = 1
+    rgb_height: int = 384
+    rgb_width: int = 320
+    motion_height: int = 192
+    motion_width: int = 160
+    motion_key: str = "observation.motion"
+    sidecar_file: str = "meta/sidecar.json"
+    text_embedding_dir: str = "meta/wsa1_5_text_embeddings"
+    use_imagenet_stats: bool = False  # Normalization is explicit in the adapter.
+    use_external_stats: bool = False
+    motion_log_every: int = 10000
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.streaming:
+            raise ValueError("WSA endpoint sampling requires map-style LeRobot data")
+        if self.use_imagenet_stats or self.use_external_stats or self.image_transforms.enable:
+            raise ValueError("WSA uses explicit Wan [-1,1] normalization; external stats/image transforms are unsupported")
+        if any(group.inputs or group.outputs for group in [self.repack_transforms, self.data_transforms, self.model_transforms]):
+            raise ValueError("WSA adapter does not support custom transform groups; refusing to ignore them")
+        for name in ["future_frames", "frame_stride", "rgb_height", "rgb_width", "motion_height", "motion_width"]:
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if type(self.motion_log_every) is not int or self.motion_log_every < 0:
+            raise ValueError("motion_log_every must be a non-negative integer")
+        if len(self.view_names) != 3 or len(set(self.view_names)) != 3:
+            raise ValueError("view_names must specify three distinct ordered schema views")
+        if self.view_keys and len(self.view_keys) != 3:
+            raise ValueError("view_keys must specify exactly three ordered source keys")
+        present = [key for key in self.view_keys if key]
+        if len(set(present)) != len(present):
+            raise ValueError("A source RGB view cannot occupy two slots")
+        if self.future_frames != 32 or self.frame_stride <= 0:
+            raise ValueError("First version requires 32 future frames and a positive frame_stride")
+        if self.rgb_height % 3 or self.rgb_width % 2:
+            raise ValueError("WSA layout requires height divisible by 3 and even width")
+        if min(self.rgb_height, self.rgb_width, self.motion_height, self.motion_width) <= 0:
+            raise ValueError("Image sizes must be positive")

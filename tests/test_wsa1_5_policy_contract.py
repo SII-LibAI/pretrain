@@ -1,4 +1,7 @@
 import inspect
+import json
+import subprocess
+import sys
 
 import draccus
 import pytest
@@ -7,11 +10,10 @@ import torch
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.factory import make_dataloader
 from lerobot.datasets.transformed_dataset import MultiLeRobotDataset
 from lerobot.policies.factory import get_policy_class, make_policy_config
-from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config
+from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config, WSA1_5DatasetConfig
 from lerobot.policies.wsa1_5.future_3d import Future3DExpert
 from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy, WorldComponents
 from test_wsa1_5_dataset import make_data
@@ -44,6 +46,41 @@ def test_real_registries_and_serialization(tmp_path):
         restored = draccus.parse(PreTrainedConfig, str(tmp_path / "config.json"), args=[])
     assert restored == config and restored.action_delta_indices is None
     assert not restored.output_features
+
+
+def test_dataset_and_policy_configs_share_module_and_roundtrip(tmp_path):
+    assert WSA1_5DatasetConfig.__module__ == WSA1_5Config.__module__
+    cfg = TrainPipelineConfig(policy=small_config(), dataset=WSA1_5DatasetConfig(
+        repo_id="nested/fixture", root="collection", view_keys=["rgb", "", ""],
+        frame_stride=2, text_embedding_dir="meta/custom_text", motion_log_every=10000))
+    path = tmp_path / "train_config.json"
+    path.write_text(json.dumps(draccus.encode(cfg)), encoding="utf-8")
+    with draccus.config_type("json"):
+        restored = draccus.parse(TrainPipelineConfig, str(path), args=[])
+    assert draccus.encode(restored) == draccus.encode(cfg)
+    assert restored.policy == cfg.policy
+    assert draccus.encode(restored)["dataset"]["type"] == "wsa1_5"
+    assert restored.policy.type == "WSA_1_5"
+
+
+@pytest.mark.parametrize("modules", [
+    ["lerobot.datasets.factory", "lerobot.policies.wsa1_5.configuration_wsa1_5"],
+    ["lerobot.policies.wsa1_5.configuration_wsa1_5", "lerobot.policies.wsa1_5.dataset_wsa1_5"],
+])
+def test_fresh_import_order_registers_configs_without_model_import(modules):
+    code = f"""
+import importlib
+import sys
+for module in {modules!r}:
+    importlib.import_module(module)
+from lerobot.configs.default import DatasetConfig
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies import WSA1_5Config, WSA1_5DatasetConfig
+assert DatasetConfig.get_choice_class('wsa1_5') is WSA1_5DatasetConfig
+assert PreTrainedConfig.get_choice_class('WSA_1_5') is WSA1_5Config
+assert 'lerobot.policies.wsa1_5.modeling_wsa1_5' not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
 
 def test_optimizer_groups_are_disjoint_and_complete():
