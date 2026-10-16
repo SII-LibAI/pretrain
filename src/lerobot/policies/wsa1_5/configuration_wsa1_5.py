@@ -1,5 +1,5 @@
 """Configuration registered with InternVLA's actual draccus policy mechanism."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -16,7 +16,8 @@ class WSA1_5Config(PreTrainedConfig):
     tokenizer_path: str = ""
     omega_checkpoint_path: str = ""
     dtype: str = "bfloat16"
-    trainable_weights_fp32: bool = True  # FP32 master parameters with BF16 autocast.
+    trainable_weights_fp32: bool = False
+    load_text_encoder: bool = False
     rgb_hidden_dim: int = 3072
     rgb_ffn_dim: int = 14336
     motion_hidden_dim: int = 1024
@@ -43,7 +44,7 @@ class WSA1_5Config(PreTrainedConfig):
     enable_3d: bool | None = None  # Legacy query flag, normalized into enable_3d_queries.
     lambda_rgb: float = 1.0
     lambda_motion: float = 1.0
-    lambda_3d: float = 1.0  # Zero skips teacher construction, target loading/cache and 3D loss.
+    lambda_3d: float = 1.0  # Zero skips teacher construction, endpoint loading and 3D loss.
     feature_mse_weight: float = 1.0
     feature_cosine_weight: float = 1.0
     freeze_rgb: bool = False
@@ -60,10 +61,6 @@ class WSA1_5Config(PreTrainedConfig):
     # Legacy checkpoint field; joint 3D training performs no extra sampling.
     goal_sampler_steps: int | None = None
     goal_conditioning: str = "joint"
-    cache_dir: str | None = None
-    # Saved with the policy: these frozen weights are included in the complete
-    # checkpoint, so resume/inference can reuse artifacts without source .pth files.
-    frozen_asset_fingerprints: dict[str, str] = field(default_factory=dict)
     rgb_lr: float = 1e-5
     motion_lr: float = 5e-5
     goal_lr: float = 5e-5
@@ -75,6 +72,9 @@ class WSA1_5Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        for name in ["trainable_weights_fp32", "load_text_encoder"]:
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be boolean")
         if self.enable_3d is not None:
             if type(self.enable_3d) is not bool:
                 raise ValueError("enable_3d must be boolean when supplied")

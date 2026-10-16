@@ -31,7 +31,7 @@ class RecordingVAE(nn.Module):
 
 
 def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_queries=False,
-                cache_dir=None, **loss_weights):
+                **loss_weights):
     config = WSA1_5Config(
         device="cpu", dtype="float32", push_to_hub=False,
         rgb_hidden_dim=16, rgb_ffn_dim=32, motion_hidden_dim=12, motion_ffn_dim=24,
@@ -39,8 +39,7 @@ def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_q
         head_dim=8, latent_channels=4, text_dim=8, freq_dim=8,
         rgb_height=96, rgb_width=32, motion_height=32, motion_width=32,
         enable_rgb=enable_rgb, enable_motion=enable_motion, enable_3d_queries=enable_3d_queries,
-        cache_dir=cache_dir,
-        frozen_asset_fingerprints={"vae_path": "recording-vae"}, **loss_weights,
+        **loss_weights,
     )
     vae = RecordingVAE()
     future = Future3DExpert(10, 20, 3, 2, 8, 8) if enable_3d_queries else None
@@ -51,10 +50,8 @@ def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_q
 
 
 @pytest.mark.parametrize("enable_rgb", [True, False])
-@pytest.mark.parametrize("cached", [True, False])
-def test_training_encoding_routes_and_backward(monkeypatch, tmp_path, enable_rgb, cached):
-    policy, vae = make_policy(monkeypatch, enable_rgb=enable_rgb,
-                              cache_dir=str(tmp_path) if cached else None)
+def test_training_encoding_routes_and_backward(monkeypatch, enable_rgb):
+    policy, vae = make_policy(monkeypatch, enable_rgb=enable_rgb)
     image = torch.randn(1, 3, 96, 32)
     pixel_valid = torch.ones(1, 1, 96, 32, dtype=torch.bool)
     pixel_valid[:, :, 64:, 16:] = False
@@ -91,6 +88,7 @@ def test_training_encoding_routes_and_backward(monkeypatch, tmp_path, enable_rgb
     monkeypatch.setattr(policy.flow, "velocity", capture_observation)
     loss, metrics = policy.training_forward(batch)
     assert torch.isfinite(loss) and metrics["loss"] == loss.item()
+    assert all(metrics[key] >= 0 for key in ["input_s", "mot_s", "pred_s"])
     loss.backward()
     assert policy.flow.motion.patch_embedding.weight.grad.abs().sum() > 0
     if enable_rgb:
@@ -100,9 +98,6 @@ def test_training_encoding_routes_and_backward(monkeypatch, tmp_path, enable_rgb
     else:
         assert vae.calls == [(1, 3, 33, 32, 32), (1, 3, 1, 96, 32), (1, 3, 1, 32, 32)]
     assert not conditions[-1].any()  # Motion still uses its fixed-zero placeholder.
-    if cached:
-        policy.training_forward(batch)
-        assert len(vae.calls) == 3
 
 
 def test_observation_without_training_targets_still_encodes_single_frame(monkeypatch):

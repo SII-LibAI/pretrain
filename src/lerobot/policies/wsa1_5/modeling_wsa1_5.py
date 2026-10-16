@@ -9,15 +9,16 @@ from torch import nn
 import torch.nn.functional as F
 
 from lerobot.datasets.wsa1_5 import imagenet_denormalize
+from lerobot.datasets.wsa1_5_text import encode_text, validate_text_embedding
 from lerobot.policies.pretrained import PreTrainedPolicy
 
-from .cache import ArtifactCache, fingerprint_path
 from .configuration_wsa1_5 import WSA1_5Config
 from .experts import FrozenWanVAE, RGBVideoExpert, MotionDiTExpert, WorldFlow, wan_config
 from .future_3d import Future3DExpert, geometric_feature_loss
 from .initialization import interpolate_wan_state, load_report, read_checkpoint
-from .teacher import OMEGA_PREPROCESS_VERSION, OmegaTeacher
+from .teacher import OmegaTeacher
 from .temporal import TemporalLayout
+from .timing import StageTimer
 from .validation import require_bool, require_finite
 from .vendor.helpers.state_dict_converters import wan_video_dit_state_dict_converter
 
@@ -50,8 +51,6 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.layout = TemporalLayout()
         self.model_dtype = getattr(torch, config.dtype)
         if components is None:
-            if initialize_pretrained:
-                config.frozen_asset_fingerprints.clear()
             components = self._build_components(initialize_pretrained)
         self.flow = components.flow
         self.future_3d = components.future_3d if config.enable_3d_queries else None
@@ -62,8 +61,6 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.tokenizer = components.tokenizer
         self.teacher = OmegaTeacher(config.omega_checkpoint_path, config.teacher_layers,
                                     dtype=self.model_dtype) if config.use_3d_supervision else None
-        self.cache = ArtifactCache(config.cache_dir) if config.cache_dir else None
-        self._fingerprints = {}
         self._freeze_modules()
 
     def prepare_for_training(self, device, *, log_parameters=True):
@@ -86,12 +83,14 @@ class WSA1_5_Policy(PreTrainedPolicy):
     def _build_components(self, initialize):
         cfg = self.config
         if initialize:
-            for name in ["wan_model_path", "vae_path", "text_encoder_path", "tokenizer_path"]:
+            paths = ["wan_model_path", "vae_path"]
+            if cfg.load_text_encoder:
+                paths += ["text_encoder_path", "tokenizer_path"]
+            for name in paths:
                 path = getattr(cfg, name)
                 if not path or not Path(path).exists():
                     raise FileNotFoundError(f"Provide local server asset {name}: {path!r}")
         from .vendor.wan_video_vae import WanVideoVAE38
-        from .vendor.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
 
         common = dict(layers=cfg.num_layers, heads=cfg.num_heads, head_dim=cfg.head_dim,
                       channels=cfg.latent_channels, text_dim=cfg.text_dim, freq_dim=cfg.freq_dim)
@@ -102,8 +101,14 @@ class WSA1_5_Policy(PreTrainedPolicy):
             student = Future3DExpert(cfg.goal_hidden_dim, cfg.goal_ffn_dim, cfg.num_layers, cfg.num_heads,
                                      cfg.head_dim, cfg.freq_dim, teacher_layers=cfg.teacher_layers,
                                      student_layers=cfg.student_layers) if cfg.enable_3d_queries else None
-        with construction_dtype(self.model_dtype):
-            text_encoder = WanTextEncoder()
+        text_encoder, tokenizer = None, None
+        if cfg.load_text_encoder:
+            from .vendor.wan_video_text_encoder import WanTextEncoder, HuggingfaceTokenizer
+
+            with construction_dtype(self.model_dtype):
+                text_encoder = WanTextEncoder().eval().requires_grad_(False)
+            tokenizer = HuggingfaceTokenizer(cfg.tokenizer_path, seq_len=cfg.max_text_length,
+                                            clean="whitespace", local_files_only=True)
         # Keep official mean/std and inverse-std calculation in float32;
         # converting the learned weights must not quantize these constants early.
         vae = WanVideoVAE38().to(dtype=self.model_dtype)
@@ -127,16 +132,15 @@ class WSA1_5_Policy(PreTrainedPolicy):
             if not all(key.startswith("model.") for key in vae_state):
                 vae_state = {f"model.{key}": value for key, value in vae_state.items()}
             load_report(vae, vae_state, name="Wan2.2 VAE", strict=True)
-            load_report(text_encoder, read_checkpoint(cfg.text_encoder_path), name="Wan UMT5", strict=True)
-        tokenizer = HuggingfaceTokenizer(cfg.tokenizer_path, seq_len=cfg.max_text_length,
-                                        clean="whitespace", local_files_only=True)
+            if text_encoder is not None:
+                load_report(text_encoder, read_checkpoint(cfg.text_encoder_path), name="Wan UMT5", strict=True)
         flow = WorldFlow(rgb, motion, backend=cfg.attention_backend, gradient_checkpointing=cfg.gradient_checkpointing,
                          shift=cfg.flow_shift)
-        return WorldComponents(flow, student, FrozenWanVAE(vae), text_encoder.eval().requires_grad_(False), tokenizer)
+        return WorldComponents(flow, student, FrozenWanVAE(vae), text_encoder, tokenizer)
 
     @classmethod
     def from_pretrained(cls, pretrained_name_or_path, **kwargs):
-        # The saved policy contains Wan/VAE/text weights. Never initialize them
+        # The saved policy contains all enabled module weights. Never initialize them
         # from source checkpoints before loading the complete saved policy.
         kwargs["initialize_pretrained"] = False
         if kwargs.get("strict") is False:
@@ -197,72 +201,23 @@ class WSA1_5_Policy(PreTrainedPolicy):
     def predict_action_chunk(self, *args, **kwargs):
         raise NotImplementedError("WSA1.5 has no action expert")
 
-    def _asset_fingerprint(self, field):
-        if field not in self._fingerprints:
-            if field in {"vae_path", "text_encoder_path"} and field in self.config.frozen_asset_fingerprints:
-                self._fingerprints[field] = self.config.frozen_asset_fingerprints[field]
-            else:
-                self._fingerprints[field] = fingerprint_path(getattr(self.config, field))
-                if field in {"vae_path", "text_encoder_path"}:
-                    self.config.frozen_asset_fingerprints[field] = self._fingerprints[field]
-        return self._fingerprints[field]
-
-    def _cached(self, kind, identity, compute, asset_fields):
-        if self.cache is None:
-            return compute()
-        identity = {**identity, "dtype": self.config.dtype,
-                    "weights": {field: self._asset_fingerprint(field) for field in asset_fields}}
-        device = next(self.flow.parameters()).device
-        return {key: value.to(device) for key, value in self.cache.get_or_compute(kind, identity, compute).items()}
-
     @torch.no_grad()
     def _encode_text(self, texts):
         if self.text_encoder is None or self.tokenizer is None:
-            raise RuntimeError("Raw-text inference/training requires the actual frozen Wan UMT5 and tokenizer")
+            raise RuntimeError("load_text_encoder=false requires offline text_embedding and text_valid; no online fallback")
         texts = [texts] if isinstance(texts, str) else list(texts)
         device = next(self.flow.parameters()).device
-        contexts, masks = [], []
-        for text in texts:
-            def encode(text=text):
-                ids, mask = self.tokenizer([text], return_mask=True, add_special_tokens=True)
-                if not torch.isfinite(mask).all() or not ((mask == 0) | (mask == 1)).all():
-                    raise ValueError("Tokenizer attention mask must contain only finite binary values")
-                ids, mask = ids.to(device), mask.to(device).bool()
-                context = self.text_encoder(ids, mask)
-                context = context.masked_fill(~mask[..., None], 0)
-                if not torch.isfinite(context).all():
-                    raise FloatingPointError("Non-finite frozen UMT5 embeddings")
-                return {"context": context[0], "valid": mask[0]}
-            value = self._cached("text", {"text": text, "max_length": self.config.max_text_length}, encode,
-                                 ["text_encoder_path", "tokenizer_path"])
-            if (value["context"].shape != (self.config.max_text_length, self.config.text_dim)
-                    or value["valid"].shape != (self.config.max_text_length,)
-                    or value["valid"].dtype != torch.bool):
-                raise ValueError("Frozen text artifact shape/mask differs from the configured UMT5 contract")
-            contexts.append(value["context"])
-            masks.append(value["valid"])
-        context = torch.stack(contexts).to(self.model_dtype)
-        if not torch.isfinite(context).all():
-            raise FloatingPointError("Non-finite UMT5 artifact after compute-dtype conversion")
-        return context, torch.stack(masks)
+        context, valid = encode_text(self.text_encoder, self.tokenizer, texts, device,
+                                     self.config.max_text_length, self.config.text_dim)
+        context = context.to(self.model_dtype)
+        require_finite(context, "UMT5 embedding after compute-dtype conversion")
+        return context, valid
 
-    def _encode_video(self, kind, video, metadata):
-        require_finite(video, f"{kind} VAE input")
+    def _encode_video(self, video):
+        require_finite(video, "VAE input")
         if self.vae is None:
             raise RuntimeError("Pixel-space execution requires the actual frozen Wan2.2 VAE")
-        if self.cache is None:
-            latent = self.vae.encode(video.to(self.model_dtype))
-        else:
-            # Cache per sample so shuffled batches can reuse the same artifacts.
-            latents = []
-            for index in range(video.shape[0]):
-                item = video[index:index + 1]
-                info = self._sample_metadata(metadata, index, video.shape[0])
-                values = self._cached(kind, {"video": item, "metadata": info},
-                                      lambda item=item: {"latent": self.vae.encode(item.to(self.model_dtype))}, ["vae_path"])
-                latents.append(values["latent"])
-            latent = torch.cat(latents)
-        latent = latent.to(self.model_dtype)
+        latent = self.vae.encode(video.to(self.model_dtype)).to(self.model_dtype)
         self._validate_encoded_latent(latent, video)
         return latent
 
@@ -273,19 +228,8 @@ class WSA1_5_Policy(PreTrainedPolicy):
             raise ValueError(f"VAE output shape {tuple(latent.shape)} does not match {expected}")
         require_finite(latent, "Frozen VAE latent")
 
-    @staticmethod
-    def _sample_metadata(metadata, index, batch_size):
-        result = {}
-        for key, value in metadata.items():
-            if torch.is_tensor(value) and value.ndim and value.shape[0] == batch_size:
-                result[key] = value[index]
-            elif isinstance(value, (list, tuple)) and len(value) == batch_size:
-                result[key] = value[index]
-            else:
-                result[key] = value
-        return result
-
-    def encode_observation(self, observed, text, observed_valid=None, *, latent=None):
+    def encode_observation(self, observed, text, observed_valid=None, *, latent=None,
+                           text_embedding=None, text_valid=None):
         if observed.ndim != 4 or observed.shape[1:] != (3, self.config.rgb_height, self.config.rgb_width):
             raise ValueError("Observed RGB must be [B,3,384,320] in adapter ImageNet-normalized coordinates")
         if not torch.isfinite(observed).all():
@@ -298,10 +242,19 @@ class WSA1_5_Policy(PreTrainedPolicy):
         if not pixel_valid.flatten(1).any(1).all():
             raise ValueError("Every sample must contain at least one valid observed RGB view")
         if latent is None:
-            latent = self._encode_video("observation", observed[:, :, None], {})
+            latent = self._encode_video(observed[:, :, None])
         else:
             self._validate_encoded_latent(latent, observed[:, :, None])
-        context, context_valid = self._encode_text(text)
+        if text_embedding is None and text_valid is None:
+            context, context_valid = self._encode_text(text)
+        else:
+            if text_embedding is None or text_valid is None:
+                raise ValueError("Provide both text_embedding and text_valid")
+            validate_text_embedding(text_embedding, text_valid, self.config.max_text_length, self.config.text_dim)
+            context = text_embedding.to(device=latent.device, dtype=self.model_dtype)
+            context_valid = text_valid.to(latent.device)
+            require_finite(context, "Text embedding after compute-dtype conversion")
+            context = context.masked_fill(~context_valid[..., None], 0)
         if context.shape[0] != latent.shape[0]:
             raise ValueError("Text batch must match observed RGB batch")
         spatial = F.interpolate(pixel_valid.float(), size=latent.shape[-2:], mode="area") >= 1 - 1e-6
@@ -309,7 +262,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
 
     def _placeholder(self, batch_size, device):
         zero = torch.zeros(batch_size, 3, 1, self.config.motion_height, self.config.motion_width, device=device)
-        return self._encode_video("motion_placeholder", zero, {})
+        return self._encode_video(zero)
 
     def _shapes(self, batch_size):
         cfg = self.config
@@ -341,38 +294,22 @@ class WSA1_5_Policy(PreTrainedPolicy):
     def prepare_training_targets(self, batch):
         target = batch["targets"]
         observed = batch["observed_rgb"]
-        metadata = {key: batch.get(key) for key in ["sample_id", "sidecar_digest", "prompt_version", "frame_timestamps"]}
         clean, masks = {}, {}
         if self.config.enable_rgb:
             video = self.layout.assemble_rgb(observed, target["future_rgb"])
-            clean["rgb"] = self._encode_video("rgb_targets", video, metadata)
+            clean["rgb"] = self._encode_video(video)
             self.layout.check_latents(clean["rgb"], self.config.rgb_height, self.config.rgb_width)
             future_valid = self.layout.latent_validity(target["rgb_valid"], clean["rgb"].shape[-2:])
             masks["rgb"] = torch.cat([torch.ones_like(future_valid[:, :, :1]), future_valid], 2)
         if self.config.enable_motion:
             video = self.layout.prepend_motion_placeholder(target["future_motion"])
-            clean["motion"] = self._encode_video("motion_targets", video, metadata)
+            clean["motion"] = self._encode_video(video)
             self.layout.check_latents(clean["motion"], self.config.motion_height, self.config.motion_width)
             future_valid = self.layout.latent_validity(target["motion_valid"], clean["motion"].shape[-2:])
             masks["motion"] = torch.cat([torch.zeros_like(future_valid[:, :, :1]), future_valid], 2)
         teacher, teacher_valid = {}, None
         if self.config.use_3d_supervision:
-            endpoint_metadata = {key: batch.get(key) for key in [
-                "sidecar_digest", "prompt_version", "episode_index", "subtask_id", "goal_timestamp"]}
-            feature_rows, valid_rows = [], []
-            for index, views in enumerate(target["goal_rgb_views"]):
-                view_valid = target["goal_view_valid"][index:index + 1]
-                def extract(views=views, view_valid=view_valid):
-                    features, valid = self.teacher.features([views], view_valid, observed.device)
-                    return {**{f"layer_{key}": value for key, value in features.items()}, "valid": valid}
-                values = self._cached("omega_targets", {"views": views, "valid": view_valid,
-                                                       "metadata": self._sample_metadata(endpoint_metadata, index, observed.shape[0]),
-                                                       "preprocess": OMEGA_PREPROCESS_VERSION, "layers": self.config.teacher_layers},
-                                      extract, ["omega_checkpoint_path"])
-                feature_rows.append(values)
-                valid_rows.append(values["valid"])
-            teacher = {layer: torch.cat([row[f"layer_{layer}"] for row in feature_rows]) for layer in self.config.teacher_layers}
-            teacher_valid = torch.cat(valid_rows)
+            teacher, teacher_valid = self.teacher.features(target["goal_rgb_views"], target["goal_view_valid"], observed.device)
         return clean, masks, teacher, teacher_valid
 
     def compute_context(self):
@@ -400,6 +337,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
             raise ValueError("training_forward requires an explicit targets dictionary")
         if "observed_valid" not in batch:
             raise ValueError("Training requires explicit observed_valid; missing views cannot default to valid")
+        timer = StageTimer(batch["observed_rgb"].device)
         require_bool(batch["observed_valid"], "Observed validity")
         target = batch["targets"]
         for name, enabled in [("rgb", self.config.enable_rgb), ("motion", self.config.enable_motion)]:
@@ -411,7 +349,8 @@ class WSA1_5_Policy(PreTrainedPolicy):
         clean, masks, teacher_targets, teacher_valid = self.prepare_training_targets(batch)
         observed_latent = clean["rgb"][:, :, :1] if "rgb" in clean else None
         observed, context, context_valid, observed_valid, pixel_valid = self.encode_observation(
-            batch["observed_rgb"], batch["condition_text"], batch["observed_valid"], latent=observed_latent)
+            batch["observed_rgb"], batch["condition_text"], batch["observed_valid"], latent=observed_latent,
+            text_embedding=batch.get("text_embedding"), text_valid=batch.get("text_valid"))
         if teacher_valid is not None:
             require_bool(teacher_valid, "Teacher feature validity")
             # An absent observed camera has no corresponding active G queries.
@@ -426,7 +365,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                                         timesteps.get("rgb"), timesteps.get("motion"), observed_valid=observed_valid,
                                         rgb_valid=masks.get("rgb"), motion_valid=masks.get("motion"),
                                         future_3d=self.future_3d,
-                                        goal_view_valid=self.observed_view_validity(pixel_valid))
+                                        goal_view_valid=self.observed_view_validity(pixel_valid), timer=timer)
         losses, metrics = {}, {}
         for name in clean:
             losses[name] = self.flow.flow_loss(prediction[name], velocities[name], timesteps[name], masks[name])
@@ -441,23 +380,25 @@ class WSA1_5_Policy(PreTrainedPolicy):
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite WSA loss: {metrics}")
         metrics["loss"] = loss.detach().item()
+        metrics.update(timer.values())
         return loss, metrics
 
     def forward(self, batch):
         return self.training_forward(batch)
 
     @torch.no_grad()
-    def predict_future(self, observed_rgb, text, seed=0, *, observed_valid=None):
+    def predict_future(self, observed_rgb, text, seed=0, *, observed_valid=None, text_embedding=None, text_valid=None):
         was_training = self.training
         self.eval()
         try:
             with self.compute_context():
-                return self._predict_future(observed_rgb, text, seed, observed_valid)
+                return self._predict_future(observed_rgb, text, seed, observed_valid, text_embedding, text_valid)
         finally:
             self.train(was_training)
 
-    def _predict_future(self, observed_rgb, text, seed, observed_valid):
-        observed, context, context_valid, latent_valid, pixel_valid = self.encode_observation(observed_rgb, text, observed_valid)
+    def _predict_future(self, observed_rgb, text, seed, observed_valid, text_embedding, text_valid):
+        observed, context, context_valid, latent_valid, pixel_valid = self.encode_observation(
+            observed_rgb, text, observed_valid, text_embedding=text_embedding, text_valid=text_valid)
         generated_rgb, generated_motion, features = self.sample_generated_latents(
             observed, context, context_valid, latent_valid, seed=seed, steps=self.config.sampler_steps,
             pixel_valid=pixel_valid, return_features=True)

@@ -74,7 +74,8 @@ def test_nonmain_rank_loads_teacher_without_parameter_report(monkeypatch, caplog
 
 
 @pytest.mark.parametrize("valid_checkpoint", [True, False])
-def test_teacher_load_is_visible_frozen_strict_and_preserves_rng(monkeypatch, caplog, valid_checkpoint):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_teacher_load_is_visible_frozen_strict_and_preserves_rng(monkeypatch, caplog, valid_checkpoint, dtype):
     class TinyOmega(nn.Module):
         def __init__(self, **kwargs):
             super().__init__()
@@ -89,7 +90,7 @@ def test_teacher_load_is_visible_frozen_strict_and_preserves_rng(monkeypatch, ca
     monkeypatch.setitem(sys.modules, "vggt_omega.models", models)
     state = TinyOmega().state_dict() if valid_checkpoint else {}
     monkeypatch.setattr("lerobot.policies.wsa1_5.teacher.read_checkpoint", lambda path: state)
-    teacher = OmegaTeacher("test-only-weights-not-read.pt", dtype=torch.float32)
+    teacher = OmegaTeacher("test-only-weights-not-read.pt", dtype=dtype)
     rng = torch.random.get_rng_state().clone()
     with caplog.at_level(logging.INFO):
         if valid_checkpoint:
@@ -104,6 +105,7 @@ def test_teacher_load_is_visible_frozen_strict_and_preserves_rng(monkeypatch, ca
     assert "[WSA layer parameters]" not in caplog.text
     if valid_checkpoint:
         assert not teacher.model.training
+        assert {parameter.dtype for parameter in teacher.model.parameters()} == {dtype}
         assert not any(p.requires_grad for p in teacher.model.parameters())
     else:
         assert teacher.model is None

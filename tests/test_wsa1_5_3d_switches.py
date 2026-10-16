@@ -50,13 +50,6 @@ def test_disabled_supervision_skips_teacher_targets_and_loss(monkeypatch, kwargs
     assert {group["name"] for group in policy.get_optim_params()} == {"rgb", "motion"}
     if queries:
         assert not any(p.requires_grad for p in policy.future_3d.parameters())
-    cached = policy._cached
-
-    def reject_teacher_cache(kind, *args, **kwargs):
-        assert kind != "omega_targets"
-        return cached(kind, *args, **kwargs)
-
-    monkeypatch.setattr(policy, "_cached", reject_teacher_cache)
     # Endpoint images/masks are deliberately absent, not zero placeholders.
     batch = {
         "observed_rgb": torch.randn(1, 3, 96, 32), "condition_text": ["move"],
@@ -108,14 +101,21 @@ def test_query_sampling_is_independent_of_feature_return(monkeypatch, weight, re
 
 
 @pytest.mark.parametrize("queries,weight", [(False, 1.0), (True, 0.0), (True, 1.0)])
-def test_factory_only_loads_endpoint_targets_for_supervision(tmp_path, monkeypatch, queries, weight):
+@pytest.mark.parametrize("online_text", [False, True])
+def test_factory_only_loads_endpoint_targets_for_supervision(tmp_path, monkeypatch, queries, weight, online_text):
     source, seen = make_data(tmp_path, monkeypatch)
+    if not online_text:
+        from test_wsa1_5_text_embeddings import precompute
+
+        precompute(tmp_path)
     monkeypatch.setattr("lerobot.datasets.factory.LeRobotDataset", lambda *args, **kwargs: source.base)
     cfg = TrainPipelineConfig(
-        policy=WSA1_5Config(device="cpu", enable_3d_queries=queries, lambda_3d=weight),
+        policy=WSA1_5Config(device="cpu", enable_3d_queries=queries, lambda_3d=weight,
+                            load_text_encoder=online_text, max_text_length=4, text_dim=8),
         dataset=WSA1_5DatasetConfig(repo_id="test", root=str(tmp_path), view_keys=["rgb", "", ""]),
     )
     dataset, _, _ = _build_single_dataset(cfg, "test", None, 0)
+    assert (dataset.text_embeddings is None) == online_text
     sample = dataset[0]
     supervised = queries and weight > 0
     assert dataset.include_3d_targets == supervised

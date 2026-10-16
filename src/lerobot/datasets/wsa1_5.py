@@ -22,8 +22,8 @@ from lerobot.dataset_schemas import get_registry, get_schema
 from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
+from lerobot.datasets.wsa1_5_text import PROMPT_VERSION, TextEmbeddingCache
 
-PROMPT_VERSION = "wsa1_5.task-subtask-hand-scene.v1"
 HAND_NAMES = {0: "left hand", 1: "right hand", 2: "both hands"}
 
 
@@ -114,7 +114,7 @@ class LoadedEpisodeMetadata:
 
 
 class WSA1_5Dataset(Dataset):
-    def __init__(self, base, config: WSA1_5DatasetConfig, *, include_3d_targets=True):
+    def __init__(self, base, config: WSA1_5DatasetConfig, *, include_3d_targets=True, text_embedding_shape=None):
         self.base, self.config = base, config
         if type(include_3d_targets) is not bool:
             raise TypeError("include_3d_targets must be boolean")
@@ -172,6 +172,10 @@ class WSA1_5Dataset(Dataset):
         self.sample_indices = []
         self.segment_for_sample = []
         self._build_segments(annotations)
+        self.text_embeddings = None
+        if text_embedding_shape is not None:
+            self.text_embeddings = TextEmbeddingCache(self.root / config.text_embedding_dir, *text_embedding_shape)
+            self.text_embeddings.require(segment.text for segment in self.segments)
         self.meta = LoadedEpisodeMetadata(base.meta, self.episode_indices)
         self.delta_indices = {config.motion_key: [i * config.frame_stride for i in range(1, 33)]}
         self._motion_reads = 0
@@ -296,8 +300,11 @@ class WSA1_5Dataset(Dataset):
                 "goal_rgb_views": [view[-1] for view in views],  # Raw [0,1], native sizes.
                 "goal_view_valid": torch.tensor([bool(mask[-1]) and segment.metadata_valid for mask in view_valid]),
             })
+        condition = build_inference_condition(normalized[0], segment.text, observed_valid=pixels_valid[0])
+        if self.text_embeddings is not None:
+            condition["text_embedding"], condition["text_valid"] = self.text_embeddings.get(segment.text)
         return {
-            **build_inference_condition(normalized[0], segment.text, observed_valid=pixels_valid[0]),
+            **condition,
             "targets": targets, "sample_id": f"{self.repo_id}:{segment.episode}:{int(self.frame_indices[idx])}",
             "episode_index": segment.episode, "subtask_id": segment.subtask,
             "start_timestamp": float(self.timestamps[idx]), "goal_timestamp": float(self.timestamps[segment.last]),

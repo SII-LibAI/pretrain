@@ -18,18 +18,10 @@ if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
     DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egodex-LerobotV3/extra/insert_remove_usb}"
-    DATASET_REPO_IDS="${DATASET_REPO_ID:-}"
-    DATASET_REPO_IDS="$(
-    {
-        find -L  ${DATA_ROOT} -type d -name data 2>/dev/null \
-        | while read -r d; do
-            root="$(dirname "$d")"
-            if [[ -d "$root/meta" && -d "$root/videos" ]]; then
-                echo "${root#data/}"
-            fi
-            done
-    } | shuf "${SHUF_ARGS[@]}" | tr '\n' ' ' | xargs
-    )"
+    DATASET_REPO_IDS="${DATASET_REPO_IDS:-${DATASET_REPO_ID:-}}"
+    if [[ -z "$DATASET_REPO_IDS" ]]; then
+        DATASET_REPO_IDS="$(python -c 'import json,sys; sys.path.insert(0,"src"); from lerobot.datasets.wsa1_5_text import discover_datasets; print(json.dumps(discover_datasets(sys.argv[1])))' "$DATA_ROOT")"
+    fi
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B}"
     TRAIN_ARGS=(
         --policy.type=WSA_1_5
@@ -46,6 +38,8 @@ else
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
         --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-0.0}"
         --policy.dtype=bfloat16
+        --policy.trainable_weights_fp32=false
+        --policy.load_text_encoder=false
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
         --policy.rgb_lr="${RGB_LR:-5e-5}"
@@ -67,7 +61,6 @@ else
         --log_freq="${LOG_FREQ:-10}"
         --wandb.enable="${WANDB_ENABLE:-false}"
     )
-    [[ -z "${WSA_CACHE_DIR:-}" ]] || TRAIN_ARGS+=(--policy.cache_dir="$WSA_CACHE_DIR")
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
 fi
 

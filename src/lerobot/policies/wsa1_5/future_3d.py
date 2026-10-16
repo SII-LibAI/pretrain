@@ -92,8 +92,11 @@ def geometric_feature_loss(student, teacher, valid, *, mse_weight=1.0, cosine_we
         if (target_norm[valid] <= 1e-6).any():
             raise ValueError(f"Valid teacher features have zero/degenerate norm at layer {layer}")
         p = F.normalize(prediction.float(), dim=-1, eps=1e-6)
-        t = F.normalize(target.float(), dim=-1, eps=1e-6)
-        mse = ((p - t).square().mean(-1).masked_fill(~valid, 0)).sum() / valid.sum().clamp_min(1)
+        t = F.normalize(target.detach().float(), dim=-1, eps=1e-6)
+        # Match WSA: LayerNorm MSE avoids the 1 / feature_dim scale of unit-vector MSE.
+        p_ln = F.layer_norm(prediction.float(), (prediction.shape[-1],))
+        t_ln = F.layer_norm(target.detach().float(), (target.shape[-1],))
+        mse = ((p_ln - t_ln).square().mean(-1).masked_fill(~valid, 0)).sum() / valid.sum().clamp_min(1)
         cosine = ((1 - (p * t).sum(-1)).masked_fill(~valid, 0)).sum() / valid.sum().clamp_min(1)
         losses.append(mse_weight * mse + cosine_weight * cosine)
         metrics[f"3d/layer_{layer}_mse"] = mse.detach().item()

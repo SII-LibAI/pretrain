@@ -110,6 +110,11 @@ def update_policy(
         loss, output_dict = policy.forward(batch)
 
 
+    is_wsa = getattr(accelerator.unwrap_model(policy), "name", None) == "WSA_1_5"
+    if is_wsa:
+        from lerobot.policies.wsa1_5.timing import StageTimer
+
+        update_timer = StageTimer(loss.device)
     # Use accelerator's backward method
     accelerator.backward(loss)
 
@@ -123,6 +128,8 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
+    if is_wsa:
+        update_timer.mark("backward_s")
     # Optimizer step
     if accelerator.sync_gradients:
         if getattr(accelerator.unwrap_model(policy), "name", None) == "WSA_1_5" and not torch.isfinite(grad_norm):
@@ -139,6 +146,9 @@ def update_policy(
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
+    if is_wsa:
+        update_timer.mark("optimizer_s")
+        output_dict.update(update_timer.values())
     train_metrics.loss = loss.item()
     if "loss_action" in output_dict:
         train_metrics.loss_action = output_dict["loss_action"]
@@ -152,7 +162,8 @@ def update_policy(
         train_metrics.loss_subtask = output_dict["loss_subtask"]
     if "loss_physical" in output_dict:
         train_metrics.loss_physical = output_dict["loss_physical"]
-    for key in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature"]:
+    for key in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature", "input_s", "mot_s", "pred_s",
+                "backward_s", "optimizer_s"]:
         if key in output_dict:
             setattr(train_metrics, key, output_dict[key])
     train_metrics.grad_norm = grad_norm.item()
@@ -202,7 +213,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
         ddp_kwargs = DistributedDataParallelKwargs(
-            find_unused_parameters=True
+            find_unused_parameters=True,
+            gradient_as_bucket_view=cfg.policy.type == "WSA_1_5",
         )
 
         nccl_timeout_kwargs = InitProcessGroupKwargs(
@@ -390,6 +402,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.type == "WSA_1_5":
         for metric in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature"]:
             train_metrics[metric] = AverageMeter(metric, ":.3f")
+        for metric in ["input_s", "mot_s", "pred_s", "backward_s", "optimizer_s"]:
+            train_metrics[metric] = AverageMeter(metric, ":.3f")
 
 
     # Use effective batch size for proper epoch calculation in distributed training
@@ -401,6 +415,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics,
         initial_step=step,
         accelerator=accelerator,
+        log_episode_progress=cfg.policy.type != "WSA_1_5",
     )
 
     if is_main_process:

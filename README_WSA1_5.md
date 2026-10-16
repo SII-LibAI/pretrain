@@ -40,7 +40,9 @@ print(torch.__version__, torch.cuda.get_device_name(0))
 PY
 ```
 
-默认使用 FP32 可训练参数、BF16 混合精度和 AdamW，另有冻结的 VAE、UMT5、Omega。完整配置的显存和主存开销很大，应先在服务器测量。DDP 每卡保留完整参数与 optimizer 状态，增加 GPU 不会自动降低这部分单卡占用。
+默认 `dtype=bfloat16`、`trainable_weights_fp32=false`：RGB、Motion、3D、VAE 和启用的 Omega 权重使用 BF16。训练默认 `load_text_encoder=false`，只读取提前计算的文本 embedding，不构造 UMT5/tokenizer。损失、部分归一化及 VAE 标准化常数仍保留必要的 FP32 数值运算。
+
+AdamW 使用 `foreach=false` 降低更新时的临时显存；DDP 启用 `gradient_as_bucket_view` 复用梯度与通信 bucket 存储，恢复 optimizer 后仍保持该更新路径。这些设置不修改学习率、betas、eps 或 weight decay。DDP 每卡仍保留完整模型和 optimizer 状态，实际显存峰值须在服务器测量。
 
 ## 2. 下载权重
 
@@ -160,22 +162,28 @@ hand_used：0=左手、1=右手、2=双手。区间不能越界或重叠，子�
 
 当前没有按监督可用性过滤采样。关闭 3D 监督或缺少终点标注时，batch_size=1 可能抽到没有完整未来 VAE 帧组的 episode 尾部而停止。子任务切换不会触发这种时间 padding。需要连续训练这类数据时应补充采样过滤，不能把报错改成零 loss 后继续更新。
 
-### 读取检查
+## 4. 提前计算文本 embedding
+
+子任务标注固定后，在 GPU 服务器运行一次 [文本预计算脚本](util_scripts/precompute_wsa1_5_text_embeddings.py)。它只加载冻结的 UMT5 和 tokenizer，不加载 DiT、VAE、Omega，不做参数更新。
 
 ```bash
+source weights/wsa1_5_weights.env
 export DATA_ROOT=/data/Egodex-LerobotV3
-python util_scripts/discover_wsa1_5_datasets.py --root "$DATA_ROOT"
-python util_scripts/inspect_wsa1_5_dataset.py "$DATA_ROOT/extra/knit_scarf" \
-  --workers 2 --output outputs/inspect_knit_scarf.json
+python util_scripts/precompute_wsa1_5_text_embeddings.py \
+  --data-root "$DATA_ROOT" \
+  --text-encoder-path "$TEXT_ENCODER_PATH" \
+  --tokenizer-path "$TOKENIZER_PATH"
 ```
 
-inspect 只检查默认 schema 的首批，并要求首样本有完整未来 32 帧 motion 和有效 RGB；不适用于缺失 motion 的消融数据，也不代表已经扫描全量数据。
+`--data-root` 可以是单个数据集，也可以是合集目录；脚本扫描该目录本身及任意层级子目录，通过 `meta/info.json` 和 `data/` 识别数据集。训练脚本自动发现数据集时使用同一规则。扫描错误、找不到数据集、错误的标注结构都会报错。
 
-discover 会扫描指定目录本身及任意层级子目录；省略 --root 时扫描当前工作目录。输出为相对于扫描根目录的 JSON repo_id 列表；根目录本身是数据集时包含 `"."`，可直接配合 `dataset.root=该目录` 使用。无 sidecar 的数据集也会列出，缺少 meta/info.json 或 data 目录的不列出，扫描错误会报错。
+每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；另计算一个用于缺失标注帧的空文本 embedding。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
 
-## 4. 启动训练
+默认 `max_text_length=512`，使用 Wan 的 4096 维 UMT5 特征。更改长度时，预计算用 `--max-text-length`，训练同步设置 `--policy.max_text_length`。自定义标注位置时，两边同步指定 `--sidecar-file` 和 `--dataset.sidecar_file`；缓存位置分别用 `--embedding-dir` 和 `--dataset.text_embedding_dir`。
 
-### 单机
+缓存不存在或不匹配时明确报错，不在线补算、不加载 UMT5、不换成零文本。只保留这一种缓存：VAE latent 和 Omega 特征每批在线提取，没有旧版 `policy.cache_dir`、权重指纹或其他缓存兼容路径。重复运行预计算会原子替换对应文本文件；标注已固定时无需再次运行。生成缓存后，训练节点不再需要 UMT5/tokenizer 文件，仍需 Wan/VAE 及启用的 Omega 权重。
+
+## 5. 启动训练
 
 ```bash
 conda activate wsa15
@@ -184,143 +192,122 @@ source weights/wsa1_5_weights.env
 export DATA_ROOT=/data/Egodex-LerobotV3
 export DATASET_REPO_IDS='["extra/knit_scarf"]'
 export OUTPUT_DIR="$PWD/outputs/wsa1_5/run_001"
-export PROC_PER_NODE=1
-export BATCH_SIZE=1
-export NUM_WORKERS=4
-export GRAD_ACCUM_STEPS=1
 
-# 仅打印命令，先核对路径、数据集与消融开关。
+# 只打印启动命令，不加载模型。
 WSA_DRY_RUN=1 bash launch/wsa_1_5_pretrain.sh
 
-# 在服务器正式启动；确保显存足以容纳完整配置。
+# 正式启动；默认单机双卡，每卡 batch=1。
 bash launch/wsa_1_5_pretrain.sh
 ```
 
-省略 DATASET_REPO_IDS 时会扫描合集下全部匹配的数据集；首次建议显式选取已检查的数据。新实验使用新输出目录。
+省略 `DATASET_REPO_IDS` 时扫描 `DATA_ROOT` 下所有匹配的数据集。若 `DATA_ROOT` 本身就是一个数据集，其 repo_id 为 `"."`。多数据集均须提前生成自己的文本缓存。可显式传入 JSON 列表选择子集，路径相对 `DATA_ROOT`。
 
-默认 BF16、gradient checkpointing、600000 个 optimizer steps；SAVE_FREQ=10000、LOG_FREQ=10。梯度累积按实际 optimizer update 计步，有效 batch 为 `BATCH_SIZE × 总进程数 × GRAD_ACCUM_STEPS`。
+启动脚本保留当前已设置的超参数：
 
-| 配置 | 默认值 |
+| 参数 | 启动脚本默认值 |
 | --- | --- |
 | RGB_LR / MOTION_LR / GOAL_LR / HEADS_LR | 均为 `5e-5` |
 | LAMBDA_RGB / LAMBDA_MOTION / LAMBDA_3D | `1.0` / `1.0` / `0.01` |
-| FEATURE_MSE_WEIGHT / FEATURE_COSINE_WEIGHT | `1.0` / `1.0`，作用于 3D 特征损失内部 |
-| SCHEDULER_WARMUP_STEPS / SCHEDULER_DECAY_STEPS | 2000 / 600000，不随较短的 STEPS 自动缩放 |
-| SCHEDULER_DECAY_LR_RATIO | `0.1`，每组最终学习率为该组峰值乘此比例 |
-| PROC_PER_NODE | `2` |
-| WSA_CACHE_DIR | 可选的冻结 VAE、文本、teacher 特征缓存目录 |
-| WANDB_ENABLE | `false` |
+| FEATURE_MSE_WEIGHT / FEATURE_COSINE_WEIGHT | `1.0` / `0.0` |
+| SCHEDULER_WARMUP_STEPS / SCHEDULER_DECAY_STEPS | `2000` / `600000` |
+| PROC_PER_NODE / NODE_COUNT | `2` / `1` |
+| BATCH_SIZE / NUM_WORKERS / GRAD_ACCUM_STEPS | `1` / `4` / `1` |
+| STEPS / SAVE_FREQ / LOG_FREQ | `600000` / `10000` / `10` |
+| WANDB_ENABLE / DIST_LOADING | `false` / `false` |
+| 权重与计算精度 | BF16，`trainable_weights_fp32=false` |
+| 文本编码 | `load_text_encoder=false`，必须有离线文本缓存 |
 
-额外参数直接接在脚本后，例如 `--policy.scheduler_warmup_steps=100 --policy.scheduler_decay_steps=10000`。完整参数见 `python src/lerobot/scripts/lerobot_train.py --help`。
-
-上述默认值对应当前启动脚本；JSON 模板及 policy 类的既有默认值分别保留。也可在启动命令前设置这些环境变量，例如 `LAMBDA_RGB=1 LAMBDA_MOTION=0.5 SCHEDULER_DECAY_LR_RATIO=0.05 bash launch/wsa_1_5_pretrain.sh`。
-
-dataset.streaming 默认 false：当前 WSA adapter 需要随机访问未来窗口、子任务终点及完整帧索引，现有 StreamingLeRobotDataset 是顺序迭代接口，不能直接替换。普通 LeRobot reader 使用 Parquet 内存映射并按需解码视频，false 不表示预先载入全部视频。此版本不支持 streaming=true，设置后会明确报错。
-
-### 多卡与多节点
+各组余弦学习率最终降到峰值的 `0.1`；短实验不会自动缩放 warmup/decay 步数。可通过环境变量覆盖表内大写参数，或把 policy/dataset 参数接在启动命令后；例如：
 
 ```bash
-# 单机四卡，其他环境变量同上。
-PROC_PER_NODE=4 bash launch/wsa_1_5_pretrain.sh
+PROC_PER_NODE=1 BATCH_SIZE=1 bash launch/wsa_1_5_pretrain.sh
 
-# 两节点、每节点四卡：在各节点终端设置，模型/数据/输出路径须一致。
+# 改为单机四卡，梯度累积两次。
+PROC_PER_NODE=4 GRAD_ACCUM_STEPS=2 bash launch/wsa_1_5_pretrain.sh
+
+# 按需改变衰减终点；默认值仍为 0.1。
+bash launch/wsa_1_5_pretrain.sh --policy.scheduler_decay_lr_ratio=0.05
+```
+
+有效 batch 为 `BATCH_SIZE × 总进程数 × GRAD_ACCUM_STEPS`，step 按 optimizer update 计数。JSON 模板见 [configs/wsa1_5_pretrain.json](configs/wsa1_5_pretrain.json)，其中原有学习率、损失权重与 launcher 不完全相同，须按实验选择；JSON 不展开 shell 变量。
+
+`dataset.streaming=false` 是当前随机访问适配器的要求：需要访问未来窗口和子任务终点，现有流式接口不能直接替换。数据按需解码，false 不表示一次加载所有视频；设置 true 会报错。
+
+多节点在每个节点设置相同模型、数据和输出路径，并设置不同 NODE_RANK：
+
+```bash
 export NODE_COUNT=2
 export PROC_PER_NODE=4
-export MASTER_ADDR=10.0.0.1              # 改为节点 0 实际地址
+export MASTER_ADDR=10.0.0.1
 export MASTER_PORT=29500
-export NODE_RANK=0                       # 节点 1 设置为 1
+export NODE_RANK=0   # 另一个节点为 1
 bash launch/wsa_1_5_pretrain.sh
 ```
 
-沿用现有 Accelerate/DDP、采样和 checkpoint 机制。默认 DIST_LOADING=false，各进程访问完整数据；当前不提供自动参数/optimizer 分片。
+### 3D 消融与损失
 
-### 3D 消融
+G 使用 WSA 默认 slot_noise：819 个槽位，每视角 1 camera、16 register、256 patch。输入为 `0.5 × 正弦位置编码 + 0.25 × 标准正态噪声`；G 时间步固定为 `0.5 × num_train_timesteps`，当前为 500。训练时每个样本重新采样，推理/no_grad 使用 seed=0 的固定噪声。Query 自身没有可学习参数，骨干和预测头参与学习。
 
-3D Query 使用 WSA 默认的 slot_noise：共 3×273=819 个槽位，输入为
-`0.5 × 正弦位置编码 + 0.5 × 0.5 × 标准正态噪声`，sigma 固定为 0.5，不跟随 R/M 的 Flow Matching 时间步。
-G 的时间调制使用 `0.5 × scheduler.num_train_timesteps`，当前默认尺度下为 500，与 WSA 默认模式一致。
-训练且开启梯度时，每个样本、每次前向重新采样噪声；推理或 no_grad 时使用 seed=0 的固定噪声，各样本和去噪步骤复用相同初始 G。
-Query 本身没有可学习参数，3D expert 骨干和 feature heads 通过蒸馏监督学习。每视角的监督槽位仍为 1 camera、16 register、256 patch。
-
-3D 监督由 Query 开关和损失权重决定：
-
-| 配置 | G | Teacher、终点图像、3D loss |
+| 设置 | G 联合计算 | Omega / 终点图像 / 3D loss |
 | --- | --- | --- |
 | ENABLE_3D_QUERIES=false | 不创建 | 关闭 |
-| queries=true，LAMBDA_3D=0 | 保留联合前向和推理输出 | 全部关闭 |
-| queries=true，LAMBDA_3D>0 | 参与联合计算 | 开启 |
+| queries=true，LAMBDA_3D=0 | 保留 | 关闭 |
+| queries=true，LAMBDA_3D>0 | 保留 | 开启 |
 
-```bash
-ENABLE_3D_QUERIES=true LAMBDA_3D=0 \
-  OUTPUT_DIR="$PWD/outputs/wsa1_5/queries_no_teacher" bash launch/wsa_1_5_pretrain.sh
+两项 feature 权重同时为零也关闭 3D 监督。无监督 G 冻结并移出优化器；R/M 不读取 G，其 loss 无法训练无监督 G。已删除 `enable_3d_supervision`，用 `lambda_3d=0` 关闭监督。
+
+训练只做一次 O/R/M/G 联合前向：R/M 是 Flow Matching 带噪 latent，G 读取同次隐藏特征；不额外采样未来，真实终点和 teacher 仅作为损失标签。推理每个去噪步骤也包含 G，返回最后一次联合前向的 3D 特征。
+
+3D 各层损失现在与 WSA 公式对齐：
+
+```text
+MSE = mean((LayerNorm(student.float()) - LayerNorm(teacher.float()))²)
+cosine = mean(1 - cosine_similarity(student.float(), teacher.float()))
+loss_3d_feature = 各层有效槽位损失的平均
+               = mean_layers(FEATURE_MSE_WEIGHT × MSE + FEATURE_COSINE_WEIGHT × cosine)
+total_loss = LAMBDA_RGB × loss_rgb_flow + LAMBDA_MOTION × loss_motion_flow
+           + LAMBDA_3D × loss_3d_feature
 ```
 
-两项 feature loss 权重同时为零也关闭监督。无监督 G 冻结并移出优化器；R/M 不读取 G，因此 R/M loss 不训练无监督 G，其输出不能当成已蒸馏几何表征。已删除 enable_3d_supervision 字段，旧 JSON/CLI 中应移除该项；需要关闭监督时设置 lambda_3d=0。
+旧公式对 L2 单位向量逐维求 MSE，2048 维随机预测也只有 `2/2048≈0.001`，量级被维数压低。新公式使用 LayerNorm MSE，独立随机特征的基线约为 2；真实初始化结果取决于特征相关性，不强行设定初始 loss。日志中的 `loss_3d_feature` 是乘 `lambda_3d` 前的值；当前启动配置 MSE=1、cosine=0、lambda_3d=0.01，因此 raw loss 约 2 时对总损失的贡献约 0.02。缺失视角和 padding 不参与归约，teacher 不接收梯度。
 
-若旧配置的 enable_3d_supervision=false，迁移时应同时将 lambda_3d 设为 0，以保持关闭监督的行为。
+### 参数与耗时日志
 
-训练只做一次 O/R/M/G 联合前向：R/M 使用带噪训练状态，G 读取同次隐藏特征；不额外采样未来。推理每个去噪步也包含已启用的 G。关闭 RGB/3D 时，对应预测为 None、有效性 mask 为全 False；关闭 motion 时 future_motion 为 None。
+加载时仅报告权重校验结果；训练前按 RGB/Observation、Motion、Future3D、VAE、UMT5、Omega 汇总参数量，单位 B。默认 UMT5 为 disabled；有 3D 监督时，首次更新前会看到 Omega 路径、加载结果和 ready 日志。
 
-正式训练入口在首次更新前加载启用的 VGGT-Omega，日志明确输出 checkpoint 路径、加载校验结果及 ready 状态；lambda_3d=0 或关闭 Query 时不创建/加载 teacher。Teacher 保持冻结、eval，独立于 policy checkpoint 和优化器；推理不加载 teacher。
+WSA 日志保留 step、sample、loss、grad norm、lr、吞吐、data_s 和总 updt_s，移除 episode/epoch；增加以下秒数，按 log_freq 区间平均：
 
-训练前仅主进程按 RGB/Observation、Motion、Future3D（含 feature heads）、Wan VAE、UMT5、VGGT-Omega 汇总 total/trainable 参数量，单位 B（十亿）。不再打印逐层参数、逐参数插值规则或完整模型结构。启用 3D 监督时，即使目标缓存命中，正式训练入口也会先加载 teacher；缓存仍用于避免重复特征前向。
+| 字段 | 测量范围 |
+| --- | --- |
+| input_s | 当前/未来图像 VAE 编码、Omega 标签提取、读取后的文本准备、Flow Matching 状态及 MoT 输入编码 |
+| mot_s | 一次 O/R/M/G MoT 骨干前向 |
+| pred_s | RGB/Motion 速度预测头及 3D 特征预测头 |
+| backward_s | 反向、梯度同步及裁剪；checkpointing 重算包含在这里 |
+| optimizer_s | 本 micro-batch 的 optimizer/scheduler 和更新收尾；累积时未更新的 micro-batch 会很短 |
 
-## 5. 配置、验证与恢复
+CUDA 阶段使用 event 计时，在读取统计时同步；输入耗时不含 DataLoader 读取缓存的时间，后者属于 data_s。pred_s 是训练这一次 FM 速度预测，不会为计时额外运行多步去噪。updt_s 还包含检查、loss 计算和日志取值，阶段之和不要求严格相等。
 
-### JSON 配置
-
-复制并修改 [配置模板](configs/wsa1_5_pretrain.json) 的数据、权重和输出路径：
-
-```bash
-accelerate launch --num_processes=1 --mixed_precision=bf16 \
-  src/lerobot/scripts/lerobot_train.py --config_path=configs/wsa1_5_pretrain.json
-```
-
-JSON 不展开 shell 环境变量。Policy 注册名是 WSA_1_5，dataset 名是 wsa1_5。改变 queries、expert 尺寸或优化器分组应新开实验，不要修改旧 checkpoint 配置强行续训。
-
-本版已移除旧可学习的 query_tokens，旧版 query_token checkpoint 与 optimizer 状态不能直接续训；严格加载会拒绝该旧参数，应从原始 Wan 权重开启新实验。
-
-### 服务器验证与缓存
-
-以下命令会加载真实模型，其中训练验证会更新参数，**仅在服务器执行**。先修改好 JSON 路径，每次诊断使用不同输出目录。
-
-```bash
-python util_scripts/verify_wsa1_5_vae.py --vae-path "$VAE_PATH" --execute-on-server
-python util_scripts/validate_wsa1_5_server.py \
-  --config-path configs/wsa1_5_pretrain.json --execute-on-server \
-  --steps 1 --reload-checkpoint --report outputs/wsa1_5_smoke.json
-
-# JSON 已设置 policy.cache_dir 时，可预计算读到的 batch；不更新参数。
-python util_scripts/validate_wsa1_5_server.py \
-  --config-path configs/wsa1_5_pretrain.json --execute-on-server \
-  --cache-only --cache-batches 100 --report outputs/wsa1_5_cache.json
-```
-
-诊断工具为单进程，短训练显式采用短 LR 计划；DDP 用正式 launcher 验证。缓存按内容、元数据、dtype、处理版本和冻结权重指纹区分并校验完整性。开启 3D 监督时，当前计算 teacher 缓存指纹仍需可读的 Omega 文件，不能只留缓存就删除 teacher 权重。
-
-### 断点恢复
-
-Checkpoint 含 pretrained_model 和 training_state；checkpoints/last 指向最近保存的 step。
+## 6. 断点恢复与推理
 
 ```bash
 export RESUME_CONFIG="$PWD/outputs/wsa1_5/run_001/checkpoints/last/pretrained_model/train_config.json"
-PROC_PER_NODE=4 bash launch/wsa_1_5_pretrain.sh
-
-# 下一次从头启动新实验前清除恢复模式。
+bash launch/wsa_1_5_pretrain.sh
 unset RESUME_CONFIG
 ```
 
-必须传保存的 **train_config.json**。恢复包含 optimizer、scheduler、RNG 和 step。完整 policy 已含 Wan/VAE/UMT5 权重，但 tokenizer 路径仍须可用；启用 3D 监督时还需要 Omega。推理不加载 Omega。
+使用本版本保存的 train_config.json，恢复 optimizer、scheduler、RNG 和 step。恢复模式沿用保存的配置，不重新应用 launcher 的默认值。文本缓存继续保留在各数据集；启用 3D 监督时仍需独立的 Omega 文件。默认完整 policy 含 Wan/VAE，不含 UMT5 或 teacher。
 
-## 6. 本地检查与限制
+旧版本带 UMT5 参数、通用缓存配置、FP32 optimizer 状态或可学习 query 的 checkpoint 不能直接当作本版继续训练；本轮变更应从 Wan 权重新开实验，不修改旧配置强行恢复。
+
+推理不加载 Omega。默认无文本编码器时，从 `lerobot.datasets.wsa1_5_text.TextEmbeddingCache` 读取对应文本的 `(embedding, valid)`，加 batch 维后传给 `predict_future(..., text_embedding=embedding[None], text_valid=valid[None])`；输入仍只来自当前 RGB 和文本。`load_text_encoder=true` 保留给显式在线冻结编码的实验，其完整 checkpoint 会包含 UMT5；不能仅给默认离线训练所得 checkpoint 改这个开关，严格加载会拒绝缺失的文本编码器参数。
+
+## 7. 本地检查范围
 
 ```bash
-# 小型随机模块和测试数据，不加载预训练权重、不执行 optimizer.step。
+# 小型随机模块和合成数据；不加载真实权重、不更新 optimizer。
 python -m pytest tests/test_wsa1_5*.py -q --basetemp outputs/pytest_wsa15
 ```
 
-本轮按 ponytail.md 核对调用方、配置、注册和测试，修复小数索引截断、空/非标准扩展名权重指纹，以及关闭分支后 mask 仍有效的问题；合并 VAE 返回校验，删除重复正数检查和无仓库调用方的内部 scheduler target 方法。保留权重、mask、NaN/Inf、缓存及无监督 batch 检查，以及 policy/CLI 接口和恢复兼容字段。
+已删除旧 WSA VAE 验证、训练/update 验证和数据 inspect 工具；保留 ModelScope 下载脚本及离线文本预计算脚本。检查覆盖缓存与实际提示词一致性、缺失/非法 embedding 拒绝、BF16 模块构造、WSA 3D 损失公式、mask/梯度及启动参数。
 
-本地检查不覆盖 GPU 安装、真实权重加载、完整训练、DDP、显存容量和 checkpoint 恢复。这些仍需服务器验证；motion 原始物理误差也尚未验证。
-
-上游依据：[Wan ModelScope](https://modelscope.cn/models/Wan-AI/Wan2.2-TI2V-5B)、[Omega ModelScope](https://modelscope.cn/models/facebook/VGGT-Omega)、[Omega 固定版本依赖](https://github.com/facebookresearch/vggt-omega/blob/48b23c8ce72c9a8fcf987f0d7f43d8e4870759f6/requirements.txt)、[ModelScope 下载接口](https://github.com/modelscope/modelscope/blob/v1.34.0/modelscope/hub/snapshot_download.py)、[PyTorch 安装](https://docs.pytorch.org/get-started/previous-versions/)。使用前遵守各仓库许可证和访问要求。
+本地不验证真实模型执行、CUDA 显存峰值、完整 DDP 训练或 checkpoint 续训；这些须在服务器验证。Motion 物理单位和视频压缩误差仍由数据制作侧确认。

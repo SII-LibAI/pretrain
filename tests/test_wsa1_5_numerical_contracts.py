@@ -3,13 +3,10 @@ import json
 
 import pytest
 import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
 
 from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.wsa1_5 import WSA1_5Dataset
 from lerobot.policies.wsa1_5.attention import build_causal_attention_mask, masked_attention
-from lerobot.policies.wsa1_5.cache import ArtifactCache
 from lerobot.policies.wsa1_5.future_3d import geometric_feature_loss
 from lerobot.policies.wsa1_5.initialization import interpolate_wan_state
 from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy
@@ -122,18 +119,6 @@ def test_all_invalid_batch_is_not_an_optimizer_update():
     with pytest.raises(ValueError, match="valid observed RGB"):
         policy.encode_observation(image, ["test"], torch.zeros_like(image[:, :1], dtype=torch.bool))
 
-
-def test_cache_verifies_finite_content_and_checksum(tmp_path):
-    cache = ArtifactCache(tmp_path)
-    with pytest.raises(FloatingPointError):
-        cache.get_or_compute("bad", {}, lambda: {"x": torch.tensor([float("inf")])})
-    cache.get_or_compute("good", {}, lambda: {"x": torch.ones(2)})
-    path = next((tmp_path / "good").glob("*.safetensors"))
-    with safe_open(path, framework="pt") as reader:
-        metadata = reader.metadata()
-    save_file({"x": torch.zeros(2)}, path, metadata=metadata)
-    with pytest.raises(RuntimeError, match="checksum"):
-        cache.get_or_compute("good", {}, lambda: pytest.fail("A corrupt cache must not recompute silently"))
 
 
 @pytest.mark.parametrize("key,source_shape,target_shape", [

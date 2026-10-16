@@ -104,7 +104,7 @@ class WorldFlow(nn.Module):
         return states, experts, pre_states, obs_n
 
     def velocity(self, observed_latent, text, text_valid, rgb_latent=None, motion_latent=None,
-                 rgb_t=None, motion_t=None, *, future_3d=None, goal_view_valid=None, **validity):
+                 rgb_t=None, motion_t=None, *, future_3d=None, goal_view_valid=None, timer=None, **validity):
         states, experts, pre, obs_n = self.prepare_states(observed_latent, text, text_valid,
                                                        rgb_latent, motion_latent, rgb_t, motion_t, **validity)
         capture_layers = ()
@@ -115,7 +115,11 @@ class WorldFlow(nn.Module):
                                              num_train_timesteps=self.scheduler.num_train_timesteps)
             experts["G"] = future_3d
             capture_layers = future_3d.student_layers
+        if timer is not None:
+            timer.mark("input_s")
         tokens, captured = self.mot(states, experts, capture_layers=capture_layers)
+        if timer is not None:
+            timer.mark("mot_s")
         result = {}
         if "R" in pre:
             full = torch.cat([tokens["O"][:, :obs_n], tokens["R"]], 1)
@@ -129,6 +133,8 @@ class WorldFlow(nn.Module):
             result["motion"] = torch.cat([torch.zeros_like(motion[:, :, :1]), motion[:, :, 1:]], 2)
         if future_3d is not None:
             result["3d"] = future_3d.project(captured)
+        if timer is not None:
+            timer.mark("pred_s")
         return result
 
     def training_state(self, clean, condition, timestep=None, noise=None):

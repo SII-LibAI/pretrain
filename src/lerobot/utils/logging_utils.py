@@ -96,6 +96,7 @@ class MetricsTracker:
         "episodes",
         "epochs",
         "accelerator",
+        "log_episode_progress",
     ]
 
     def __init__(
@@ -106,6 +107,7 @@ class MetricsTracker:
         metrics: dict[str, AverageMeter],
         initial_step: int = 0,
         accelerator: Callable | None = None,
+        log_episode_progress: bool = True,
     ):
         self.__dict__.update(dict.fromkeys(self.__keys__))
         self._batch_size = batch_size
@@ -120,6 +122,7 @@ class MetricsTracker:
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
         self.accelerator = accelerator
+        self.log_episode_progress = log_episode_progress
 
     def __getattr__(self, name: str) -> int | dict[str, AverageMeter] | AverageMeter | Any:
         if name in self.__dict__:
@@ -153,10 +156,8 @@ class MetricsTracker:
             f"step:{format_big_number(self.steps, precision=1)}",
             # number of samples seen during training
             f"sample:{format_big_number(self.samples)}",
-            # number of episodes seen during training
-            f"episode:{format_big_number(self.episodes)}",
-            # number of time all unique samples are seen
-            f"epoch:{self.epochs:.2f}",
+            *([f"episode:{format_big_number(self.episodes)}", f"epoch:{self.epochs:.2f}"]
+              if self.log_episode_progress else []),
             *[str(m) for m in self.metrics.values()],
         ]
         return " | ".join(display_list)
@@ -168,8 +169,7 @@ class MetricsTracker:
         return {
             "steps": self.steps,
             "samples": self.samples,
-            "episodes": self.episodes,
-            "epochs": self.epochs,
+            **({"episodes": self.episodes, "epochs": self.epochs} if self.log_episode_progress else {}),
             **{k: m.avg if use_avg else m.val for k, m in self.metrics.items()},
         }
 

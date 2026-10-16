@@ -15,11 +15,18 @@
 # limitations under the License.
 
 
-from torch.optim import Optimizer
+from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
+
+
+def _disable_adamw_foreach(optimizer: Optimizer) -> None:
+    # CUDA foreach creates parameter-sized temporaries; keep resume on the same low-peak path.
+    optimizer.defaults["foreach"] = False
+    for group in optimizer.param_groups:
+        group["foreach"] = False
 
 
 def make_optimizer_and_scheduler(
@@ -36,5 +43,8 @@ def make_optimizer_and_scheduler(
     """
     params = policy.get_optim_params() if cfg.use_policy_training_preset else policy.parameters()
     optimizer = cfg.optimizer.build(params)
+    if cfg.policy.type == "WSA_1_5" and isinstance(optimizer, AdamW):
+        _disable_adamw_foreach(optimizer)
+        optimizer.register_load_state_dict_post_hook(_disable_adamw_foreach)
     lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps) if cfg.scheduler is not None else None
     return optimizer, lr_scheduler

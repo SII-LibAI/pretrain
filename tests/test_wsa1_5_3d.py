@@ -239,3 +239,18 @@ def test_missing_views_and_padding_excluded_from_loss():
     torch.testing.assert_close(loss, altered, atol=0, rtol=0)
     loss.backward()
     assert not student[4].grad[:, 1:].any()
+
+
+def test_geometric_mse_matches_wsa_layernorm_formula_and_scale():
+    generator = torch.Generator().manual_seed(42)
+    prediction = torch.randn(1, 3, 7, 2048, generator=generator, requires_grad=True)
+    target = torch.randn(1, 3, 7, 2048, generator=generator, requires_grad=True)
+    valid = torch.ones(1, 3, 7, dtype=torch.bool)
+    loss, metrics = geometric_feature_loss({4: prediction}, {4: target}, valid, cosine_weight=0)
+    expected = torch.nn.functional.mse_loss(torch.nn.functional.layer_norm(prediction, (2048,)),
+                                            torch.nn.functional.layer_norm(target.detach(), (2048,)))
+    torch.testing.assert_close(loss, expected)
+    assert 1.8 < loss.item() < 2.2
+    assert .9 < metrics["3d/layer_4_cosine"] < 1.1
+    loss.backward()
+    assert prediction.grad.abs().sum() > 0 and target.grad is None

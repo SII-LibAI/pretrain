@@ -3,6 +3,8 @@
     "type": "WSA_1_5",
     "device": "cuda",
     "dtype": "bfloat16",
+    "trainable_weights_fp32": false,
+    "load_text_encoder": false,
     "push_to_hub": false,
     "enable_3d_queries": true,
     "lambda_3d": 1.0,

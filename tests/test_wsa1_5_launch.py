@@ -12,7 +12,7 @@ import pytest
 
 from lerobot.datasets.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config
-from util_scripts.discover_wsa1_5_datasets import discover
+from lerobot.datasets.wsa1_5_text import discover_datasets as discover
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -33,14 +33,7 @@ def test_discovery_includes_root_and_all_nested_levels(tmp_path, monkeypatch):
     (tmp_path / "not_a_dataset/data").mkdir(parents=True)
     assert discover(tmp_path) == sorted(repos)
     monkeypatch.chdir(tmp_path)
-    assert discover() == sorted(repos)
-
-
-def test_discovery_cli_defaults_to_current_directory(tmp_path):
-    add_dataset(tmp_path)
-    result = subprocess.run([sys.executable, str(PROJECT / "util_scripts/discover_wsa1_5_datasets.py")],
-                            cwd=tmp_path, capture_output=True, text=True, check=True, encoding="utf-8")
-    assert json.loads(result.stdout) == ["."]
+    assert discover(Path.cwd()) == sorted(repos)
 
 
 def test_discovery_errors_are_not_an_empty_dataset_list(tmp_path, monkeypatch):
@@ -49,10 +42,10 @@ def test_discovery_errors_are_not_an_empty_dataset_list(tmp_path, monkeypatch):
     with pytest.raises(FileNotFoundError, match="No LeRobot"):
         discover(tmp_path)
 
-    def denied(root, *, onerror):
+    def denied(root, *, followlinks, onerror):
         onerror(PermissionError("unreadable dataset directory"))
 
-    monkeypatch.setattr("util_scripts.discover_wsa1_5_datasets.os.walk", denied)
+    monkeypatch.setattr("lerobot.datasets.wsa1_5_text.os.walk", denied)
     with pytest.raises(PermissionError, match="unreadable"):
         discover(tmp_path)
 
@@ -65,14 +58,14 @@ def launch(monkeypatch):
         pytest.skip("Bash is unavailable")
     for name in ["RESUME_CONFIG", "RGB_LR", "MOTION_LR", "GOAL_LR", "HEADS_LR", "LAMBDA_RGB",
                  "LAMBDA_MOTION", "LAMBDA_3D", "FEATURE_MSE_WEIGHT", "FEATURE_COSINE_WEIGHT",
-                 "SCHEDULER_WARMUP_STEPS", "SCHEDULER_DECAY_STEPS", "SCHEDULER_DECAY_LR_RATIO",
-                 "PROC_PER_NODE", "NODE_COUNT", "WSA_CACHE_DIR", "WEIGHT_RULES_PATH", "ENABLE_3D_QUERIES"]:
+                 "SCHEDULER_WARMUP_STEPS", "SCHEDULER_DECAY_STEPS",
+                 "PROC_PER_NODE", "NODE_COUNT", "WEIGHT_RULES_PATH", "ENABLE_3D_QUERIES"]:
         monkeypatch.delenv(name, raising=False)
 
-    def run(**overrides):
+    def run(extra_args=(), **overrides):
         env = {**os.environ, "WSA_DRY_RUN": "1", "CONDA_PREFIX": "/tmp/wsa15-conda",
                "DATASET_REPO_IDS": '["fixture"]', **overrides}
-        result = subprocess.run([bash, "launch/wsa_1_5_pretrain.sh"], cwd=PROJECT, env=env,
+        result = subprocess.run([bash, "launch/wsa_1_5_pretrain.sh", *extra_args], cwd=PROJECT, env=env,
                                 capture_output=True, text=True, check=True, encoding="utf-8")
         command = shlex.split(result.stdout)
         return dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
@@ -94,7 +87,8 @@ def test_launcher_preserves_assigned_defaults_and_removes_supervision_switch(lau
     assert config.lambda_3d == 0.01
     assert [config.rgb_lr, config.motion_lr, config.goal_lr, config.heads_lr] == [5e-5] * 4
     assert config.lambda_rgb == config.lambda_motion == 1
-    assert config.feature_mse_weight == config.feature_cosine_weight == 1
+    assert (config.feature_mse_weight, config.feature_cosine_weight) == (1, 0)
+    assert not config.trainable_weights_fp32 and not config.load_text_encoder
     assert config.scheduler_warmup_steps == 2000
     assert config.scheduler_decay_steps == 600000
     assert config.scheduler_decay_lr_ratio == 0.1
@@ -107,7 +101,7 @@ def test_launcher_loss_and_decay_overrides_reach_policy(launch):
     args = launch(LAMBDA_RGB="0.7", LAMBDA_MOTION="0.3", LAMBDA_3D="0",
                   FEATURE_MSE_WEIGHT="0.4", FEATURE_COSINE_WEIGHT="0.6",
                   SCHEDULER_WARMUP_STEPS="10", SCHEDULER_DECAY_STEPS="100",
-                  SCHEDULER_DECAY_LR_RATIO="0.02")
+                  extra_args=["--policy.scheduler_decay_lr_ratio=0.02"])
     config = parse_policy(args)
     assert (config.lambda_rgb, config.lambda_motion, config.lambda_3d) == (0.7, 0.3, 0)
     assert (config.feature_mse_weight, config.feature_cosine_weight) == (0.4, 0.6)

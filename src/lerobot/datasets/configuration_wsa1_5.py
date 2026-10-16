@@ -21,6 +21,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     motion_width: int = 160
     motion_key: str = "observation.motion"
     sidecar_file: str = "meta/sidecar.json"
+    text_embedding_dir: str = "meta/wsa1_5_text_embeddings"
     use_imagenet_stats: bool = False  # Normalization is explicit in the adapter.
     use_external_stats: bool = False
     motion_log_every: int = 1000

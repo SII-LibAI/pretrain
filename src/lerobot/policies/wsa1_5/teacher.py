@@ -12,8 +12,6 @@ from .vendor.omega_preprocessing import (
     _crop_to_supported_aspect_ratio, _max_size_target_shape, _pad_images_to_common_size,
 )
 
-OMEGA_PREPROCESS_VERSION = "omega.48b23c8.max_size.256.patch16.v1"
-
 
 @dataclass(frozen=True)
 class ViewGeometry:
@@ -117,7 +115,7 @@ class OmegaTeacher:
             load_report(model, read_checkpoint(self.checkpoint_path), name="VGGT-Omega", strict=True)
             if model.aggregator.patch_token_start != 17 or not set(self.layers).issubset(model.aggregator.cached_layer_indices):
                 raise ValueError("Omega token order/cached layers differ from audited official source")
-            self.model = model.to(device).eval().requires_grad_(False)
+            self.model = model.to(device=device, dtype=self.dtype).eval().requires_grad_(False)
             logging.info("[WSA teacher] VGGT-Omega ready device=%s compute_dtype=%s frozen=True", device, self.dtype)
         else:
             self.model.to(device).eval()
