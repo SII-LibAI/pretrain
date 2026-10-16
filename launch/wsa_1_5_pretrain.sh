@@ -17,10 +17,22 @@ export HF_LEROBOT_HOME="$PWD/data"
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egodex-LerobotV3/extra/insert_remove_usb}"
-    DATASET_REPO_IDS="${DATASET_REPO_IDS:-${DATASET_REPO_ID:-}}"
-    if [[ -z "$DATASET_REPO_IDS" ]]; then
-        DATASET_REPO_IDS="$(python -c 'import json,sys; sys.path.insert(0,"src"); from lerobot.datasets.wsa1_5_text import discover_datasets; print(json.dumps(discover_datasets(sys.argv[1])))' "$DATA_ROOT")"
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/umi/fastumi/dual_arm}"
+    DATASET_REPO_ID="${DATASET_REPO_ID:-}}"
+    DATASET_REPO_ID="$(
+    {
+        find -L ${DATA_ROOT} -type d -name data 2>/dev/null \
+        | while read -r d; do
+            root="$(dirname "$d")"
+            if [[ -d "$root/meta" && -d "$root/videos" ]]; then
+                echo "${root#data/}"
+            fi
+            done
+    } | shuf | tr '\n' ' ' | xargs
+    )"
+    if [[ -z "${DATASET_REPO_ID}" ]]; then
+    echo "No annotated LeRobotV3 datasets found under ${DATASET_ROOT}" >&2
+    exit 1
     fi
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B}"
     TRAIN_ARGS=(
@@ -38,8 +50,7 @@ else
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
         --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-0.0}"
         --policy.dtype=bfloat16
-        --policy.trainable_weights_fp32=false
-        --policy.load_text_encoder=false
+        --policy.load_text_encoder=true
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
         --policy.rgb_lr="${RGB_LR:-5e-5}"
@@ -50,7 +61,7 @@ else
         --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-600000}"
         --dataset.type=wsa1_5
         --dataset.root="$DATA_ROOT"
-        --dataset.repo_id="$DATASET_REPO_IDS"
+        --dataset.repo_id="$DATASET_REPO_ID"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"
         --dataset.dist_loading="${DIST_LOADING:-false}"
         --output_dir="${OUTPUT_DIR:-outputs/wsa1_5/$(date +%Y_%m_%d_%H_%M_%S)}"

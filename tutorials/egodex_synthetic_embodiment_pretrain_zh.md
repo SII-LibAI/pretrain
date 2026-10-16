@@ -58,10 +58,16 @@ find -L "/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/Int
 ```bash
 
 python /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/util_scripts/compute_synthetic_embodiment_stats.py \
-  --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/repos/egodex.txt \
-  --output-dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/stats/egodex_egoverse  \
-  --chunk-size 50 --num-workers 50 \
-  --embodiment rm75
+  --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/repos/human.txt \
+  --output-dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/stats/humandata  \
+  --chunk-size 50 \
+  --num-workers 55 \
+  --embodiment arx_l5 \
+  --embodiment franka \
+  --embodiment human_eef \
+  --embodiment ur7e \
+  --embodiment rm75 \
+  --embodiment piper
 ```
 ### 1.4 核对启动参数并训练
 

@@ -27,9 +27,8 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 POLICY="internvla_a1_5"
 VLM_MODEL_PATH="${VLM_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/qwen3.5-2b}"
 DATASET_ROOT="${DATASET_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego}"
-STATS_DIR="${STATS_DIR:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/stats/egodex_egoverse}"
-# EMBODIMENTS="${EMBODIMENTS:-[\"piper\",\"arx_l5\",\"human_eef\"]}"
-EMBODIMENTS="${EMBODIMENTS:-[\"human_eef\"]}"
+STATS_DIR="${STATS_DIR:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/stats/humandata}"
+EMBODIMENTS="${EMBODIMENTS:-[\"piper\",\"arx_l5\",\"human_eef\",\"franka\"]}"
 CHUNK_SIZE="${CHUNK_SIZE:-50}"
 BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-12}"
 
@@ -112,11 +111,11 @@ ARGS=(
   --dataset.tokenize_state=true
   --dataset.max_prompt_length=650
   --dataset.video_backend=pyav
-
+  --dataset.use_imagenet_stats=false
   --seed=42
   --batch_size="${BATCH_SIZE_PER_DEVICE}"
   --steps=200000
-  --save_freq=40000
+  --save_freq=50000
   --log_freq=100
 
   --wandb.enable=true

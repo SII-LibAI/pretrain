@@ -24,7 +24,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     text_embedding_dir: str = "meta/wsa1_5_text_embeddings"
     use_imagenet_stats: bool = False  # Normalization is explicit in the adapter.
     use_external_stats: bool = False
-    motion_log_every: int = 1000
+    motion_log_every: int = 10000
 
     def __post_init__(self):
         super().__post_init__()

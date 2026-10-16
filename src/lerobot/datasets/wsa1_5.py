@@ -82,7 +82,7 @@ def condition_text(episode, subtask):
     instruction = subtask.get("subtask_text", "") or ""
     hand = HAND_NAMES.get(subtask.get("hand_used"), "")
     scene = episode.get("scene", "") or ""
-    return f"Task: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
+    return f"You are a world modeling agent observing an interacting through multi-view video observations.:Task: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
 
 
 class LoadedEpisodeMetadata:
@@ -249,6 +249,7 @@ class WSA1_5Dataset(Dataset):
     def _decode(self, key, timestamps, ep):
         feature = self.meta.features.get(key)
         if not key or feature is None:
+            logging.warning("No motion in",self.repo_id)
             return torch.zeros(len(timestamps), 3, 16, 16), torch.zeros(len(timestamps), dtype=torch.bool)
         h, w, c = feature["shape"]
         if c != 3:
@@ -281,11 +282,9 @@ class WSA1_5Dataset(Dataset):
         normalized = imagenet_normalize(canvas)
         normalized = normalized.masked_fill(~pixels_valid, 0)
         motion, motion_valid = self._decode(self.config.motion_key, future_ts, segment.episode)
-        self._motion_reads += 1
-        if self.config.motion_log_every > 0 and self._motion_reads % self.config.motion_log_every == 1:
-            logging.info("[WSA motion codec] repo=%s ep=%s decoded=[%.6f,%.6f] mean=%.6f std=%.6f "
-                         "uint8_quantization_bound=%.6f physical_scale=unknown",
-                         self.repo_id, segment.episode, motion.min(), motion.max(), motion.mean(), motion.std(), 0.5 / 255)
+        # self._motion_reads += 1
+        # if self.config.motion_log_every > 0 and self._motion_reads % self.config.motion_log_every == 1:
+        #     logging.info("[WSA motion] repo=%s ep=%s decoded=[%.6f,%.6f]",self.repo_id, segment.episode, motion.min(), motion.max())
         motion = F.interpolate(motion, size=(self.config.motion_height, self.config.motion_width),
                                mode="bilinear", align_corners=False)
         motion_valid &= valid_time

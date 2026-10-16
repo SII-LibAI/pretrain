@@ -1,13 +1,11 @@
 
 from pathlib import Path
 
-root = Path("/inspire/qb-ilm/project/embodied-basic-model/zhangjianing-253108140206/evaluation/RoboTwin/egopretrain-onlyeef/robotwin/demo_randomized")
+root = Path("/inspire/qb-ilm/project/embodied-basic-model/zhangjianing-253108140206/evaluation/RoboTwin/egopretrain/robotwin/demo_randomized")
 expected_tasks, episodes = 50, 100
 expected_ids = set(range(1, episodes + 1))
 tasks = sorted(p for p in root.iterdir() if p.is_dir())
 
-if len(tasks) != expected_tasks:
-    print (f"任务数不完整：{len(tasks)}/{expected_tasks}")
 
 total_success = 0
 for task in tasks:

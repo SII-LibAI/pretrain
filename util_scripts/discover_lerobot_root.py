@@ -35,11 +35,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parent-dir", type=Path, required=True)
     parser.add_argument("--output-file", type=Path, required=True)
-    parser.add_argument(
-        "--annotation-file",
-        default="meta/annotations/action.parquet",
-        help="Annotation path relative to each dataset root.",
-    )
     args = parser.parse_args()
     roots = discover_lerobot_roots(args.parent_dir, args.annotation_file)
     write_dataset_roots(args.output_file, roots)
