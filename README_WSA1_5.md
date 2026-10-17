@@ -24,11 +24,11 @@ cd /path/to/InternVLA-A-series
 
 # Ubuntu；已有 Git 和 FFmpeg 时跳过。
 sudo apt-get update && sudo apt-get install -y git ffmpeg
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install torch==2.6.0 torchvision==0.21.0 \
+pip install --upgrade pip setuptools wheel
+pip install torch==2.6.0 torchvision==0.21.0 \
   --index-url https://download.pytorch.org/whl/cu124 \
   --extra-index-url https://pypi.org/simple
-python -m pip install -c configs/wsa1_5_constraints.txt \
+pip install -c configs/wsa1_5_constraints.txt \
   -e '.[wsa1_5,wsa1_5_download]'
 
 # 安装已核对版本的 Omega 实现；不下载模型权重。

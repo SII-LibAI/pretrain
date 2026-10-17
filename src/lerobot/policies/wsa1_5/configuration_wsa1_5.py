@@ -21,7 +21,7 @@ class WSA1_5Config(PreTrainedConfig):
     load_text_encoder: bool = False
     rgb_hidden_dim: int = 3072
     rgb_ffn_dim: int = 14336
-    motion_hidden_dim: int = 1024
+    motion_hidden_dim: int = 768
     motion_ffn_dim: int = 4096
     goal_hidden_dim: int = 768
     goal_ffn_dim: int = 3072
@@ -36,7 +36,7 @@ class WSA1_5Config(PreTrainedConfig):
     rgb_width: int = 320
     motion_height: int = 192
     motion_width: int = 160
-    future_frames: int = 32
+    future_frames: int = 16
     teacher_layers: tuple[int, ...] = (4, 11, 17, 23)
     student_layers: tuple[int, ...] | None = None
     enable_rgb: bool = True
@@ -106,8 +106,6 @@ class WSA1_5Config(PreTrainedConfig):
             raise ValueError("scheduler_decay_lr_ratio must be within [0, 1]")
         if self.dtype not in {"float32", "bfloat16", "float16"}:
             raise ValueError("Unsupported WSA dtype")
-        if self.future_frames != 32 or self.n_obs_steps != 1:
-            raise ValueError("WSA1.5 first version requires one observation and 32 future frames")
         if not any((self.enable_rgb, self.enable_motion, self.enable_3d_queries)):
             raise ValueError("Enable at least one supervised modality")
         # Accept serialized legacy configs while making their new semantics explicit.
@@ -175,7 +173,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     ])
     # Optional source keys in precisely the same order; empty entries mean absent.
     view_keys: list[str] = field(default_factory=list)
-    future_frames: int = 32
+    future_frames: int = 16
     frame_stride: int = 1
     rgb_height: int = 384
     rgb_width: int = 320
@@ -208,8 +206,6 @@ class WSA1_5DatasetConfig(DatasetConfig):
         present = [key for key in self.view_keys if key]
         if len(set(present)) != len(present):
             raise ValueError("A source RGB view cannot occupy two slots")
-        if self.future_frames != 32 or self.frame_stride <= 0:
-            raise ValueError("First version requires 32 future frames and a positive frame_stride")
         if self.rgb_height % 3 or self.rgb_width % 2:
             raise ValueError("WSA layout requires height divisible by 3 and even width")
         if min(self.rgb_height, self.rgb_width, self.motion_height, self.motion_width) <= 0:

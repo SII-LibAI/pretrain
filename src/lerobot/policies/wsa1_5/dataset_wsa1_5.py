@@ -239,7 +239,6 @@ class WSA1_5Dataset(Dataset):
     def _decode(self, key, timestamps, ep):
         feature = self.meta.features.get(key)
         if not key or feature is None:
-            logging.warning("No motion in %s", self.repo_id)
             return torch.zeros(len(timestamps), 3, 16, 16), torch.zeros(len(timestamps), dtype=torch.bool)
         h, w, c = feature["shape"]
         if c != 3:
