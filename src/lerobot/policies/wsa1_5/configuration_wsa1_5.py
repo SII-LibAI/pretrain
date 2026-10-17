@@ -7,6 +7,8 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import MultiGroupCosineDecayWithWarmupSchedulerConfig
 
+from .temporal import TemporalLayout
+
 
 @PreTrainedConfig.register_subclass("WSA_1_5")
 @dataclass
@@ -73,6 +75,9 @@ class WSA1_5Config(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        TemporalLayout(future_frames=self.future_frames)
+        if self.n_obs_steps != 1:
+            raise ValueError("Only one observed RGB timepoint is supported")
         for name in ["trainable_weights_fp32", "load_text_encoder"]:
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be boolean")
@@ -188,6 +193,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        TemporalLayout(future_frames=self.future_frames)
         if self.streaming:
             raise ValueError("WSA endpoint sampling requires map-style LeRobot data")
         if self.use_imagenet_stats or self.use_external_stats or self.image_transforms.enable:

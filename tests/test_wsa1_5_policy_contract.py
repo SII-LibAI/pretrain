@@ -20,11 +20,11 @@ from test_wsa1_5_dataset import make_data
 from test_wsa1_5_experts import small_flow, inputs
 
 
-def small_config(**kwargs):
+def small_config(*, future_frames=32, **kwargs):
     return WSA1_5Config(device="cpu", dtype="float32", push_to_hub=False,
                        rgb_hidden_dim=16, rgb_ffn_dim=32, motion_hidden_dim=12, motion_ffn_dim=24,
                        goal_hidden_dim=10, goal_ffn_dim=20, num_layers=3, num_heads=2,
-                       head_dim=8, latent_channels=4, text_dim=8, freq_dim=8, **kwargs)
+                       head_dim=8, latent_channels=4, text_dim=8, freq_dim=8, future_frames=future_frames, **kwargs)
 
 
 def small_policy(**kwargs):
@@ -32,7 +32,7 @@ def small_policy(**kwargs):
     student = Future3DExpert(10, 20, 3, 2, 8, 8)
     # Explicit small random components only. No VAE, UMT5, Omega, weights or
     # optimizer are constructed, and pixel-space execution remains unavailable.
-    return WSA1_5_Policy(config, components=WorldComponents(small_flow(), student))
+    return WSA1_5_Policy(config, components=WorldComponents(small_flow(future_frames=config.future_frames), student))
 
 
 def test_real_registries_and_serialization(tmp_path):
@@ -52,7 +52,7 @@ def test_dataset_and_policy_configs_share_module_and_roundtrip(tmp_path):
     assert WSA1_5DatasetConfig.__module__ == WSA1_5Config.__module__
     cfg = TrainPipelineConfig(policy=small_config(), dataset=WSA1_5DatasetConfig(
         repo_id="nested/fixture", root="collection", view_keys=["rgb", "", ""],
-        frame_stride=2, text_embedding_dir="meta/custom_text", motion_log_every=10000))
+        frame_stride=2, future_frames=32, text_embedding_dir="meta/custom_text", motion_log_every=10000))
     path = tmp_path / "train_config.json"
     path.write_text(json.dumps(draccus.encode(cfg)), encoding="utf-8")
     with draccus.config_type("json"):

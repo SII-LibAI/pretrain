@@ -55,7 +55,7 @@ def test_omega_batches_all_samples_with_wsa_repeated_missing_cameras(monkeypatch
     assert not result[4][~mask].any() and not result[4].is_inference()
 
 
-@pytest.mark.parametrize("frames", [1, 9])
+@pytest.mark.parametrize("frames", [1, 9, 17, 33])
 def test_wan_vae_real_tiny_codec_batches_match_individual_encoding(frames):
     # Construct only a tiny random codec; never instantiate the pretrained 5B VAE.
     torch.manual_seed(18)
@@ -72,6 +72,8 @@ def test_wan_vae_real_tiny_codec_batches_match_individual_encoding(frames):
     assert all(value is None for value in wrapper.model._enc_feat_map)
     expected = torch.cat([vae.encode(video[None]) for video in videos])
     torch.testing.assert_close(batch, expected, atol=1e-5, rtol=1e-5)
+    decoded = vae.decode(batch)
+    assert decoded.shape == videos.shape and torch.isfinite(decoded).all()
     # Different batch/temporal lengths must never reuse the previous causal cache.
     changed = vae.encode(videos[1:2, :, :1])
     torch.testing.assert_close(changed, expected[1:2, :, :1], atol=1e-5, rtol=1e-5)

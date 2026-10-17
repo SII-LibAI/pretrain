@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from .mot import CausalMoT, ExpertState
+from .temporal import TemporalLayout
 from .validation import require_bool, require_finite
 from .vendor.scheduler import WanContinuousFlowMatchScheduler
 from .vendor.wan_video_dit import WanVideoDiT, precompute_freqs_cis
@@ -46,8 +47,10 @@ def token_validity(latent_valid, grid, *, patch_size=(1, 2, 2)):
 
 
 class WorldFlow(nn.Module):
-    def __init__(self, rgb, motion=None, *, backend="sdpa", gradient_checkpointing=False, shift=5.0):
+    def __init__(self, rgb, motion=None, *, backend="sdpa", gradient_checkpointing=False, shift=5.0,
+                 future_frames=32):
         super().__init__()
+        self.layout = TemporalLayout(future_frames=future_frames)
         self.rgb, self.motion = rgb, motion
         self.mot = CausalMoT(backend=backend, gradient_checkpointing=gradient_checkpointing)
         self.scheduler = WanContinuousFlowMatchScheduler(shift=shift)
@@ -75,8 +78,8 @@ class WorldFlow(nn.Module):
                                   observed_pre["context"], text_valid)
         states, experts, pre_states = {"O": observation}, {"O": self.rgb}, {}
         if rgb_latent is not None:
-            if rgb_latent.shape[2] != 9 or rgb_t is None:
-                raise ValueError("RGB flow requires the explicit 9-frame latent sequence and timestep")
+            if rgb_latent.ndim != 5 or rgb_latent.shape[2] != self.layout.latent_frames or rgb_t is None:
+                raise ValueError(f"RGB flow requires {self.layout.latent_frames} latent timepoints and a timestep")
             # Never trust the clean/noisy target's first latent as observed input.
             rgb_latent = torch.cat([observed_latent, rgb_latent[:, :, 1:]], 2)
             pre = self.rgb.pre_dit(rgb_latent, rgb_t, text, text_valid, fuse_vae_embedding_in_latents=True)
@@ -88,8 +91,9 @@ class WorldFlow(nn.Module):
                                   freqs=rgb_state.freqs[obs_n:])
             experts["R"], pre_states["R"] = self.rgb, pre
         if motion_latent is not None:
-            if self.motion is None or motion_t is None or motion_latent.shape[2] != 9:
-                raise ValueError("Motion flow requires an expert, timestep and explicit 9-frame latent sequence")
+            if (self.motion is None or motion_t is None or motion_latent.ndim != 5
+                    or motion_latent.shape[2] != self.layout.latent_frames):
+                raise ValueError(f"Motion flow requires an expert, timestep and {self.layout.latent_frames} latent timepoints")
             pre = self.motion.pre_dit(motion_latent, motion_t, text, text_valid, fuse_vae_embedding_in_latents=True)
             valid = (torch.ones(b, 1, *motion_latent.shape[2:], dtype=torch.bool, device=motion_latent.device)
                      if motion_valid is None else motion_valid)
@@ -138,8 +142,9 @@ class WorldFlow(nn.Module):
         return result
 
     def training_state(self, clean, condition, timestep=None, noise=None):
-        if clean.ndim != 5 or clean.shape[2] != 9 or condition.shape != clean[:, :, :1].shape:
-            raise ValueError("Flow target and separately encoded t0 condition must obey Wan temporal layout")
+        if (clean.ndim != 5 or clean.shape[2] != self.layout.latent_frames
+                or condition.shape != clean[:, :, :1].shape):
+            raise ValueError(f"Flow target requires {self.layout.latent_frames} latent timepoints and a matching t0 condition")
         if timestep is None:
             timestep = self.scheduler.sample_training_t(clean.shape[0], clean.device, clean.dtype)
         if noise is None:
@@ -159,7 +164,8 @@ class WorldFlow(nn.Module):
         require_bool(valid, "Flow loss validity")
         require_finite(prediction, "Flow prediction")
         require_finite(target, "Flow target")
-        if prediction.shape != target.shape or valid.shape != (target.shape[0], 1, *target.shape[2:]):
+        if (target.ndim != 5 or target.shape[2] != self.layout.latent_frames
+                or prediction.shape != target.shape or valid.shape != (target.shape[0], 1, *target.shape[2:])):
             raise ValueError("Flow prediction/target/valid shapes disagree")
         valid = valid.clone()
         valid[:, :, 0] = False  # Only future latent groups contribute.
@@ -182,6 +188,9 @@ class WorldFlow(nn.Module):
         Inputs are observations/text plus shapes/constants; there is no motion
         observation. G is rebuilt from fixed slot noise at each denoising step.
         """
+        for name, shape in [("RGB", rgb_shape), ("Motion", motion_shape)]:
+            if shape is not None and (len(shape) != 5 or shape[2] != self.layout.latent_frames):
+                raise ValueError(f"{name} sampler requires {self.layout.latent_frames} latent timepoints")
         rgb_gen = torch.Generator(device=observed_latent.device).manual_seed(int(seed))
         motion_gen = torch.Generator(device=observed_latent.device).manual_seed(int(seed) + 1)
         # Keep the Euler state in FP32; transformer operations still use AMP.
@@ -193,7 +202,8 @@ class WorldFlow(nn.Module):
             raise ValueError("Motion placeholder must match the sampler t0 shape exactly")
         if motion_placeholder is not None:
             require_finite(motion_placeholder, "Motion placeholder")
-        rgb_flags = observed_valid.expand(-1, -1, 9, -1, -1) if rgb is not None and observed_valid is not None else None
+        rgb_flags = (observed_valid.expand(-1, -1, self.layout.latent_frames, -1, -1)
+                     if rgb is not None and observed_valid is not None else None)
         if rgb_flags is not None:
             rgb = rgb.masked_fill(~rgb_flags, 0)
         times, deltas = self.scheduler.build_inference_schedule(steps, observed_latent.device, observed_latent.dtype)

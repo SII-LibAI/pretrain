@@ -47,11 +47,13 @@ class WSA1_5_Policy(PreTrainedPolicy):
 
     def __init__(self, config, *, components=None, initialize_pretrained=True):
         super().__init__(config)
-        self.layout = TemporalLayout()
+        self.layout = TemporalLayout(future_frames=config.future_frames)
         self.model_dtype = getattr(torch, config.dtype)
         if components is None:
             components = self._build_components(initialize_pretrained)
         self.flow = components.flow
+        if self.flow.layout != self.layout:
+            raise ValueError("WorldFlow temporal layout must match policy.future_frames")
         self.future_3d = components.future_3d if config.enable_3d_queries else None
         if config.enable_3d_queries and self.future_3d is None:
             raise ValueError("enable_3d_queries requires a Future3DExpert")
@@ -144,7 +146,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
             if text_encoder is not None:
                 load_report(text_encoder, read_checkpoint(cfg.text_encoder_path), name="Wan UMT5", strict=True)
         flow = WorldFlow(rgb, motion, backend=cfg.attention_backend, gradient_checkpointing=cfg.gradient_checkpointing,
-                         shift=cfg.flow_shift)
+                         shift=cfg.flow_shift, future_frames=cfg.future_frames)
         return WorldComponents(flow, student, FrozenWanVAE(vae), text_encoder, tokenizer)
 
     @classmethod
@@ -240,7 +242,8 @@ class WSA1_5_Policy(PreTrainedPolicy):
     def encode_observation(self, observed, text, observed_valid=None, *, latent=None,
                            text_embedding=None, text_valid=None):
         if observed.ndim != 4 or observed.shape[1:] != (3, self.config.rgb_height, self.config.rgb_width):
-            raise ValueError("Observed RGB must be [B,3,384,320] in Wan-normalized [-1,1] coordinates")
+            raise ValueError(f"Observed RGB must be [B,3,{self.config.rgb_height},{self.config.rgb_width}] "
+                             "in Wan-normalized [-1,1] coordinates")
         if not torch.isfinite(observed).all():
             raise ValueError("Non-finite observed RGB")
         pixel_valid = (torch.ones_like(observed[:, :1], dtype=torch.bool) if observed_valid is None else observed_valid)
@@ -281,8 +284,10 @@ class WSA1_5_Policy(PreTrainedPolicy):
 
     def _shapes(self, batch_size):
         cfg = self.config
-        rgb = (batch_size, cfg.latent_channels, 9, cfg.rgb_height // 16, cfg.rgb_width // 16) if cfg.enable_rgb else None
-        motion = (batch_size, cfg.latent_channels, 9, cfg.motion_height // 16, cfg.motion_width // 16) if cfg.enable_motion else None
+        rgb = (batch_size, cfg.latent_channels, self.layout.latent_frames,
+               cfg.rgb_height // 16, cfg.rgb_width // 16) if cfg.enable_rgb else None
+        motion = (batch_size, cfg.latent_channels, self.layout.latent_frames,
+                  cfg.motion_height // 16, cfg.motion_width // 16) if cfg.enable_motion else None
         return rgb, motion
 
     def sample_generated_latents(self, observed_latent, context, context_valid, observed_valid, *, seed, steps,
@@ -422,7 +427,8 @@ class WSA1_5_Policy(PreTrainedPolicy):
         features = {key: value.masked_fill(~goal_valid[..., None], 0) for key, value in features.items()}
         result = {"goal_3d_features": features[self.config.teacher_layers[-1]] if features else None,
                   "goal_3d_layer_features": features, "goal_3d_valid": goal_valid,
-                  "future_rgb_valid": (pixel_valid & (generated_rgb is not None))[:, None].expand(-1, 32, -1, -1, -1)}
+                  "future_rgb_valid": (pixel_valid & (generated_rgb is not None))[:, None].expand(
+                      -1, self.layout.future_frames, -1, -1, -1)}
         for name, latent in [("rgb", generated_rgb), ("motion", generated_motion)]:
             if latent is not None:
                 decoded = self.layout.future_from_decoded(self.vae.decode(latent))

@@ -53,6 +53,7 @@ else
         --policy.load_text_encoder=false
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
+        --policy.future_frames="${FUTURE_FRAMES:-16}"
         --policy.rgb_lr="${RGB_LR:-5e-5}"
         --policy.motion_lr="${MOTION_LR:-5e-5}"
         --policy.goal_lr="${GOAL_LR:-5e-5}"
@@ -60,6 +61,7 @@ else
         --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS:-5000}"
         --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-300000}"
         --dataset.type=wsa1_5
+        --dataset.future_frames="${FUTURE_FRAMES:-16}"
         --dataset.root="$DATA_ROOT"
         --dataset.repo_id="$DATASET_REPO_ID"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"

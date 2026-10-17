@@ -27,11 +27,12 @@ class RecordingVAE(nn.Module):
 
     @torch.no_grad()
     def decode(self, latent):
-        return F.interpolate(latent[:, :3], size=(33, latent.shape[-2] * 16, latent.shape[-1] * 16), mode="nearest")
+        frames = 1 + (latent.shape[2] - 1) * 4
+        return F.interpolate(latent[:, :3], size=(frames, latent.shape[-2] * 16, latent.shape[-1] * 16), mode="nearest")
 
 
 def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_queries=False,
-                **loss_weights):
+                future_frames=32, **loss_weights):
     config = WSA1_5Config(
         device="cpu", dtype="float32", push_to_hub=False,
         rgb_hidden_dim=16, rgb_ffn_dim=32, motion_hidden_dim=12, motion_ffn_dim=24,
@@ -39,11 +40,13 @@ def make_policy(monkeypatch, *, enable_rgb=True, enable_motion=True, enable_3d_q
         head_dim=8, latent_channels=4, text_dim=8, freq_dim=8,
         rgb_height=96, rgb_width=32, motion_height=32, motion_width=32,
         enable_rgb=enable_rgb, enable_motion=enable_motion, enable_3d_queries=enable_3d_queries,
+        future_frames=future_frames,
         **loss_weights,
     )
     vae = RecordingVAE()
     future = Future3DExpert(10, 20, 3, 2, 8, 8) if enable_3d_queries else None
-    policy = WSA1_5_Policy(config, components=WorldComponents(small_flow(), future, vae=vae))
+    policy = WSA1_5_Policy(config, components=WorldComponents(
+        small_flow(future_frames=future_frames), future, vae=vae))
     monkeypatch.setattr(policy, "_encode_text", lambda texts: (
         torch.zeros(len(texts), 3, 8), torch.ones(len(texts), 3, dtype=torch.bool)))
     return policy, vae

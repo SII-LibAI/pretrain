@@ -40,7 +40,7 @@ def launch(monkeypatch, tmp_path, bash):
     for name in ["RESUME_CONFIG", "RGB_LR", "MOTION_LR", "GOAL_LR", "HEADS_LR", "LAMBDA_RGB",
                  "LAMBDA_MOTION", "LAMBDA_3D", "FEATURE_MSE_WEIGHT", "FEATURE_COSINE_WEIGHT",
                  "SCHEDULER_WARMUP_STEPS", "SCHEDULER_DECAY_STEPS",
-                 "PROC_PER_NODE", "NODE_COUNT", "WEIGHT_RULES_PATH", "ENABLE_3D_QUERIES"]:
+                 "PROC_PER_NODE", "NODE_COUNT", "WEIGHT_RULES_PATH", "ENABLE_3D_QUERIES", "FUTURE_FRAMES"]:
         monkeypatch.delenv(name, raising=False)
 
     default_root = tmp_path / "parent/fixture"
@@ -68,13 +68,14 @@ def test_launcher_preserves_assigned_defaults_and_removes_supervision_switch(lau
     args = launch()
     config = parse_policy(args)
     assert args["num_processes"] == "2"
-    assert config.lambda_3d == 0.01
+    assert config.lambda_3d == 1
     assert [config.rgb_lr, config.motion_lr, config.goal_lr, config.heads_lr] == [5e-5] * 4
     assert config.lambda_rgb == config.lambda_motion == 1
-    assert (config.feature_mse_weight, config.feature_cosine_weight) == (1, 0)
+    assert (config.feature_mse_weight, config.feature_cosine_weight) == (1, 1)
     assert not config.trainable_weights_fp32 and not config.load_text_encoder
-    assert config.scheduler_warmup_steps == 2000
-    assert config.scheduler_decay_steps == 600000
+    assert config.scheduler_warmup_steps == 5000
+    assert config.scheduler_decay_steps == 300000
+    assert config.future_frames == int(args["dataset.future_frames"]) == 16
     assert config.scheduler_decay_lr_ratio == 0.1
     assert config.use_3d_supervision
     assert "policy.enable_3d_supervision" not in args
@@ -94,6 +95,13 @@ def test_launcher_loss_and_decay_overrides_reach_policy(launch):
         assert schedule["num_warmup_steps"] == 10
         assert schedule["num_decay_steps"] == 100
         assert schedule["decay_lr"] == pytest.approx(schedule["peak_lr"] * 0.02)
+
+
+@pytest.mark.parametrize("frames", [4, 12, 16, 32, 48])
+def test_launcher_passes_same_future_frames_to_dataset_and_policy(launch, frames):
+    args = launch(FUTURE_FRAMES=str(frames))
+    assert int(args["dataset.future_frames"]) == frames
+    assert parse_policy(args).future_frames == frames
 
 
 @pytest.mark.parametrize("repos", [["."], ["one", "a/b/c"], [".", "nested/child"]])

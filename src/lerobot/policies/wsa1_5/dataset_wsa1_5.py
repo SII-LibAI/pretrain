@@ -167,7 +167,7 @@ class WSA1_5Dataset(Dataset):
             self.text_embeddings = TextEmbeddingCache(self.root / config.text_embedding_dir, *text_embedding_shape)
             self.text_embeddings.require(segment.text for segment in self.segments)
         self.meta = LoadedEpisodeMetadata(base.meta, self.episode_indices)
-        self.delta_indices = {config.motion_key: [i * config.frame_stride for i in range(1, 33)]}
+        self.delta_indices = {config.motion_key: [i * config.frame_stride for i in range(1, config.future_frames + 1)]}
         self._motion_reads = 0
         logging.info("[WSA data] repo=%s samples=%d views=%s sidecar_sha256=%s",
                      self.repo_id, len(self), self.view_keys, self.sidecar_digest)
@@ -278,8 +278,8 @@ class WSA1_5Dataset(Dataset):
         motion_valid &= valid_time
         motion = (motion * 2 - 1).masked_fill(~motion_valid[:, None, None, None], 0)
         targets = {
-            "future_rgb": normalized[1:33], "future_motion": motion,
-            "rgb_valid": pixels_valid[1:33] & valid_time[:, None, None, None],
+            "future_rgb": normalized[1:1 + self.config.future_frames], "future_motion": motion,
+            "rgb_valid": pixels_valid[1:1 + self.config.future_frames] & valid_time[:, None, None, None],
             "motion_valid": motion_valid,
         }
         if self.include_3d_targets:

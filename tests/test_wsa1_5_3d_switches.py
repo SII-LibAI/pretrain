@@ -120,7 +120,7 @@ def test_factory_only_loads_endpoint_targets_for_supervision(tmp_path, monkeypat
     assert dataset.include_3d_targets == supervised
     assert ("goal_rgb_views" in sample["targets"]) == supervised
     assert ("goal_view_valid" in sample["targets"]) == supervised
-    assert len(seen[0][1]) == (34 if supervised else 33)
+    assert len(seen[0][1]) == cfg.policy.future_frames + 1 + int(supervised)
     batch = wsa1_5_collate([sample, dataset[1]])
     assert ("goal_rgb_views" in batch["targets"]) == supervised
 

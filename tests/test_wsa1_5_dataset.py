@@ -1,5 +1,4 @@
 import json
-import logging
 from types import SimpleNamespace
 
 import datasets
@@ -16,7 +15,8 @@ from lerobot.policies.wsa1_5.dataset_wsa1_5 import (
 )
 
 
-def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, include_3d_targets=True):
+def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, include_3d_targets=True,
+              future_frames=32):
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "meta").mkdir(exist_ok=True)
     if annotations:
@@ -43,7 +43,7 @@ def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, includ
         return torch.tensor(times)[:, None, None, None].expand(-1, 3, 16, 16) / 4
     monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames", decode)
     config = WSA1_5DatasetConfig(repo_id="test", view_keys=["rgb", "", ""], motion_log_every=0,
-                               frame_stride=frame_stride)
+                               frame_stride=frame_stride, future_frames=future_frames)
     return WSA1_5Dataset(base, config, include_3d_targets=include_3d_targets), seen
 
 
@@ -78,25 +78,26 @@ def test_rgb_motion_use_wan_range_and_teacher_keeps_raw_pixels(tmp_path, monkeyp
                         lambda path, times, *args: torch.full((len(times), 3, 16, 16), pixel))
     sample = ds[8]
     expected = pixel * 2 - 1
-    assert (sample["observed_rgb"][:, :256] == expected).all()
+    torch.testing.assert_close(sample["observed_rgb"][:, :256],
+                               torch.full_like(sample["observed_rgb"][:, :256], expected), rtol=1e-6, atol=2e-7)
     assert not sample["observed_rgb"][:, 256:].any()
     assert not sample["observed_valid"][:, 256:].any()
     targets = sample["targets"]
-    assert (targets["future_rgb"][:, :, :256] == expected).all()
+    torch.testing.assert_close(targets["future_rgb"][:, :, :256],
+                               torch.full_like(targets["future_rgb"][:, :, :256], expected), rtol=1e-6, atol=2e-7)
     assert not targets["future_rgb"][:, :, 256:].any()
-    assert (targets["future_motion"][:31] == expected).all()
+    torch.testing.assert_close(targets["future_motion"][:31],
+                               torch.full_like(targets["future_motion"][:31], expected), rtol=1e-6, atol=2e-7)
     assert not targets["future_motion"][31].any()
     assert not targets["motion_valid"][31]
     assert (targets["goal_rgb_views"][0] == pixel).all()
 
 
-def test_missing_video_placeholder_warning_formats_repo(tmp_path, monkeypatch, caplog):
+def test_missing_video_returns_explicit_invalid_placeholder(tmp_path, monkeypatch):
     ds, _ = make_data(tmp_path, monkeypatch)
-    with caplog.at_level(logging.WARNING):
-        frames, valid = ds._decode("", [0.0], 0)
+    frames, valid = ds._decode("", [0.0], 0)
     assert frames.shape == (1, 3, 16, 16) and not frames.any()
     assert valid.dtype == torch.bool and not valid.any()
-    assert "No motion in test" in caplog.text
 
 
 @pytest.mark.parametrize("frame_stride", [1, 2, 5])

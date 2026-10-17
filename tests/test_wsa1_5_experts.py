@@ -6,11 +6,11 @@ from lerobot.policies.wsa1_5.initialization import interpolate_wan_state
 from lerobot.policies.wsa1_5.temporal import TemporalLayout
 
 
-def small_flow(checkpointing=False):
+def small_flow(checkpointing=False, *, future_frames=32):
     torch.manual_seed(13)
     rgb = RGBVideoExpert(**wan_config(16, 32, layers=3, heads=2, head_dim=8, channels=4, text_dim=8, freq_dim=8))
     motion = MotionDiTExpert(**wan_config(12, 24, layers=3, heads=2, head_dim=8, channels=4, text_dim=8, freq_dim=8))
-    return WorldFlow(rgb, motion, gradient_checkpointing=checkpointing)
+    return WorldFlow(rgb, motion, gradient_checkpointing=checkpointing, future_frames=future_frames)
 
 
 def inputs():
