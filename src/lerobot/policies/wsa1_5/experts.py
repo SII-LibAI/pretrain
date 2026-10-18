@@ -8,7 +8,7 @@ from .mot import CausalMoT, ExpertState
 from .temporal import TemporalLayout
 from .validation import require_bool, require_finite
 from .vendor.scheduler import WanContinuousFlowMatchScheduler
-from .vendor.wan_video_dit import WanVideoDiT, precompute_freqs_cis
+from .vendor.wan_video_dit import WanVideoDiT
 
 
 class RGBVideoExpert(WanVideoDiT):
@@ -67,15 +67,7 @@ class WorldFlow(nn.Module):
         if observed_valid is None:
             observed_valid = torch.ones(b, 1, *observed_latent.shape[2:], device=observed_latent.device, dtype=torch.bool)
         observed_tokens_valid = token_validity(observed_valid, observed_pre["meta"]["grid_size"])
-        # Text tokens belong to O and cannot read any future branch.
-        text_tokens = observed_pre["context"]
-        text_freqs = precompute_freqs_cis(self.rgb.attn_head_dim, end=text.shape[1]).to(observed_latent.device)[:, None]
-        text_mod = observed_pre["t_mod"][:, :1].expand(-1, text.shape[1], -1, -1)
-        observation = ExpertState(torch.cat([observed_pre["tokens"], text_tokens], 1),
-                                  torch.cat([observed_pre["t_mod"], text_mod], 1),
-                                  torch.cat([observed_tokens_valid, text_valid], 1),
-                                  torch.cat([observed_pre["freqs"], text_freqs], 0),
-                                  observed_pre["context"], text_valid)
+        observation = state_from_pre(observed_pre, observed_tokens_valid)
         states, experts, pre_states = {"O": observation}, {"O": self.rgb}, {}
         if rgb_latent is not None:
             if rgb_latent.ndim != 5 or rgb_latent.shape[2] != self.layout.latent_frames or rgb_t is None:

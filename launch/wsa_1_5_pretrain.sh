@@ -17,8 +17,8 @@ export HF_LEROBOT_HOME="$PWD/data"
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egoverse-Lerobot-v3/shard_000}"
-    DATASET_REPO_ID="${DATASET_REPO_ID:-}}"
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/umi}"
+    DATASET_REPO_ID="${DATASET_REPO_ID:-}"
     DATASET_REPO_ID="$(
     {
         find -L ${DATA_ROOT} -type d -name data 2>/dev/null \
@@ -31,8 +31,8 @@ else
     } | shuf | tr '\n' ' ' | xargs
     )"
     if [[ -z "${DATASET_REPO_ID}" ]]; then
-    echo "No annotated LeRobotV3 datasets found under ${DATASET_ROOT}" >&2
-    exit 1
+        echo "No annotated LeRobotV3 datasets found under ${DATASET_ROOT}" >&2
+        exit 1
     fi
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B}"
     TRAIN_ARGS=(
@@ -46,7 +46,7 @@ else
         --policy.enable_3d_queries="${ENABLE_3D_QUERIES:-true}"
         --policy.lambda_rgb="${LAMBDA_RGB:-1.0}"
         --policy.lambda_motion="${LAMBDA_MOTION:-1.0}"
-        --policy.lambda_3d="${LAMBDA_3D:-1}"
+        --policy.lambda_3d="${LAMBDA_3D:-1.0}"
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
         --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-1.0}"
         --policy.dtype=bfloat16
@@ -70,8 +70,8 @@ else
         --batch_size="${BATCH_SIZE:-8}"
         --num_workers="${NUM_WORKERS:-12}"
         --steps="${STEPS:-300000}"
-        --save_freq="${SAVE_FREQ:-20000}"
-        --log_freq="${LOG_FREQ:-10}"
+        --save_freq="${SAVE_FREQ:-2000000}"
+        --log_freq="${LOG_FREQ:-50}"
         --wandb.enable="${WANDB_ENABLE:-true}"
         --wandb.mode=offline
     )

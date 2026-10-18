@@ -24,7 +24,7 @@ class WSA1_5Config(PreTrainedConfig):
     rgb_hidden_dim: int = 3072
     rgb_ffn_dim: int = 14336
     motion_hidden_dim: int = 768
-    motion_ffn_dim: int = 4096
+    motion_ffn_dim: int = 3072
     goal_hidden_dim: int = 768
     goal_ffn_dim: int = 3072
     num_layers: int = 30
@@ -38,7 +38,7 @@ class WSA1_5Config(PreTrainedConfig):
     rgb_width: int = 320
     motion_height: int = 192
     motion_width: int = 160
-    future_frames: int = 16
+    future_frames: int = 32
     teacher_layers: tuple[int, ...] = (4, 11, 17, 23)
     student_layers: tuple[int, ...] | None = None
     enable_rgb: bool = True
@@ -178,7 +178,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     ])
     # Optional source keys in precisely the same order; empty entries mean absent.
     view_keys: list[str] = field(default_factory=list)
-    future_frames: int = 16
+    future_frames: int = 32
     frame_stride: int = 1
     rgb_height: int = 384
     rgb_width: int = 320
