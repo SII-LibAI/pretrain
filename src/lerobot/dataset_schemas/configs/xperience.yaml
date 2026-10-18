@@ -1,0 +1,7 @@
+- robot_type: xperience10m_human
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.images.front: observation.images.image0
+  description: "Xperience10M source video schema (not an embodiment action schema)"

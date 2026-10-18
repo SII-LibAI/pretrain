@@ -72,7 +72,7 @@ def condition_text(episode, subtask):
     instruction = subtask.get("subtask_text", "") or ""
     hand = HAND_NAMES.get(subtask.get("hand_used"), "")
     scene = episode.get("scene", "") or ""
-    return f"You are a world modeling agent observing an interacting through multi-view video observations.:Task: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
+    return f"You are a world modeling agent observing an interacting through multi-view video observations.\nTask: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
 
 
 class LoadedEpisodeMetadata:

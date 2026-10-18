@@ -446,6 +446,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # increment `step` here.
         step += 1
         train_tracker.step()
+        if cfg.policy.type == "WSA_1_5" and is_main_process and cfg.eval_freq > 0 and step % cfg.eval_freq == 0:
+            from lerobot.policies.wsa1_5.visualization import save_training_sample
+
+            snapshot_dir = save_training_sample(batch, dataset, cfg.output_dir / "validation", step)
+            logging.info("[WSA sample] saved current batch snapshot to %s", snapshot_dir)
         if (
             is_main_process
             and isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)

@@ -17,7 +17,7 @@ export HF_LEROBOT_HOME="$PWD/data"
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/umi}"
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egoverse-Lerobot-v3/shard_000}"
     DATASET_REPO_ID="${DATASET_REPO_ID:-}"
     DATASET_REPO_ID="$(
     {
@@ -45,23 +45,21 @@ else
         --policy.omega_checkpoint_path="${OMEGA_CHECKPOINT_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/vggt-omega/vggt_omega_1b_256_text.pt}"
         --policy.enable_3d_queries="${ENABLE_3D_QUERIES:-true}"
         --policy.lambda_rgb="${LAMBDA_RGB:-1.0}"
-        --policy.lambda_motion="${LAMBDA_MOTION:-1.0}"
-        --policy.lambda_3d="${LAMBDA_3D:-1.0}"
+        --policy.lambda_motion="${LAMBDA_MOTION:-0.5}"
+        --policy.lambda_3d="${LAMBDA_3D:-0.5}"
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
         --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-1.0}"
         --policy.dtype=bfloat16
         --policy.load_text_encoder=false
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
-        --policy.future_frames="${FUTURE_FRAMES:-16}"
-        --policy.rgb_lr="${RGB_LR:-5e-5}"
-        --policy.motion_lr="${MOTION_LR:-5e-5}"
-        --policy.goal_lr="${GOAL_LR:-5e-5}"
-        --policy.heads_lr="${HEADS_LR:-5e-5}"
+        --policy.rgb_lr="${RGB_LR:-1e-4}"
+        --policy.motion_lr="${MOTION_LR:-1e-4}"
+        --policy.goal_lr="${GOAL_LR:-1e-4}"
+        --policy.heads_lr="${HEADS_LR:-1e-4}"
         --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS:-5000}"
         --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-300000}"
         --dataset.type=wsa1_5
-        --dataset.future_frames="${FUTURE_FRAMES:-16}"
         --dataset.root="$DATA_ROOT"
         --dataset.repo_id="$DATASET_REPO_ID"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"
@@ -70,8 +68,9 @@ else
         --batch_size="${BATCH_SIZE:-8}"
         --num_workers="${NUM_WORKERS:-12}"
         --steps="${STEPS:-300000}"
-        --save_freq="${SAVE_FREQ:-2000000}"
-        --log_freq="${LOG_FREQ:-50}"
+        --save_freq="${SAVE_FREQ:-50000}"
+        --log_freq="${LOG_FREQ:-10000}"
+        --eval_freq="${EVAL_FREQ:-10000}"
         --wandb.enable="${WANDB_ENABLE:-true}"
         --wandb.mode=offline
     )
