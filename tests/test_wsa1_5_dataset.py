@@ -60,7 +60,7 @@ def test_boundaries_targets_and_timestamps(tmp_path, monkeypatch):
                                check_dtype=False)
     assert sample["targets"]["rgb_valid"][:31, :, :256].all()
     assert not sample["targets"]["rgb_valid"][31].any()
-    assert not sample["targets"]["future_motion"][31].any()
+    assert (sample["targets"]["future_motion"][31] == -1).all()
     np.testing.assert_allclose(seen[0][1][1:33], seen[1][1])
     assert sample["targets"]["goal_view_valid"].tolist() == [True, False, False]
     assert "both hands" in sample["condition_text"]
@@ -80,15 +80,16 @@ def test_rgb_motion_use_wan_range_and_teacher_keeps_raw_pixels(tmp_path, monkeyp
     expected = pixel * 2 - 1
     torch.testing.assert_close(sample["observed_rgb"][:, :256],
                                torch.full_like(sample["observed_rgb"][:, :256], expected), rtol=1e-6, atol=2e-7)
-    assert not sample["observed_rgb"][:, 256:].any()
+    assert (sample["observed_rgb"][:, 256:] == -1).all()
     assert not sample["observed_valid"][:, 256:].any()
     targets = sample["targets"]
     torch.testing.assert_close(targets["future_rgb"][:, :, :256],
                                torch.full_like(targets["future_rgb"][:, :, :256], expected), rtol=1e-6, atol=2e-7)
-    assert not targets["future_rgb"][:, :, 256:].any()
+    assert (targets["future_rgb"][:, :, 256:] == -1).all()
+    assert not targets["rgb_valid"][:, :, 256:].any()
     torch.testing.assert_close(targets["future_motion"][:31],
                                torch.full_like(targets["future_motion"][:31], expected), rtol=1e-6, atol=2e-7)
-    assert not targets["future_motion"][31].any()
+    assert (targets["future_motion"][31] == -1).all()
     assert not targets["motion_valid"][31]
     assert (targets["goal_rgb_views"][0] == pixel).all()
 
@@ -98,6 +99,16 @@ def test_missing_video_returns_explicit_invalid_placeholder(tmp_path, monkeypatc
     frames, valid = ds._decode("", [0.0], 0)
     assert frames.shape == (1, 3, 16, 16) and not frames.any()
     assert valid.dtype == torch.bool and not valid.any()
+
+
+def test_missing_motion_is_zero_before_normalization_and_minus_one_after(tmp_path, monkeypatch):
+    ds, _ = make_data(tmp_path, monkeypatch)
+    del ds.meta.features[ds.config.motion_key]
+    raw, valid = ds._decode(ds.config.motion_key, [0.0], 0)
+    assert not raw.any() and not valid.any()
+    sample = ds[0]
+    assert (sample["targets"]["future_motion"] == -1).all()
+    assert not sample["targets"]["motion_valid"].any()
 
 
 @pytest.mark.parametrize("frame_stride", [1, 2, 5])

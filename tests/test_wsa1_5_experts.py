@@ -19,6 +19,40 @@ def inputs():
             torch.tensor([200.0, 500.0]), torch.tensor([300.0, 600.0]))
 
 
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_image_only_observation_and_per_expert_text_cross_attention(checkpointing):
+    model = small_flow(checkpointing)
+    obs, text, text_valid, rgb, motion, rt, mt = inputs()
+    text.requires_grad_()
+    text_valid[:, -1] = False
+    observed_valid = torch.ones(2, 1, 1, 4, 4, dtype=torch.bool)
+    observed_valid[..., :2, :2] = False
+    states, experts, _, obs_n = model.prepare_states(
+        obs, text, text_valid, rgb, motion, rt, mt, observed_valid=observed_valid)
+    assert obs_n == 4
+    assert {group: state.tokens.shape[1] for group, state in states.items()} == {"O": 4, "R": 32, "M": 8}
+    assert states["O"].valid.tolist() == [[False, True, True, True]] * 2
+    for group, state in states.items():
+        assert state.context.shape == (2, 3, experts[group].hidden_dim)
+        torch.testing.assert_close(state.context, experts[group].text_embedding(text))
+        torch.testing.assert_close(state.context_valid, text_valid)
+        assert state.modulation.shape[1] == state.freqs.shape[0] == state.tokens.shape[1]
+
+    tokens, _ = model.mot(states, experts)
+    changed = text.detach().clone()
+    changed[:, -1] += 1000
+    changed_states, changed_experts, _, _ = model.prepare_states(
+        obs, changed, text_valid, rgb, motion, rt, mt, observed_valid=observed_valid)
+    changed_tokens, _ = model.mot(changed_states, changed_experts)
+    for group in states:
+        torch.testing.assert_close(tokens[group], changed_tokens[group], rtol=0, atol=0)
+        text_grad, projection_grad = torch.autograd.grad(
+            tokens[group].square().mean(), (text, experts[group].text_embedding[0].weight), retain_graph=True)
+        assert torch.isfinite(text_grad).all() and torch.isfinite(projection_grad).all()
+        assert text_grad[:, :-1].abs().sum() > 0 and not text_grad[:, -1].any()
+        assert projection_grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("mode", ["rgb", "motion", "both"])
 def test_expert_backward_and_target_isolation(mode):
     model = small_flow(True)
@@ -124,10 +158,24 @@ def test_temporal_mapping_masks_and_no_observed_motion():
     flags[0, 8] = False
     mask = layout.latent_validity(flags, (2, 2))
     assert mask.shape == (2, 1, 8, 2, 2)
+    assert mask.all()  # A partial group remains supervised, as in WSA-L.
+    flags[0, 8:12] = False
+    mask = layout.latent_validity(flags, (2, 2))
     assert not mask[0, :, 2].any() and mask[0, :, 1].all()
-    assert not mask[0, :, 2:].any()  # Causal encoder history stays invalid after a missing frame.
+    assert mask[0, :, 3:].all()
     with pytest.raises(ValueError):
         layout.future_from_decoded(padded[:, :, :-1])
+
+
+@pytest.mark.parametrize("remaining", [0, 1, 2, 3, 4, 5, 31, 32])
+def test_temporal_padding_matches_wsa_l_without_unmasking_missing_views(remaining):
+    frames = torch.arange(32)[None] < remaining
+    validity = frames[:, :, None, None, None].expand(-1, -1, 1, 4, 4).clone()
+    validity[..., 2:] = False
+    latent = TemporalLayout().latent_validity(validity, (2, 2))
+    expected = ~(~frames).reshape(1, 8, 4).all(2)
+    torch.testing.assert_close(latent[0, 0, :, :, 0], expected[0, :, None].expand(-1, 2))
+    assert not latent[..., 1].any()
 
 
 def test_initialization_groups_not_blended():

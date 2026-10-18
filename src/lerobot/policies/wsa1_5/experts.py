@@ -72,7 +72,6 @@ class WorldFlow(nn.Module):
         if rgb_latent is not None:
             if rgb_latent.ndim != 5 or rgb_latent.shape[2] != self.layout.latent_frames or rgb_t is None:
                 raise ValueError(f"RGB flow requires {self.layout.latent_frames} latent timepoints and a timestep")
-            # Never trust the clean/noisy target's first latent as observed input.
             rgb_latent = torch.cat([observed_latent, rgb_latent[:, :, 1:]], 2)
             pre = self.rgb.pre_dit(rgb_latent, rgb_t, text, text_valid, fuse_vae_embedding_in_latents=True)
             valid = (torch.ones(b, 1, *rgb_latent.shape[2:], dtype=torch.bool, device=rgb_latent.device)

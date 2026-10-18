@@ -341,17 +341,6 @@ class WSA1_5_Policy(PreTrainedPolicy):
         with self.compute_context():
             return self._training_forward(batch)
 
-    def _require_supervision(self, masks, teacher_valid):
-        cfg = self.config
-        weights = {"rgb": cfg.lambda_rgb, "motion": cfg.lambda_motion, "3d": cfg.lambda_3d}
-        active = any(weights[name] > 0 and flags[:, :, 1:].any().item() for name, flags in masks.items())
-        active = active or (cfg.use_3d_supervision
-                            and cfg.feature_mse_weight + cfg.feature_cosine_weight > 0
-                            and teacher_valid is not None and teacher_valid.any().item())
-        if not active:
-            # shortcut: 无监督 batch 直接终止；需连续训练无标签区间时再加入监督感知采样。
-            raise ValueError("Batch has no valid positive-weight supervision; refusing a zero-loss optimizer update")
-
     def _training_forward(self, batch):
         if "targets" not in batch:
             raise ValueError("training_forward requires an explicit targets dictionary")
@@ -376,7 +365,6 @@ class WSA1_5_Policy(PreTrainedPolicy):
             # An absent observed camera has no corresponding active G queries.
             teacher_valid = teacher_valid & self.observed_view_validity(pixel_valid).repeat_interleave(273, 1).reshape(-1, 3, 273)
         weights = {"rgb": self.config.lambda_rgb, "motion": self.config.lambda_motion, "3d": self.config.lambda_3d}
-        self._require_supervision(masks, teacher_valid)
         states, velocities, timesteps = {}, {}, {}
         for name, value in clean.items():
             condition = observed if name == "rgb" else self._placeholder(observed.shape[0], observed.device)

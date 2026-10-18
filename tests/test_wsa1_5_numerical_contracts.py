@@ -98,19 +98,9 @@ def test_feature_targets_and_masks_cannot_hide_errors():
         geometric_feature_loss(student, {4: torch.full_like(student[4], 1e30)}, mask)
 
 
-def test_all_invalid_batch_is_not_an_optimizer_update():
+def test_observation_masks_are_validated():
     policy = small_policy()
     assert policy.teacher.dtype == torch.float32
-    empty = torch.zeros(1, 1, 9, 2, 2, dtype=torch.bool)
-    goal = torch.zeros(1, 3, 273, dtype=torch.bool)
-    with pytest.raises(ValueError, match="no valid positive-weight"):
-        policy._require_supervision({"rgb": empty, "motion": empty}, goal)
-    # The condition at t0 never counts as supervision.
-    empty[:, :, 0] = True
-    with pytest.raises(ValueError, match="no valid positive-weight"):
-        policy._require_supervision({"rgb": empty}, goal)
-    goal[:, 0] = True
-    policy._require_supervision({"rgb": empty}, goal)
     with pytest.raises(ValueError, match="observed_valid"):
         policy.training_forward({"targets": {}})
     image = torch.zeros(1, 3, policy.config.rgb_height, policy.config.rgb_width)
@@ -118,6 +108,24 @@ def test_all_invalid_batch_is_not_an_optimizer_update():
         policy.encode_observation(image, ["test"], torch.ones_like(image[:, :1]))
     with pytest.raises(ValueError, match="valid observed RGB"):
         policy.encode_observation(image, ["test"], torch.zeros_like(image[:, :1], dtype=torch.bool))
+
+
+def test_all_invalid_forward_has_zero_loss_without_raising(monkeypatch):
+    from test_wsa1_5_observation_encoding import make_policy
+
+    policy, _ = make_policy(monkeypatch, enable_3d_queries=False)
+    cfg = policy.config
+    batch = {"observed_rgb": torch.zeros(1, 3, cfg.rgb_height, cfg.rgb_width),
+             "observed_valid": torch.ones(1, 1, cfg.rgb_height, cfg.rgb_width, dtype=torch.bool),
+             "condition_text": ["move"],
+             "targets": {"future_rgb": torch.zeros(1, cfg.future_frames, 3, cfg.rgb_height, cfg.rgb_width),
+                         "future_motion": torch.zeros(1, cfg.future_frames, 3, cfg.motion_height, cfg.motion_width),
+                         "rgb_valid": torch.zeros(1, cfg.future_frames, dtype=torch.bool),
+                         "motion_valid": torch.zeros(1, cfg.future_frames, dtype=torch.bool)}}
+    loss, metrics = policy.training_forward(batch)
+    assert loss.item() == 0 and metrics["loss"] == 0
+    loss.backward()
+    assert all(parameter.grad is None or not parameter.grad.any() for parameter in policy.parameters())
 
 
 

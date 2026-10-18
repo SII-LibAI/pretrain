@@ -7,6 +7,29 @@ from lerobot.policies.wsa1_5.vendor.wan_video_dit import sinusoidal_embedding_1d
 from test_wsa1_5_experts import small_flow, inputs
 
 
+def test_3d_receives_text_only_through_visual_states_in_later_layers():
+    flow = small_flow().eval()
+    future = Future3DExpert(10, 20, 3, 2, 8, 8).eval()
+    obs, text, valid, rgb, motion, rt, mt = inputs()
+    text.requires_grad_()
+    goal_valid = torch.ones(2, 3, dtype=torch.bool)
+
+    def run(context):
+        states, experts, _, _ = flow.prepare_states(obs, context, valid, rgb, motion, rt, mt)
+        states["G"] = future.prepare(2, goal_valid, num_train_timesteps=1000)
+        experts["G"] = future
+        assert states["G"].context is None and states["G"].context_valid is None
+        assert all(not hasattr(block, "cross_attn") for block in future.blocks)
+        return flow.mot(states, experts, capture_layers=(0, 1))
+
+    _, before = run(text)
+    _, after = run(text + 1)
+    torch.testing.assert_close(before[0]["G"], after[0]["G"], rtol=0, atol=0)
+    assert not torch.allclose(before[1]["G"], after[1]["G"])
+    before[1]["G"].square().mean().backward()
+    assert text.grad is not None and torch.isfinite(text.grad).all() and text.grad.abs().sum() > 0
+
+
 def test_slot_noise_training_matches_wsa_default_and_resamples():
     future = Future3DExpert(10, 20, 3, 2, 8, 8)
     view_valid = torch.tensor([[True, True, False], [True, False, False]])

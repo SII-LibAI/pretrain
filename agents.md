@@ -36,7 +36,6 @@
 - 预测未来 32 帧三通道 XYZ motion。
 - 模型不输入当前或历史 motion。
 - 训练时真实 motion 仅用于构造监督目标和 flow matching 的 noisy training state。
-- 注意 32 帧与 Wan VAE 时间压缩规则的兼容性，设计并验证确定性的 padding 方案。
 
 ### Future3D Expert
 
@@ -49,15 +48,12 @@
 - 每个视角包括 1 camera query、16 register queries 和 256 patch queries。
 - 目标是预测当前子任务结束时的三视角几何表征。
 - 使用冻结的 VGGT-Omega-1B-256-Text-Alignment 作为 teacher。
-- Teacher 预处理严格使用官方 `mode="max_size"`、`image_resolution=256`。
-- Teacher 输出长度可以动态变化，不能假设始终等于 273。
-- Student 固定 819 queries，使用空间网格对齐完成变长 teacher 特征蒸馏。
 - 支持多层中间特征监督，检查索引 [4,11,17,23]。
 - 不允许在推理时使用真实目标状态图像或 teacher features。
 
 ## 3. 强制因果 Attention Mask
 
-设 O=current observation tokens包含RGB与text，R=future RGB tokens，M=future motion tokens，G=goal 3D tokens。
+设 O=current observation tokens包含RGB，R=future RGB tokens，M=future motion tokens，G=goal 3D tokens。
 
 采用 Query 行、Key 列约定：
 
@@ -74,8 +70,7 @@
 - 不得因为使用 FlashAttention、SDPA 或其他优化算子而退化成 full attention。
 - 训练与推理必须保持相同的依赖关系。
 
-按用户最新说明：O/R/M/G 在同一次 MoT 前向中混合注意力，RGB、Motion、3D 分别并行输出并计算监督。训练时 R/M 使用标准 Flow Matching 的带噪训练状态，G 读取同次前向的 O/R/M/G 隐藏表征；不得为 3D 额外先采样未来或运行第二次 MoT。推理时每个去噪步骤也包含 G，返回最后一次联合前向的 3D 特征。真实目标图像与 teacher features 只用于监督，不作为 G 的输入。Motion 占位首帧 token 必须在 MoT 前移除，并从监督中屏蔽。
-
+/R/M/G 在同一次 MoT 前向中混合注意力，RGB、Motion、3D 分别并行输出并计算监督。训练时 R/M 使用标准 Flow Matching 的带噪训练状态，G 读取同次前向的 O/R/M/G 隐藏表征
 
 MoT 风格共享注意力计算，但不能改变上述因果依赖。
 

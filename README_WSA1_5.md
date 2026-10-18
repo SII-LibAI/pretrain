@@ -2,6 +2,8 @@
 
 当前 `WSA_1_5` policy 输入当前 RGB 和文本，预测未来 `future_frames` 帧 RGB、同长度的三通道 motion，以及可选的子任务终点 3D 特征；不预测 action。默认未来 16 帧，支持任意正的 4 的倍数。
 
+MoT 中 O 只包含当前图像 token，R/M 分别包含未来 RGB/motion token，不拼接文本 token。文本按 WSA-L 的方式作为固定 context，经各层 cross-attention 条件化 O、R、M；O/R 共用 RGB 专家的文本投影，Motion 使用独立投影适配自己的 hidden 维度。G 不含文本 cross-attention，通过后续层读取已融合文本的 O/R/M 表示间接获得文本条件。文本 padding mask 继续作用于 cross-attention。此次调整不改变参数形状或文本缓存格式，旧 checkpoint 可严格加载，但前向行为已有变化，不能保证与旧版结果一致。
+
 WSA1.5 专用实现统一放在 `src/lerobot/policies/wsa1_5/`：
 
 - [configuration_wsa1_5.py](src/lerobot/policies/wsa1_5/configuration_wsa1_5.py)：集中定义 policy 配置 `WSA1_5Config` 和数据配置 `WSA1_5DatasetConfig`，保留 `policy.type=WSA_1_5`、`dataset.type=wsa1_5` 及既有参数字段。
@@ -140,7 +142,7 @@ bash launch/wsa_1_5_pretrain.sh \
 
 显式列表应用到所有选中的数据集；混合不同相机命名的数据时应注册各自 schema。`egodex_v` 已将 `observation.image` 映射到 image0。
 
-RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。缺失区域在映射后置零，并通过无效 mask 排除监督。Omega 的目标图像保持原始 `[0,1]`，直接双线性缩放至 `256×256`，再交给教师内部归一化。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
+RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。缺失图像在原始像素域填 `0`，归一化后为 `-1`，并通过无效 mask 排除监督。Omega 的目标图像保持原始 `[0,1]`，直接双线性缩放至 `256×256`，再交给教师内部归一化。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
 
 ### 子任务标注
 
@@ -167,11 +169,13 @@ RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 
 
 hand_used：0=左手、1=右手、2=双手。区间不能越界或重叠，子任务编号不能重复。文本只读取示例中的任务、子任务、手和场景字段；物理语义应写进这些文本，额外 JSON 字段不会自动输入模型。
 
-未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。文本条件和 3D 目标图像仍对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。缺失标注使用空文本、关闭相应 3D 标签；缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频会报错，整批无正权重有效监督也会停止。
+未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。文本条件和 3D 目标图像仍对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。缺失标注使用空文本、关闭相应 3D 标签；缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频仍会报错。
+
+未来时间 mask 与 WSA-L 一致：每四帧一组，只要组内至少一帧有效，对应 latent 就保留；全部无效才屏蔽，不再把无效历史累计传播到后续组。部分有效组的 VAE 编码仍包含补齐帧的贡献。空间 mask 继续屏蔽缺失相机区域；RGB 越界帧保留重复末帧的像素，motion 越界帧在原始像素域填 `0`、归一化后为 `-1`，二者的时间 mask 都为无效。
+
+不按监督可用性过滤、跳过或重新采样 batch。全无效监督按 WSA-L 返回零损失，仍执行正常的梯度累积、优化器及 scheduler 流程，不因无监督抛异常；即使当前梯度为零，优化器已有动量和 weight decay 仍可能更新参数。
 
 启动脚本通过 `FUTURE_FRAMES` 同时设置 policy 和 dataset，例如 `FUTURE_FRAMES=16 bash launch/wsa_1_5_pretrain.sh`。直接调用训练入口时同时传 `--policy.future_frames=16 --dataset.future_frames=16`，两者不一致会报错。帧数控制实际采样、训练与推理输出；错误长度的训练标签会在对应 VAE 编码前报错。文本缓存与帧数无关，可继续复用。恢复旧实验时保留其已保存的帧数配置；此前配置写 16、实际按 32 帧训练的实验需明确使用 32，不能仅凭旧配置判断其训练长度。
-
-当前没有按监督可用性过滤采样。关闭 3D 监督或缺少终点标注时，batch_size=1 可能抽到没有完整未来 VAE 帧组的 episode 尾部而停止。子任务切换不会触发这种时间 padding。需要连续训练这类数据时应补充采样过滤，不能把报错改成零 loss 后继续更新。
 
 ## 4. 提前计算文本 embedding
 

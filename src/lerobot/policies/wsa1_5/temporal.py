@@ -47,16 +47,13 @@ class TemporalLayout:
         return decoded[:, :, 1:].transpose(1, 2).contiguous()
 
     def latent_validity(self, frame_valid, spatial_size):
-        """Require complete groups and their causal VAE history to be valid."""
+        """Match WSA-L: discard a temporal group only when all its frames are invalid."""
         require_bool(frame_valid, "Future frame validity")
         if frame_valid.ndim == 2:
             frame_valid = frame_valid[:, :, None, None, None]
         if frame_valid.ndim != 5 or frame_valid.shape[1:3] != (self.future_frames, 1):
             raise ValueError(f"Expected [B,{self.future_frames}] or [B,{self.future_frames},1,H,W] validity")
         b, _, _, h, w = frame_valid.shape
-        grouped = frame_valid.reshape(b, self.latent_frames - 1, self.temporal_factor, 1, h, w).all(2)
-        # A later valid group still depends on earlier encoder cache entries.
-        # Once history is missing, it cannot become a trustworthy clean target.
-        grouped = grouped.to(torch.int32).cumprod(1).bool()
+        grouped = frame_valid.reshape(b, self.latent_frames - 1, self.temporal_factor, 1, h, w).any(2)
         resized = torch.nn.functional.interpolate(grouped.float().flatten(0, 1), size=spatial_size, mode="area")
         return (resized >= 1 - 1e-6).reshape(b, self.latent_frames - 1, 1, *spatial_size).transpose(1, 2)

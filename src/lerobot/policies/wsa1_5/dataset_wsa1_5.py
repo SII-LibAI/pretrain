@@ -268,7 +268,7 @@ class WSA1_5Dataset(Dataset):
             all_ts = np.concatenate((all_ts, [self.timestamps[segment.last]]))
         views, view_valid = zip(*(self._decode(key, all_ts, segment.episode) for key in self.view_keys), strict=True)
         canvas, pixels_valid = compose_rgb_views(views, view_valid, self.config.rgb_height, self.config.rgb_width)
-        normalized = (canvas * 2 - 1).masked_fill(~pixels_valid, 0)
+        normalized = canvas * 2 - 1
         motion, motion_valid = self._decode(self.config.motion_key, future_ts, segment.episode)
         # self._motion_reads += 1
         # if self.config.motion_log_every > 0 and self._motion_reads % self.config.motion_log_every == 1:
@@ -276,7 +276,8 @@ class WSA1_5Dataset(Dataset):
         motion = F.interpolate(motion, size=(self.config.motion_height, self.config.motion_width),
                                mode="bilinear", align_corners=False)
         motion_valid &= valid_time
-        motion = (motion * 2 - 1).masked_fill(~motion_valid[:, None, None, None], 0)
+        motion = motion.masked_fill(~motion_valid[:, None, None, None], 0)
+        motion = motion * 2 - 1
         targets = {
             "future_rgb": normalized[1:1 + self.config.future_frames], "future_motion": motion,
             "rgb_valid": pixels_valid[1:1 + self.config.future_frames] & valid_time[:, None, None, None],
