@@ -8,11 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import operator
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -20,10 +20,10 @@ from torch.utils.data._utils.collate import default_collate
 
 from lerobot.dataset_schemas import get_registry, get_schema
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.video_utils import decode_video_frames
 
 from .configuration_wsa1_5 import WSA1_5DatasetConfig
 from .text_embeddings import PROMPT_VERSION, TextEmbeddingCache
+from .video import decode_video_frames
 
 HAND_NAMES = {0: "left hand", 1: "right hand", 2: "both hands"}
 
@@ -33,19 +33,24 @@ def compose_rgb_views(views, valid, height=384, width=320):
     if len(views) != 3 or len(valid) != 3 or height % 3 or width % 2:
         raise ValueError("Expected three ordered views and a valid WSA canvas size")
     sizes = [(height * 2 // 3, width), (height // 3, width // 2), (height // 3, width // 2)]
-    patches, masks = [], []
-    for view, is_valid, size in zip(views, valid, sizes, strict=True):
+    length = views[0].shape[0]
+    canvas = views[0].new_zeros((length, 3, height, width), dtype=torch.float32)
+    pixels_valid = torch.zeros((length, 1, height, width), dtype=torch.bool, device=views[0].device)
+    regions = [(slice(0, height * 2 // 3), slice(None)),
+               (slice(height * 2 // 3, None), slice(0, width // 2)),
+               (slice(height * 2 // 3, None), slice(width // 2, None))]
+    for view, is_valid, size, (rows, cols) in zip(views, valid, sizes, regions, strict=True):
         if view.ndim != 4 or view.shape[1] != 3:
             raise ValueError("Each view must have shape [T,3,H,W]")
-        patch = F.interpolate(view.float(), size=size, mode="bilinear", align_corners=False)
         mask = torch.as_tensor(is_valid, device=view.device)
         if mask.dtype != torch.bool:
             raise TypeError("RGB view validity must be boolean")
         mask = mask.expand(view.shape[0]).reshape(-1, 1, 1, 1)
-        patches.append(patch.masked_fill(~mask, 0))
-        masks.append(mask.expand(-1, 1, *size))
-    return (torch.cat([patches[0], torch.cat(patches[1:], -1)], -2),
-            torch.cat([masks[0], torch.cat(masks[1:], -1)], -2))
+        if mask.any():
+            patch = F.interpolate(view.float(), size=size, mode="bilinear", align_corners=False)
+            canvas[:, :, rows, cols] = patch.masked_fill(~mask, 0)
+            pixels_valid[:, :, rows, cols] = mask
+    return canvas, pixels_valid
 
 
 def build_inference_condition(observed_rgb, text, *, observed_valid=None):
@@ -81,16 +86,13 @@ class LoadedEpisodeMetadata:
     Video path methods stay bound to the original LeRobot metadata, preserving
     global episode IDs and chunk offsets after an episodes=[...] filter.
     """
-    def __init__(self, source, episode_indices):
+    def __init__(self, source, episode_ids, starts, ends):
         self.source = source
         self.entries = {}
-        cursor = 0
-        for ep in dict.fromkeys(episode_indices.tolist()):
-            count = int((episode_indices == ep).sum())
-            self.entries[int(ep)] = {**source.episodes[int(ep)], "dataset_from_index": cursor,
-                                     "dataset_to_index": cursor + count}
-            cursor += count
-        self.total_frames = cursor
+        for ep, start, end in zip(episode_ids, starts, ends, strict=True):
+            self.entries[int(ep)] = {**source.episodes[int(ep)], "dataset_from_index": int(start),
+                                     "dataset_to_index": int(end)}
+        self.total_frames = int(ends[-1]) if len(ends) else 0
         self.total_episodes = len(self.entries)
         self.episodes = self
 
@@ -113,11 +115,33 @@ class WSA1_5Dataset(Dataset):
         self.meta = base.meta
         self.root = Path(base.root)
         base._ensure_hf_dataset_loaded()
-        self.timestamps = np.asarray([float(v) for v in base.hf_dataset["timestamp"]], dtype=np.float64)
+        # Arrow bypasses the HF per-scalar Torch transform and honors filtered row order.
+        columns = ["timestamp", "frame_index", "episode_index"]
+        table = base.hf_dataset.select_columns(columns).with_format("arrow")[:]
+        for name in columns:
+            if table.column(name).null_count:
+                raise ValueError(f"Dataset column {name} contains null values")
+        for name in ["frame_index", "episode_index"]:
+            column = table.column(name)
+            if not pa.types.is_integer(column.type):
+                raise TypeError(f"Dataset {name} must contain integer indices")
+            if (pa.types.is_unsigned_integer(column.type) and len(column)
+                    and int(column.to_numpy().max()) > np.iinfo(np.int64).max):
+                raise ValueError(f"Dataset {name} exceeds int64 range")
+        self.timestamps = np.asarray(table.column("timestamp").to_numpy(), dtype=np.float64)
         if not np.isfinite(self.timestamps).all():
             raise ValueError("Dataset timestamps must be finite")
-        self.frame_indices = np.asarray([operator.index(v) for v in base.hf_dataset["frame_index"]], dtype=np.int64)
-        self.episode_indices = np.asarray([operator.index(v) for v in base.hf_dataset["episode_index"]], dtype=np.int64)
+        self.frame_indices = np.asarray(table.column("frame_index").to_numpy(), dtype=np.int64)
+        self.episode_indices = np.asarray(table.column("episode_index").to_numpy(), dtype=np.int64)
+        changes = np.flatnonzero(self.episode_indices[1:] != self.episode_indices[:-1]) + 1
+        bounds = np.concatenate(([0], changes, [len(self.episode_indices)]))
+        self.episode_starts, self.episode_ends = bounds[:-1], bounds[1:]
+        if not len(self.episode_indices):
+            self.episode_starts, self.episode_ends = bounds[:0], bounds[:0]
+        episode_ids = self.episode_indices[self.episode_starts]
+        if len(np.unique(episode_ids)) != len(episode_ids):
+            raise ValueError("Episode rows are not contiguous")
+        self.meta = LoadedEpisodeMetadata(base.meta, episode_ids, self.episode_starts, self.episode_ends)
         if config.view_keys:
             self.view_keys = list(config.view_keys)
             absent = [key for key in self.view_keys if key and key not in self.meta.features]
@@ -159,28 +183,32 @@ class WSA1_5Dataset(Dataset):
             annotations[ep] = row
         self.sidecar_digest = hashlib.sha256(sidecar_path.read_bytes() if sidecar_path.exists() else b"").hexdigest()
         self.segments = []
-        self.sample_indices = []
-        self.segment_for_sample = []
         self._build_segments(annotations)
+        self.sample_indices = np.empty(len(self.timestamps), dtype=np.int64)
+        self.segment_for_sample = np.empty(len(self.timestamps), dtype=np.int32)
+        cursor = 0
+        for sid, segment in enumerate(self.segments):
+            length = segment.last - segment.first + 1
+            self.sample_indices[cursor:cursor + length] = np.arange(segment.first, segment.last + 1)
+            self.segment_for_sample[cursor:cursor + length] = sid
+            cursor += length
+        assert cursor == len(self.timestamps), "Segments must cover every loaded row exactly once"
         self.text_embeddings = None
         if text_embedding_shape is not None:
             self.text_embeddings = TextEmbeddingCache(self.root / config.text_embedding_dir, *text_embedding_shape)
             self.text_embeddings.require(segment.text for segment in self.segments)
-        self.meta = LoadedEpisodeMetadata(base.meta, self.episode_indices)
         self.delta_indices = {config.motion_key: [i * config.frame_stride for i in range(1, config.future_frames + 1)]}
         self._motion_reads = 0
         logging.info("[WSA data] repo=%s samples=%d views=%s sidecar_sha256=%s",
                      self.repo_id, len(self), self.view_keys, self.sidecar_digest)
 
     def _build_segments(self, annotations):
-        for ep in dict.fromkeys(self.episode_indices.tolist()):
-            positions = np.flatnonzero(self.episode_indices == ep)
-            if not np.array_equal(positions, np.arange(positions[0], positions[-1] + 1)):
-                raise ValueError(f"Episode {ep} rows are not contiguous")
-            frames = self.frame_indices[positions]
+        for start, end in zip(self.episode_starts, self.episode_ends, strict=True):
+            ep = int(self.episode_indices[start])
+            frames = self.frame_indices[start:end]
             if not np.array_equal(frames, np.arange(len(frames))):
                 raise ValueError(f"Episode {ep} must contain contiguous frame indices starting at zero")
-            if np.any(np.diff(self.timestamps[positions]) <= 0):
+            if np.any(np.diff(self.timestamps[start:end]) <= 0):
                 raise ValueError(f"Episode {ep} has non-increasing timestamps")
             annotation = annotations.get(int(ep), {})
             occupied = np.zeros(len(frames), dtype=bool)
@@ -210,20 +238,17 @@ class WSA1_5Dataset(Dataset):
                     raise ValueError(f"Episode {ep} has duplicate/overlapping subtasks")
                 ids.add(sid)
                 occupied[first:last + 1] = True
-                self._add_segment(Segment(int(ep), int(positions[first]), int(positions[last]),
+                self._add_segment(Segment(int(ep), int(start + first), int(start + last),
                                           sid, condition_text(annotation, subtask), True))
             # Missing labels: blank condition, bounded interval, no endpoint/3D supervision.
             missing = np.flatnonzero(~occupied)
             for run in np.split(missing, np.flatnonzero(np.diff(missing) > 1) + 1):
                 if len(run):
-                    self._add_segment(Segment(int(ep), int(positions[run[0]]), int(positions[run[-1]]),
+                    self._add_segment(Segment(int(ep), int(start + run[0]), int(start + run[-1]),
                                               -1, "", False))
 
     def _add_segment(self, segment):
-        sid = len(self.segments)
         self.segments.append(segment)
-        self.sample_indices.extend(range(segment.first, segment.last + 1))
-        self.segment_for_sample.extend([sid] * (segment.last - segment.first + 1))
 
     @property
     def num_frames(self):
@@ -231,7 +256,7 @@ class WSA1_5Dataset(Dataset):
 
     @property
     def num_episodes(self):
-        return len(np.unique(self.episode_indices))
+        return self.meta.total_episodes
 
     def __len__(self):
         return self.num_frames
@@ -247,7 +272,8 @@ class WSA1_5Dataset(Dataset):
         query_ts = [float(t) + float(entry[f"videos/{key}/from_timestamp"]) for t in timestamps]
         path = self.root / self.meta.get_video_file_path(ep, key)
         try:
-            frames = decode_video_frames(path, query_ts, 0.001, self.base.video_backend)
+            frames = decode_video_frames(path, query_ts, 0.001, self.base.video_backend,
+                                         self.config.video_decode_threads)
             if (frames.shape != (len(timestamps), 3, h, w) or not torch.isfinite(frames).all()
                     or (frames < 0).any() or (frames > 1).any()):
                 raise ValueError(f"Bad decoded shape/values for {key}: {tuple(frames.shape)}")
@@ -256,7 +282,7 @@ class WSA1_5Dataset(Dataset):
             raise RuntimeError(f"WSA video decode failed: ep={ep} key={key} path={path}") from error
 
     def __getitem__(self, index):
-        idx = self.sample_indices[index]
+        idx = int(self.sample_indices[index])
         segment = self.segments[self.segment_for_sample[index]]
         # Use loaded-table episode offsets, including when the base dataset filters episodes.
         query_indices, padding = LeRobotDataset._get_query_indices(self, idx, segment.episode)
@@ -264,10 +290,15 @@ class WSA1_5Dataset(Dataset):
         valid_time = ~padding[f"{self.config.motion_key}_is_pad"]
         future_ts = self.timestamps[future_indices]
         all_ts = np.concatenate(([self.timestamps[idx]], future_ts))
-        if self.include_3d_targets:
+        need_goal = self.include_3d_targets and segment.metadata_valid
+        goal_in_window = need_goal and segment.last <= future_indices[-1]
+        if goal_in_window:
             all_ts = np.concatenate((all_ts, [self.timestamps[segment.last]]))
         views, view_valid = zip(*(self._decode(key, all_ts, segment.episode) for key in self.view_keys), strict=True)
-        canvas, pixels_valid = compose_rgb_views(views, view_valid, self.config.rgb_height, self.config.rgb_width)
+        window_length = 1 + self.config.future_frames
+        canvas, pixels_valid = compose_rgb_views([view[:window_length] for view in views],
+                                                 [mask[:window_length] for mask in view_valid],
+                                                 self.config.rgb_height, self.config.rgb_width)
         normalized = canvas * 2 - 1
         motion, motion_valid = self._decode(self.config.motion_key, future_ts, segment.episode)
         # self._motion_reads += 1
@@ -284,9 +315,19 @@ class WSA1_5Dataset(Dataset):
             "motion_valid": motion_valid,
         }
         if self.include_3d_targets:
+            if goal_in_window:
+                goal_views = [view[-1].clone() for view in views]
+                goal_valid = [bool(mask[-1]) for mask in view_valid]
+            elif need_goal:
+                goals = [self._decode(key, [self.timestamps[segment.last]], segment.episode) for key in self.view_keys]
+                goal_views = [frames[0].clone() for frames, _ in goals]
+                goal_valid = [bool(mask[0]) for _, mask in goals]
+            else:
+                goal_views = [torch.zeros_like(view[0]) for view in views]
+                goal_valid = [False] * 3
             targets.update({
-                "goal_rgb_views": [view[-1] for view in views],  # Raw [0,1], native sizes.
-                "goal_view_valid": torch.tensor([bool(mask[-1]) and segment.metadata_valid for mask in view_valid]),
+                "goal_rgb_views": goal_views,  # Compact raw [0,1] frames, not views of a video storage.
+                "goal_view_valid": torch.tensor(goal_valid),
             })
         condition = build_inference_condition(normalized[0], segment.text, observed_valid=pixels_valid[0])
         if self.text_embeddings is not None:

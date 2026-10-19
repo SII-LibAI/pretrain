@@ -190,6 +190,8 @@ class WSA1_5DatasetConfig(DatasetConfig):
     use_imagenet_stats: bool = False  # Normalization is explicit in the adapter.
     use_external_stats: bool = False
     motion_log_every: int = 10000
+    video_decode_threads: int = 1
+    prefetch_factor: int = 2
 
     def __post_init__(self):
         super().__post_init__()
@@ -200,7 +202,8 @@ class WSA1_5DatasetConfig(DatasetConfig):
             raise ValueError("WSA uses explicit Wan [-1,1] normalization; external stats/image transforms are unsupported")
         if any(group.inputs or group.outputs for group in [self.repack_transforms, self.data_transforms, self.model_transforms]):
             raise ValueError("WSA adapter does not support custom transform groups; refusing to ignore them")
-        for name in ["future_frames", "frame_stride", "rgb_height", "rgb_width", "motion_height", "motion_width"]:
+        for name in ["future_frames", "frame_stride", "rgb_height", "rgb_width", "motion_height", "motion_width",
+                     "video_decode_threads", "prefetch_factor"]:
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.motion_log_every) is not int or self.motion_log_every < 0:

@@ -666,6 +666,8 @@ def make_dataloader(
         from lerobot.policies.wsa1_5.dataset_wsa1_5 import wsa1_5_collate
 
         collate_fn = wsa1_5_collate
+        prefetch = cfg.dataset.prefetch_factor if num_workers > 0 else None
+    persistent_workers = isinstance(cfg.dataset, WSA1_5DatasetConfig) and num_workers > 0
 
     if (
         not cfg.dataset.streaming
@@ -686,6 +688,7 @@ def make_dataloader(
             pin_memory=True,
             drop_last=False,
             prefetch_factor=prefetch,
+            persistent_workers=persistent_workers,
         )
         return dl, False
 
@@ -711,5 +714,6 @@ def make_dataloader(
         pin_memory=True,
         drop_last=False,
         prefetch_factor=prefetch,
+        persistent_workers=persistent_workers,
     )
     return dl, False

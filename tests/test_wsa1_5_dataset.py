@@ -15,6 +15,12 @@ from lerobot.policies.wsa1_5.dataset_wsa1_5 import (
 )
 
 
+class FrameTable(dict):
+    """Mutable fixture columns with the real HF Arrow-format read interface."""
+    def select_columns(self, columns):
+        return datasets.Dataset.from_dict({key: self[key] for key in columns})
+
+
 def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, include_3d_targets=True,
               future_frames=32):
     tmp_path.mkdir(exist_ok=True)
@@ -34,8 +40,8 @@ def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, includ
     meta.get_video_file_path = lambda ep, key: key
     meta.episodes = {0: meta.episodes[0], "dataset_from_index": [0], "dataset_to_index": [40]}
     base = SimpleNamespace(meta=meta, root=tmp_path, repo_id="test", tolerance_s=1e-4, video_backend="pyav",
-                           hf_dataset={"timestamp": [torch.tensor(i / 30, dtype=torch.float64) for i in range(40)],
-                                       "frame_index": list(range(40)), "episode_index": [0] * 40})
+                           hf_dataset=FrameTable(timestamp=[i / 30 for i in range(40)],
+                                                 frame_index=list(range(40)), episode_index=[0] * 40))
     base._ensure_hf_dataset_loaded = lambda: None
     seen = []
     def decode(path, times, *args):
@@ -151,7 +157,7 @@ def test_future_window_never_crosses_episodes_after_filtering(tmp_path, monkeypa
     for ep in [7, 2]:
         for frame in [0, 8, 39]:
             row = (0 if ep == 7 else 40) + frame
-            sample = rebuilt[rebuilt.sample_indices.index(row)]
+            sample = rebuilt[np.flatnonzero(rebuilt.sample_indices == row)[0]]
             requested = np.arange(1, 33) + frame
             np.testing.assert_allclose(sample["frame_timestamps"], np.minimum(requested, 39) / 30)
             torch.testing.assert_close(sample["future_frame_valid"], torch.from_numpy(requested < 40))
@@ -247,6 +253,6 @@ def test_null_annotation_fields_clear_condition(tmp_path, monkeypatch, field):
         sidecar[0][field] = None
     path.write_text(json.dumps(sidecar))
     rebuilt = WSA1_5Dataset(ds.base, ds.config)
-    sample = rebuilt[rebuilt.sample_indices.index(0)]
+    sample = rebuilt[np.flatnonzero(rebuilt.sample_indices == 0)[0]]
     assert sample["condition_text"] == "" and not sample["metadata_valid"]
     assert not sample["targets"]["goal_view_valid"].any()

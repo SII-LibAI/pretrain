@@ -29,6 +29,7 @@ def test_invalid_horizon_rejected_at_all_configuration_boundaries(frames):
 def test_config_controls_actual_decoded_frames_and_episode_padding(tmp_path, monkeypatch, frames, stride):
     dataset, decoded = make_data(tmp_path, monkeypatch, future_frames=frames, frame_stride=stride)
     for current in [0, 8, 39]:
+        decoded.clear()
         sample = dataset[current]
         target = sample["targets"]
         requested = current + np.arange(1, frames + 1) * stride
@@ -39,8 +40,12 @@ def test_config_controls_actual_decoded_frames_and_episode_padding(tmp_path, mon
         torch.testing.assert_close(target["motion_valid"], sample["future_frame_valid"])
         # Endpoint stays tied to the current subtask, independently of the horizon.
         assert sample["goal_timestamp"] == pytest.approx((9 if current <= 9 else 39) / 30)
-        assert len(decoded[-2][1]) == frames + 2
-        assert len(decoded[-1][1]) == frames
+        goal_frame = 9 if current <= 9 else 39
+        goal_in_window = goal_frame <= min(current + frames * stride, 39)
+        assert len(decoded[0][1]) == frames + 1 + int(goal_in_window)
+        assert len(decoded[1][1]) == frames
+        if not goal_in_window:
+            assert decoded[2][1] == pytest.approx([2 + goal_frame / 30])
 
 
 @pytest.mark.parametrize("frames", [4, 12, 16, 32, 48])

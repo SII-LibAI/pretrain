@@ -287,9 +287,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
+    dataset_loading_start = time.perf_counter()
     dataset, data_stats = make_dataset(cfg)
 
     accelerator.wait_for_everyone()
+    if is_main_process:
+        logging.info("Dataset loading completed in %.1fs", time.perf_counter() - dataset_loading_start)
 
     # Now all other processes can safely load the dataset
     # if not is_main_process:
@@ -399,6 +402,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_metrics["loss_subtask"] = AverageMeter("loss_subtask", ":.3f")
 
     if cfg.policy.type == "WSA_1_5":
+        train_metrics["step_s"] = AverageMeter("step_s", ":.3f")
         for metric in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature"]:
             train_metrics[metric] = AverageMeter(metric, ":.3f")
         for metric in ["input_s", "mot_s", "pred_s", "backward_s", "optimizer_s"]:
@@ -423,6 +427,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     input_tokenizer = None
     for _ in range(step, cfg.steps):
+        step_start_time = time.perf_counter()
         for _micro_step in range(accumulation_steps):
             start_time = time.perf_counter()
             batch = next(dl_iter)
@@ -441,6 +446,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     lr_scheduler=lr_scheduler,
                 )
 
+        if cfg.policy.type == "WSA_1_5":
+            train_tracker.step_s = time.perf_counter() - step_start_time
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
@@ -466,12 +473,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
 
         if is_log_step:
-            avg_update_time = train_tracker.update_s.avg if hasattr(train_tracker.update_s, 'avg') else train_tracker.update_s.val
-            steps_per_second = 1.0 / avg_update_time if avg_update_time > 0 else 0
+            duration = train_tracker.step_s if cfg.policy.type == "WSA_1_5" else train_tracker.update_s
+            avg_step_time = duration.avg
+            steps_per_second = 1.0 / avg_step_time if avg_step_time > 0 else 0
 
             elapsed_time = time.perf_counter() - training_start_time if training_start_time else 0
             remaining_steps = cfg.steps - step
-            estimated_remaining_time = remaining_steps * avg_update_time if avg_update_time > 0 else 0
+            estimated_remaining_time = remaining_steps * avg_step_time if avg_step_time > 0 else 0
+            if cfg.policy.type == "WSA_1_5" and output_dict is not None:
+                output_dict["throughput/samples_per_s"] = effective_batch_size * steps_per_second
 
             elapsed_str = format_time(elapsed_time)
             remaining_str = format_time(estimated_remaining_time)

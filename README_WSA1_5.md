@@ -306,6 +306,7 @@ WSA 日志保留 step、sample、loss、grad norm、lr、吞吐、data_s 和总 
 
 | 字段 | 测量范围 |
 | --- | --- |
+| step_s | 一次 optimizer 更新的整步耗时，包括数据等待和全部梯度累积 micro-batch；不含更新后的图片保存、日志和 checkpoint |
 | input_s | 当前/未来图像 VAE 编码、Omega 标签提取、读取后的文本准备、Flow Matching 状态及 MoT 输入编码 |
 | mot_s | 一次 O/R/M/G MoT 骨干前向 |
 | pred_s | RGB/Motion 速度预测头及 3D 特征预测头 |
@@ -313,6 +314,45 @@ WSA 日志保留 step、sample、loss、grad norm、lr、吞吐、data_s 和总 
 | optimizer_s | 本 micro-batch 的 optimizer/scheduler 和更新收尾；累积时未更新的 micro-batch 会很短 |
 
 CUDA 阶段使用 event 计时，在读取统计时同步；输入耗时不含 DataLoader 读取缓存的时间，后者属于 data_s。pred_s 是训练这一次 FM 速度预测，不会为计时额外运行多步去噪。updt_s 还包含检查、loss 计算和日志取值，阶段之和不要求严格相等。
+
+WSA 的 `iters/s` 和 ETA 现在按 `step_s` 计算。`updt_s`、`data_s` 和各阶段仍为 micro-batch 平均；使用梯度累积时，一次 step 包含多个 micro-batch。WandB 的 `throughput/samples_per_s` 为全局有效 batch 除以 `step_s`。旧日志只用 `updt_s` 计算吞吐，例如 `updt_s=4.248, data_s=6.582` 对应约 `0.092` 次更新/秒，而非日志原先显示的 `0.24`。
+
+### 大数据集与多卡数据加载
+
+本轮优化集中在 WSA 数据路径，保留采样分布、跨子任务未来窗口、episode 尾部 padding 和损失 mask：
+
+- 初始化直接从 HF 的 Arrow 表批量读取 timestamp/frame_index/episode_index，保留 episode 筛选后的行顺序和时间戳精度，不经过逐标量 Torch transform。
+- episode 边界通过一次相邻比较生成，元数据和 segment 共用这些边界，不再为每个 episode 重扫整张帧表。逐帧样本索引改为 NumPy int64/int32 数组，不再保存两个 Python 整数列表。
+- RGB 当前帧与未来窗口一起读取；goal 在窗口范围内时复用同次请求，超出时单独 seek。缺少子任务标注时不读取无效 goal。窗口仍只受 episode 边界限制。
+- WSA 的 PyAV 解码器流式选择最近帧，只将选中的帧转换成 RGB，并释放中间帧；排序/重复查询、时间戳容差和解码错误仍受检查。远处 goal 的 seek 仍需从关键帧解码，长 GOP 的成本不会完全消失。
+- goal 图复制为独立单帧张量，避免 worker IPC 通过 `view[-1]` 保留整段视频 storage。三视角画布预分配，缺失视角不做插值。
+- WSA DataLoader 保留 worker，避免迭代器耗尽后重新创建进程；PyAV 每个解码器默认限制为一个线程。其他 policy 的视频解码路径保持原实现。
+
+可用资源参数如下，未改动现有 batch、worker 数、学习率或损失权重：
+
+| 启动环境变量 | 对应配置 | 默认值 |
+| --- | --- | --- |
+| `VIDEO_DECODE_THREADS` | `dataset.video_decode_threads` | 1，仅 PyAV 路径 |
+| `PREFETCH_FACTOR` | `dataset.prefetch_factor` | 2，每个 worker 预取的 batch 数 |
+| `NUM_WORKERS` | `num_workers` | 沿用启动脚本当前值 12，每个 rank 独立配置 |
+
+例如保留单卡 batch=8、累积=1，先比较资源参数：
+
+```bash
+# 集群 PET_* 等启动环境仍按平台原有方式提供。
+NUM_WORKERS=8 PREFETCH_FACTOR=1 VIDEO_DECODE_THREADS=1 \
+  bash launch/wsa_1_5_pretrain.sh
+```
+
+对于每节点 8 卡、160 核、1.8 TB 内存、本地 NVMe，12 workers/rank 意味着 96 个 worker/node，prefetch=2 最多预取 192 个 batch。内存容量充足仍可能受 CPU 解码、内存带宽、共享内存和 pin-memory 搬运限制；PyTorch 也说明多 worker 会扩大父进程 Python 对象占用，参见 [DataLoader 文档](https://docs.pytorch.org/docs/stable/data.html)。建议保持数据、batch=8、累积=1 一致，逐项比较 workers=4/8/12 和 prefetch=1/2，先固定解码线程为 1，丢弃启动预热后按 `step_s` 与全局 samples/s 判断，不只看 iters/s。
+
+初始化会报告 `Dataset loading completed in ...s`，包含等待其他 rank 完成的时间。修复后的剩余启动成本仍包括首次 Parquet→Arrow 构建、逐视频存在性检查和文本缓存文件检查；数据量增加不代表这些工作会变为常数时间。可分别测首次启动与缓存已存在时的启动，避免把初始化与稳态吞吐混在一起。
+
+数据等待仍高时，检查 `iostat -xz 1`、`pidstat -u -r 1`、`df -h /dev/shm` 和进程实际 CPU affinity/容器配额。按 GPU/CPU 拓扑设置 NUMA 亲和性可减少跨节点内存访问，参见 [PyTorch 性能指南](https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide)。`data_s` 降低而 `backward_s` 随节点数增长时，再用 profiler 区分 checkpointing 重算与 NCCL 通信，不能仅凭该字段判断网络故障。
+
+当前 checkout 的启动脚本显式设置 `--policy.load_text_encoder=true`，会在线编码文本；已有完整离线缓存时可把该参数设为 `false`，省去 UMT5。这里保留用户当前脚本值，不自动覆盖。资源参数测试先在相同小数据集比较 2→8 卡，再扩大到 16 卡和完整数据，才能区分规模与数据组成的影响。
+
+本地合成测试中，20 万帧/2,000 episode 的适配器初始化由 16.30s 降至 0.081s；34 帧视频中的 goal 引用改为独立单帧后，底层 storage 缩小 34 倍。这些数字不包含 Parquet、真实视频或 GPU/DDP，不能推算服务器训练加速比。
 
 ## 6. 断点恢复与推理
 
