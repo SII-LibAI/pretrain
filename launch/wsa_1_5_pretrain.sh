@@ -17,7 +17,7 @@ export HF_LEROBOT_HOME="$PWD/data"
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egoverse-Lerobot-v3/shard_000}"
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego}"
     DATASET_REPO_ID="${DATASET_REPO_ID:-}"
     DATASET_REPO_ID="$(
     {
@@ -50,7 +50,7 @@ else
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
         --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-1.0}"
         --policy.dtype=bfloat16
-        --policy.load_text_encoder=false
+        --policy.load_text_encoder=true
         --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
         --policy.rgb_lr="${RGB_LR:-1e-4}"
@@ -68,23 +68,63 @@ else
         --batch_size="${BATCH_SIZE:-8}"
         --num_workers="${NUM_WORKERS:-12}"
         --steps="${STEPS:-300000}"
-        --save_freq="${SAVE_FREQ:-50000}"
-        --log_freq="${LOG_FREQ:-10000}"
-        --eval_freq="${EVAL_FREQ:-10000}"
+        --save_freq="${SAVE_FREQ:-30000}"
+        --log_freq="${LOG_FREQ:-10}"
+        --eval_freq="${EVAL_FREQ:-5000}"
         --wandb.enable="${WANDB_ENABLE:-true}"
         --wandb.mode=offline
     )
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
 fi
 
-PROC_PER_NODE="${PROC_PER_NODE:-2}"
-NODE_COUNT="${NODE_COUNT:-1}"
-NUM_PROCESSES=$((PROC_PER_NODE * NODE_COUNT))
-ACCEL_ARGS=(--num_processes="$NUM_PROCESSES" --num_machines="$NODE_COUNT"
-    --machine_rank="${NODE_RANK:-0}" --main_process_ip="${MASTER_ADDR:-127.0.0.1}"
-    --main_process_port="${MASTER_PORT:-29500}" --mixed_precision=bf16)
-if ((NUM_PROCESSES > 1)); then ACCEL_ARGS+=(--multi_gpu); fi
-COMMAND=(accelerate launch "${ACCEL_ARGS[@]}" src/lerobot/scripts/lerobot_train.py "${TRAIN_ARGS[@]}" "$@")
+# PROC_PER_NODE="${PROC_PER_NODE:-8}"
+# NODE_COUNT="${NODE_COUNT:-2}"
+# NUM_PROCESSES=$((PROC_PER_NODE * NODE_COUNT))
+
+# ===== 平台多机环境 =====
+
+NODE_COUNT="${PET_NNODES:?PET_NNODES is required}"
+NODE_RANK="${PET_NODE_RANK:?PET_NODE_RANK is required}"
+PROC_PER_NODE="${PET_NPROC_PER_NODE:?PET_NPROC_PER_NODE is required}"
+
+MASTER_ADDR="${PET_MASTER_ADDR:-${MASTER_ADDR:-}}"
+MASTER_PORT="${PET_MASTER_PORT:-${MASTER_PORT:-}}"
+
+: "${MASTER_ADDR:?MASTER_ADDR is required}"
+: "${MASTER_PORT:?MASTER_PORT is required}"
+
+NUM_PROCESSES=$((NODE_COUNT * PROC_PER_NODE))
+
+# ===== 启动前检查 =====
+
+echo "========== Distributed Config =========="
+echo "HOSTNAME       = $(hostname)"
+echo "NODE_COUNT     = $NODE_COUNT"
+echo "NODE_RANK      = $NODE_RANK"
+echo "PROC_PER_NODE  = $PROC_PER_NODE"
+echo "NUM_PROCESSES  = $NUM_PROCESSES"
+echo "MASTER_ADDR    = $MASTER_ADDR"
+echo "MASTER_PORT    = $MASTER_PORT"
+echo "========================================"
+ACCEL_ARGS=(
+    --multi_gpu
+    --num_machines="$NODE_COUNT"
+    --num_processes="$NUM_PROCESSES"
+    --machine_rank="$NODE_RANK"
+    --main_process_ip="$MASTER_ADDR"
+    --main_process_port="$MASTER_PORT"
+    --mixed_precision=bf16
+    --same_network
+)
+
+COMMAND=(
+    accelerate launch
+    "${ACCEL_ARGS[@]}"
+    src/lerobot/scripts/lerobot_train.py
+    "${TRAIN_ARGS[@]}"
+    "$@"
+)
+
 if [[ "${WSA_DRY_RUN:-0}" == 1 ]]; then
     printf '%q ' "${COMMAND[@]}"
     printf '\n'

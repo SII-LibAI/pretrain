@@ -72,7 +72,7 @@ def condition_text(episode, subtask):
     instruction = subtask.get("subtask_text", "") or ""
     hand = HAND_NAMES.get(subtask.get("hand_used"), "")
     scene = episode.get("scene", "") or ""
-    return f"You are a world modeling agent observing an interacting through multi-view video observations.\nTask: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
+    return f"You are a world modeling agent observing an interacting through multi-view video observations.:Task: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
 
 
 class LoadedEpisodeMetadata:
@@ -247,7 +247,7 @@ class WSA1_5Dataset(Dataset):
         query_ts = [float(t) + float(entry[f"videos/{key}/from_timestamp"]) for t in timestamps]
         path = self.root / self.meta.get_video_file_path(ep, key)
         try:
-            frames = decode_video_frames(path, query_ts, self.base.tolerance_s, self.base.video_backend)
+            frames = decode_video_frames(path, query_ts, 0.001, self.base.video_backend)
             if (frames.shape != (len(timestamps), 3, h, w) or not torch.isfinite(frames).all()
                     or (frames < 0).any() or (frames > 1).any()):
                 raise ValueError(f"Bad decoded shape/values for {key}: {tuple(frames.shape)}")

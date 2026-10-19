@@ -9,7 +9,7 @@ import tempfile
 """
 run:
 WAN_MODEL_PATH=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B
-DATA_ROOT=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego
+DATA_ROOT=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egodex-LerobotV3
 cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 torchrun --standalone --nnodes=1 --nproc_per_node=4 \

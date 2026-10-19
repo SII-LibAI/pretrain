@@ -184,6 +184,8 @@ def init_logging(
 
 
 def gather_object(obj, accelerator):
+    if accelerator.num_processes == 1:
+        return [obj]
     objs = [None] * accelerator.num_processes
     torch.distributed.all_gather_object(objs, obj)
     return objs
