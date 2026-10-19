@@ -1,0 +1,7 @@
+- robot_type: human_egoexo4d
+  feature_mapping:
+    observation.state: [observation.state]
+    action: [action]
+  image_mapping:
+    observation.images.ego: observation.images.image0
+  description: "Ego-exo4D source video schema (not an embodiment action schema)"

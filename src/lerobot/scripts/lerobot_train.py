@@ -203,7 +203,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
-    # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
         from datetime import timedelta
 
@@ -213,12 +212,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
 
         ddp_kwargs = DistributedDataParallelKwargs(
-            find_unused_parameters=True,
+            find_unused_parameters=False,
             gradient_as_bucket_view=cfg.policy.type == "WSA_1_5",
         )
 
         nccl_timeout_kwargs = InitProcessGroupKwargs(
-            timeout=timedelta(hours=2)
+            timeout=timedelta(hours=5)
         )
 
         wsa_options = {}
@@ -446,6 +445,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # increment `step` here.
         step += 1
         train_tracker.step()
+        if cfg.policy.type == "WSA_1_5" and is_main_process and cfg.eval_freq > 0 and step % cfg.eval_freq == 0:
+            from lerobot.policies.wsa1_5.visualization import save_training_sample
+
+            snapshot_dir = save_training_sample(batch, dataset, cfg.output_dir / "validation", step)
+            logging.info("[WSA sample] saved current batch snapshot to %s", snapshot_dir)
         if (
             is_main_process
             and isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
