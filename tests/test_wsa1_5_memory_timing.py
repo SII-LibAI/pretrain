@@ -9,7 +9,7 @@ from torch import nn
 
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy
-from lerobot.policies.wsa1_5.timing import StageTimer
+from lerobot.policies.wsa1_5.utils.timing import StageTimer
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from test_wsa1_5_policy_contract import small_config, small_policy
 
@@ -45,7 +45,7 @@ def test_adamw_foreach_is_disabled_for_wsa_including_resume(wsa):
 
 def test_cpu_stage_times_and_wsa_progress_fields(monkeypatch):
     stamps = iter([1.0, 1.2, 1.5, 1.6])
-    monkeypatch.setattr("lerobot.policies.wsa1_5.timing.time", SimpleNamespace(perf_counter=lambda: next(stamps)))
+    monkeypatch.setattr("lerobot.policies.wsa1_5.utils.timing.time", SimpleNamespace(perf_counter=lambda: next(stamps)))
     timer = StageTimer("cpu")
     for stage in ["input_s", "mot_s", "pred_s"]:
         timer.mark(stage)

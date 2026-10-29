@@ -9,7 +9,7 @@ import torch
 from lerobot.datasets.factory import _build_single_dataset
 from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config, WSA1_5DatasetConfig
 from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy, WorldComponents
-from lerobot.policies.wsa1_5.temporal import TemporalLayout
+from lerobot.policies.wsa1_5.utils.temporal import TemporalLayout
 from test_wsa1_5_dataset import make_data
 from test_wsa1_5_experts import small_flow
 from test_wsa1_5_observation_encoding import RecordingVAE, make_policy

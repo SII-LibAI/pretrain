@@ -51,6 +51,7 @@ class CausalMoT(nn.Module):
 
     def _layer(self, tokens, groups, states, blocks):
         qkv, mods = {}, {}
+        flags = {group: state.valid for group, state in states.items()}
         for group, token in zip(groups, tokens, strict=True):
             state, block = states[group], blocks[group]
             token = token.masked_fill(~state.valid[:, :, None], 0)
@@ -70,7 +71,7 @@ class CausalMoT(nn.Module):
             sources = [source for source in VISIBLE[group] if source in qkv]
             k = torch.cat([qkv[source][1] for source in sources], 2)
             v = torch.cat([qkv[source][2] for source in sources], 2)
-            key_valid = torch.cat([states[source].valid for source in sources], 1)
+            key_valid = torch.cat([flags[source] for source in sources], 1)
             mask = state.valid[:, None, :, None] & key_valid[:, None, None, :]
             mixed = masked_attention(qkv[group][0], k, v, mask, backend=self.backend)
             mixed = mixed.transpose(1, 2).flatten(2)

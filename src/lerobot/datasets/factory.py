@@ -384,9 +384,16 @@ def _build_single_dataset(
         root = Path(cfg.dataset.root) / repo_id if cfg.dataset.root else HF_LEROBOT_HOME / repo_id
         base = LeRobotDataset(repo_id, root=root, episodes=cfg.dataset.episodes,
                              revision=cfg.dataset.revision, video_backend=cfg.dataset.video_backend)
+        if cfg.policy.enable_action:
+            if cfg.dataset.action_mode != cfg.policy.action_mode:
+                raise ValueError("dataset.action_mode and policy.action_mode must match")
+            _apply_dataset_stats_overrides(cfg, base)
+        elif cfg.dataset.use_external_stats:
+            raise ValueError("Stage-1 WSA does not use external state/action statistics")
         dataset = WSA1_5Dataset(base, cfg.dataset, include_3d_targets=cfg.policy.use_3d_supervision,
                                text_embedding_shape=None if cfg.policy.load_text_encoder else
-                               (cfg.policy.max_text_length, cfg.policy.text_dim))
+                               (cfg.policy.max_text_length, cfg.policy.text_dim),
+                               action_config=cfg.policy if cfg.policy.enable_action else None)
         return dataset, base.meta.stats.copy(), base.meta.robot_type
 
     use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
@@ -563,6 +570,18 @@ def make_dataset(cfg: TrainPipelineConfig):
     logging.info(
         f"[make_dataset] all_repo_ids={all_repo_ids}"
     )
+
+    if (isinstance(cfg.dataset, WSA1_5DatasetConfig) and cfg.policy.enable_action
+            and cfg.policy.lambda_action > 0):
+        # Check the complete source list on every rank, before rank-local sharding.
+        available = False
+        for repo in all_repo_ids:
+            root = Path(cfg.dataset.root) / repo if cfg.dataset.root else HF_LEROBOT_HOME / repo
+            info = load_json(root / "meta/info.json")
+            schema = get_schema(info["robot_type"])
+            available |= all(key in info["features"] for key in schema.get_action_keys())
+        if not available:
+            raise ValueError("Action supervision is enabled but none of the selected datasets declare actions")
 
     frames_map, episodes_map = load_info_for_repos(cfg, all_repo_ids)
     weight_cfg = None

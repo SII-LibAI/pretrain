@@ -3,7 +3,7 @@ import torch
 
 from lerobot.policies.wsa1_5.experts import RGBVideoExpert, MotionDiTExpert, WorldFlow, wan_config
 from lerobot.policies.wsa1_5.initialization import interpolate_wan_state
-from lerobot.policies.wsa1_5.temporal import TemporalLayout
+from lerobot.policies.wsa1_5.utils.temporal import TemporalLayout
 
 
 def small_flow(checkpointing=False, *, future_frames=32):

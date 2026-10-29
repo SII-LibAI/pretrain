@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from lerobot.policies.wsa1_5.attention import GROUPS, VISIBLE, build_causal_attention_mask, masked_attention
+from lerobot.policies.wsa1_5.attention import WORLD_GROUPS as GROUPS, VISIBLE, build_causal_attention_mask, masked_attention
 from lerobot.policies.wsa1_5.mot import CausalMoT, ExpertState
 
 

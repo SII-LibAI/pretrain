@@ -4,12 +4,15 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
-from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset, wsa1_5_collate
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset, condition_text, wsa1_5_collate
 from lerobot.policies.wsa1_5.text_embeddings import TextEmbeddingCache, text_embedding_path
 from util_scripts.precompute_wsa1_5_text_embeddings import dataset_prompts, precompute_dataset
 from util_scripts import precompute_wsa1_5_text_embeddings as precompute_script
@@ -30,12 +33,15 @@ def tokenize(texts, **kwargs):
 
 
 def precompute(root):
+    if not (root / "meta/episodes").exists():
+        add_dataset(root)
     return precompute_dataset(root, TinyEncoder(), tokenize, "cpu", max_length=4, text_dim=8)
 
 
 def test_offline_cache_covers_actual_prompts_collates_and_never_loads_encoder(tmp_path, monkeypatch):
     dataset, _ = make_data(tmp_path, monkeypatch)
-    assert set(dataset_prompts(tmp_path)) == {"", *(segment.text for segment in dataset.segments)}
+    assert set(dataset_prompts(tmp_path)) == {condition_text({"task_instruction": "knit"}),
+                                             *(segment.text for segment in dataset.segments)}
     with pytest.raises(FileNotFoundError, match="offline text"):
         WSA1_5Dataset(dataset.base, dataset.config, text_embedding_shape=(4, 8))
     assert precompute(tmp_path) == 3
@@ -56,13 +62,48 @@ def test_offline_cache_covers_actual_prompts_collates_and_never_loads_encoder(tm
     assert policy.text_encoder is None and policy.tokenizer is None
 
 
-def test_blank_condition_cache_for_missing_annotations(tmp_path, monkeypatch):
+def test_original_task_cache_for_missing_annotations(tmp_path, monkeypatch):
     dataset, _ = make_data(tmp_path, monkeypatch, annotations=False)
-    assert dataset_prompts(tmp_path) == [""]
+    prompt = condition_text({"task_instruction": "knit"})
+    assert dataset_prompts(tmp_path) == [prompt]
     assert precompute(tmp_path) == 1
     dataset = WSA1_5Dataset(dataset.base, dataset.config, text_embedding_shape=(4, 8))
-    assert dataset[0]["condition_text"] == ""
+    assert dataset[0]["condition_text"] == prompt
     assert dataset[0]["text_valid"].any()
+
+
+@pytest.mark.parametrize("subtasks", [[], None])
+def test_episode_without_subtasks_uses_sidecar_task_in_training_and_precompute(tmp_path, monkeypatch, subtasks):
+    dataset, _ = make_data(tmp_path, monkeypatch)
+    sidecar = [{"episode_index": 0, "task_instruction": "original task", "subtasks": subtasks}]
+    (tmp_path / "meta/sidecar.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    prompt = condition_text({"task_instruction": "original task"})
+    assert dataset_prompts(tmp_path) == [prompt]
+    assert precompute(tmp_path) == 1
+    rebuilt = WSA1_5Dataset(dataset.base, dataset.config, text_embedding_shape=(4, 8))
+    assert rebuilt[0]["condition_text"] == prompt and not rebuilt[0]["metadata_valid"]
+    assert not rebuilt[0]["targets"]["goal_view_valid"].any()
+
+
+def test_multiple_original_tasks_follow_actual_frame_task_indices(tmp_path, monkeypatch):
+    dataset, _ = make_data(tmp_path, monkeypatch, annotations=False)
+    dataset.base.meta.episodes[0]["tasks"] = ["knit", "pull"]
+    dataset.base.meta.tasks = pd.DataFrame({"task_index": [0, 1]}, index=["knit", "pull"])
+    dataset.base.hf_dataset["task_index"] = [0] * 20 + [1] * 20
+    pq.write_table(pa.table({"episode_index": [0], "tasks": [["knit", "pull"]],
+                             "dataset_from_index": [0], "dataset_to_index": [40]}),
+                   tmp_path / "meta/episodes/chunk-000/file-000.parquet")
+    prompts = {condition_text({"task_instruction": task}) for task in ("knit", "pull")}
+    assert set(dataset_prompts(tmp_path)) == prompts and "" not in prompts
+    assert precompute(tmp_path) == 2
+    rebuilt = WSA1_5Dataset(dataset.base, dataset.config, text_embedding_shape=(4, 8))
+    assert len(rebuilt) == 40
+    for index in (0, 19, 20, 39):
+        sample = rebuilt[index]
+        task = "knit" if index < 20 else "pull"
+        assert sample["condition_text"] == condition_text({"task_instruction": task})
+        assert sample["text_valid"].any() and not sample["metadata_valid"]
+        assert not sample["targets"]["goal_view_valid"].any()
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 8])
@@ -98,7 +139,8 @@ def test_precompute_rejects_invalid_batch_size(tmp_path, batch_size):
 def test_bad_text_cache_is_rejected_without_recomputing(tmp_path, corruption):
     precompute(tmp_path)
     cache = TextEmbeddingCache(tmp_path / "meta/wsa1_5_text_embeddings", 4, 8)
-    path = text_embedding_path(cache.directory, "")
+    prompt = condition_text({"task_instruction": "knit"})
+    path = text_embedding_path(cache.directory, prompt)
     with safe_open(path, framework="pt") as handle:
         metadata = handle.metadata()
         tensors = {key: handle.get_tensor(key).clone() for key in handle.keys()}
@@ -114,13 +156,14 @@ def test_bad_text_cache_is_rejected_without_recomputing(tmp_path, corruption):
         tensors["context"] = tensors["context"].float()
     save_file(tensors, path, metadata=metadata)
     with pytest.raises(ValueError):
-        cache.get("")
+        cache.get(prompt)
 
 
 def test_cache_read_checks_expected_model_shape_and_has_no_online_fallback(tmp_path, monkeypatch):
     precompute(tmp_path)
     with pytest.raises(ValueError, match="metadata"):
-        TextEmbeddingCache(tmp_path / "meta/wsa1_5_text_embeddings", 512, 4096).get("")
+        TextEmbeddingCache(tmp_path / "meta/wsa1_5_text_embeddings", 512, 4096).get(
+            condition_text({"task_instruction": "knit"}))
     policy, _ = make_policy(monkeypatch)
     monkeypatch.undo()
     with pytest.raises(RuntimeError, match="no online fallback"):
@@ -128,7 +171,7 @@ def test_cache_read_checks_expected_model_shape_and_has_no_online_fallback(tmp_p
 
 
 def test_sidecar_schema_errors_are_not_silenced(tmp_path):
-    (tmp_path / "meta").mkdir()
+    add_dataset(tmp_path)
     sidecar = tmp_path / "meta/sidecar.json"
     for payload in [{}, [{"episode_index": 0, "subtasks": {}}]]:
         sidecar.write_text(json.dumps(payload), encoding="utf-8")

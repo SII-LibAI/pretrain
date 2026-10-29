@@ -1,5 +1,8 @@
 """Explicit Wan2.2 4n+1 temporal contract; no implicit tail truncation."""
+from collections import deque
 from dataclasses import dataclass
+
+import numpy as np
 
 import torch
 
@@ -57,3 +60,34 @@ class TemporalLayout:
         grouped = frame_valid.reshape(b, self.latent_frames - 1, self.temporal_factor, 1, h, w).any(2)
         resized = torch.nn.functional.interpolate(grouped.float().flatten(0, 1), size=spatial_size, mode="area")
         return (resized >= 1 - 1e-6).reshape(b, self.latent_frames - 1, 1, *spatial_size).transpose(1, 2)
+
+
+def history_indices(frame, count, stride):
+    if type(frame) is not int or frame < 0 or type(count) is not int or count < 0 or type(stride) is not int or stride < 1:
+        raise ValueError("History requires frame/count >= 0 and stride > 0")
+    requested = np.arange(-count, 1, dtype=np.int64) * stride + frame
+    return np.maximum(requested, 0), torch.from_numpy(requested >= 0)
+
+
+class ObservationHistory:
+    """Append at every control tick, including while executing a cached chunk."""
+    def __init__(self, count, stride):
+        self.count, self.stride = count, stride
+        self.frames = deque(maxlen=count * stride + 1)
+        self.masks = deque(maxlen=count * stride + 1)
+        self.step = -1
+
+    def append(self, frame, valid):
+        if self.frames and frame.shape != self.frames[-1].shape:
+            raise ValueError("Observation batch/image shape changed; reset the policy at episode boundaries")
+        self.frames.append(frame.detach().clone())
+        self.masks.append(valid.detach().clone())
+        self.step += 1
+
+    def sample(self):
+        indices, valid = history_indices(self.step, self.count, self.stride)
+        start = self.step - len(self.frames) + 1
+        frames = torch.stack([self.frames[int(i) - start] for i in indices], 1)
+        masks = torch.stack([self.masks[int(i) - start] for i in indices], 1)
+        masks = masks & valid.to(masks.device)[None, :, None, None, None]
+        return frames, masks

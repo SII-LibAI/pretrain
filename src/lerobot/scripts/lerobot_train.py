@@ -20,7 +20,6 @@ from pprint import pformat
 from typing import Any
 
 import torch
-import multiprocessing as mp
 from accelerate import Accelerator
 from accelerate.utils import send_to_device
 from termcolor import colored
@@ -40,7 +39,6 @@ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker, format_tim
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
-    get_step_identifier,
     load_training_state,
     save_checkpoint,
     update_last_checkpoint,
@@ -112,7 +110,7 @@ def update_policy(
 
     is_wsa = getattr(accelerator.unwrap_model(policy), "name", None) == "WSA_1_5"
     if is_wsa:
-        from lerobot.policies.wsa1_5.timing import StageTimer
+        from lerobot.policies.wsa1_5.utils.timing import StageTimer
 
         update_timer = StageTimer(loss.device)
     # Use accelerator's backward method
@@ -162,8 +160,8 @@ def update_policy(
         train_metrics.loss_subtask = output_dict["loss_subtask"]
     if "loss_physical" in output_dict:
         train_metrics.loss_physical = output_dict["loss_physical"]
-    for key in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature", "input_s", "mot_s", "pred_s",
-                "backward_s", "optimizer_s"]:
+    for key in ["loss_rgb_flow", "loss_motion_flow", "loss_3d_feature", "loss_action_flow",
+                "input_s", "mot_s", "pred_s", "backward_s", "optimizer_s"]:
         if key in output_dict:
             setattr(train_metrics, key, output_dict[key])
     train_metrics.grad_norm = grad_norm.item()
@@ -177,6 +175,10 @@ def update_policy(
     train_metrics.lr = group_lrs.get("action", optimizer.param_groups[0]["lr"])
     if output_dict is not None and group_lrs:
         output_dict.update({f"lr/{name}": lr for name, lr in group_lrs.items()})
+        if "action" in group_lrs:
+            output_dict["action_lr"] = group_lrs["action"]
+            if is_wsa:
+                train_metrics.action_lr = group_lrs["action"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
@@ -407,6 +409,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             train_metrics[metric] = AverageMeter(metric, ":.3f")
         for metric in ["input_s", "mot_s", "pred_s", "backward_s", "optimizer_s"]:
             train_metrics[metric] = AverageMeter(metric, ":.3f")
+        if cfg.policy.enable_action:
+            for metric in ["loss_action_flow", "action_lr"]:
+                train_metrics[metric] = AverageMeter(metric, ":.3f")
 
 
     # Use effective batch size for proper epoch calculation in distributed training
@@ -453,7 +458,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         step += 1
         train_tracker.step()
         if cfg.policy.type == "WSA_1_5" and is_main_process and cfg.eval_freq > 0 and step % cfg.eval_freq == 0:
-            from lerobot.policies.wsa1_5.visualization import save_training_sample
+            from lerobot.policies.wsa1_5.utils.visualization import save_training_sample
 
             snapshot_dir = save_training_sample(batch, dataset, cfg.output_dir / "validation", step)
             logging.info("[WSA sample] saved current batch snapshot to %s", snapshot_dir)

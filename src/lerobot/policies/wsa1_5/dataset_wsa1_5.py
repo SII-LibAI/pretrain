@@ -20,10 +20,15 @@ from torch.utils.data._utils.collate import default_collate
 
 from lerobot.dataset_schemas import get_registry, get_schema
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.transforms.core import DeltaActionTransformFn, NormalizeTransformFn
 
 from .configuration_wsa1_5 import WSA1_5DatasetConfig
-from .text_embeddings import PROMPT_VERSION, TextEmbeddingCache
-from .video import decode_video_frames
+from .text_embeddings import PROMPT_PREFIX, PROMPT_VERSION, TextEmbeddingCache
+from .utils.temporal import history_indices
+from .utils.video import decode_video_frames
+from .utils.visual_augmentation import (
+    CAMERA_WEIGHTS, apply_pixel_augmentation, load_visual_augmentation, sample_pixel_augmentation,
+)
 
 HAND_NAMES = {0: "left hand", 1: "right hand", 2: "both hands"}
 
@@ -71,13 +76,173 @@ class Segment:
     metadata_valid: bool
 
 
-def condition_text(episode, subtask):
+def condition_text(episode, subtask=None):
     # Only read fields verified in the real sample. Unknown optional fields are empty.
     task = episode.get("task_instruction", "") or ""
+    prefix = f"{PROMPT_PREFIX}\nTask: {task}"
+    if subtask is None:
+        return prefix
     instruction = subtask.get("subtask_text", "") or ""
     hand = HAND_NAMES.get(subtask.get("hand_used"), "")
     scene = episode.get("scene", "") or ""
-    return f"You are a world modeling agent observing an interacting through multi-view video observations.:Task: {task}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
+    return f"{prefix}\nSubtask: {instruction}\nHand: {hand}\nScene: {scene}"
+
+
+def episode_task_texts(annotation, metadata):
+    """Use the sidecar's original task, or the tasks recorded by LeRobot."""
+    task = annotation.get("task_instruction")
+    if task is not None and not isinstance(task, str):
+        raise ValueError("Original task_instruction must be a string")
+    tasks = [task] if task else metadata.get("tasks", [])
+    if (not isinstance(tasks, list) or not tasks
+            or any(not isinstance(value, str) or not value.strip() for value in tasks)):
+        raise ValueError("Missing or invalid original task in sidecar and episode metadata")
+    return list(dict.fromkeys(tasks))
+
+
+def load_sidecar_annotations(path):
+    path = Path(path)
+    sidecar = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    if not isinstance(sidecar, list):
+        raise ValueError("Verified sidecar schema is a list of episode objects")
+    annotations = {}
+    for row in sidecar:
+        if not isinstance(row, dict) or row.get("episode_index") is None:
+            logging.warning("[WSA sidecar] dropped annotation without episode_index")
+            continue
+        try:
+            ep = int(row["episode_index"])
+        except (TypeError, ValueError):
+            raise ValueError("Invalid non-null sidecar episode_index") from None
+        if isinstance(row["episode_index"], bool) or isinstance(row["episode_index"], float) and row["episode_index"] != ep:
+            raise ValueError("Sidecar episode_index must be integral, never rounded")
+        if ep in annotations:
+            raise ValueError(f"Duplicate sidecar episode_index {ep}")
+        annotations[ep] = row
+    return annotations
+
+
+def control_mode(schema):
+    # The current registry names control space `action_mode`, not abs/delta.
+    modes = {"joint": "joint", "end_effector": "endpose_effector", "endpose_effector": "endpose_effector"}
+    if schema.action_mode not in modes:
+        raise ValueError(f"Schema {schema.robot_type} requires control mode joint or endpose_effector")
+    return modes[schema.action_mode]
+
+
+def action_prompt(task, mode, action_mode, *, annotation=None, subtask=None):
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("Action prompt requires an actual task instruction")
+    if mode not in {"joint", "endpose_effector"} or action_mode not in {"abs", "delta"}:
+        raise ValueError("Invalid control/action mode")
+    # Preserve verified Stage-1 subtask/hand/scene semantics, using ordinary UMT5 text.
+
+    text = condition_text({**(annotation or {}), "task_instruction": task}, subtask)
+    return f"{text}\nControl Mode: {mode}\nAction Mode: {action_mode}"
+
+
+def _reorder(value, spec, dim):
+    if spec is None:
+        if value.shape[-1] != dim:
+            raise ValueError(f"Schema vector dimension {value.shape[-1]} != configured {dim}")
+        return value
+    out = value.new_zeros(*value.shape[:-1], dim)
+    used = set()
+    for lo, hi, start, end in spec:
+        if not (0 <= lo < hi <= value.shape[-1] and 0 <= start < end <= dim and hi - lo == end - start):
+            raise ValueError("Invalid schema state/action reorder bounds")
+        if used.intersection(range(start, end)):
+            raise ValueError("Overlapping schema reorder destinations")
+        used.update(range(start, end))
+        out[..., start:end] = value[..., lo:hi]
+    return out
+
+
+class ActionCodec:
+    """Use schema mappings and the stats already selected by the dataset factory."""
+    def __init__(self, meta, config):
+        self.schema = get_schema(meta.robot_type)
+        self.control_mode = control_mode(self.schema)
+        self.config = config
+        self.state_keys, self.action_keys = self.schema.get_state_keys(), self.schema.get_action_keys()
+        present = [key in meta.features for key in self.action_keys]
+        if any(present) and not all(present):
+            raise ValueError(f"Partial action schema for {meta.robot_type}: {self.action_keys}")
+        self.has_action = all(present)
+        self.has_state = all(key in meta.features for key in self.state_keys)
+        if self.has_action and not self.has_state:
+            raise ValueError("Action supervision requires the current state features declared by the schema")
+        self.stats = {}
+        if not self.has_state and not self.has_action:
+            return  # Masked placeholders for world-only sources in a mixed dataset.
+        stats = meta.stats
+        for key in self.state_keys + (self.action_keys if self.has_action else []):
+            dim = meta.features[key]["shape"]
+            if len(dim) != 1:
+                raise ValueError(f"State/action source {key} must be a vector feature")
+            entry = {name: np.asarray(stats[key][name], dtype=np.float32) for name in ["mean", "std"]}
+            if (any(value.shape != tuple(dim) or not np.isfinite(value).all() for value in entry.values())
+                    or (entry["std"] < 0).any()):
+                raise ValueError(f"Invalid mean/std statistics for {key}")
+            self.stats[key] = entry
+        self.normalize_state = NormalizeTransformFn(selected_keys=self.state_keys, mode="mean_std", norm_stats=self.stats)
+        self.normalize_action = NormalizeTransformFn(selected_keys=self.action_keys, mode="mean_std", norm_stats=self.stats)
+        state_size = sum(meta.features[k]["shape"][0] for k in self.state_keys)
+        self.delta = self.schema.action_mask
+        self.delta_transform = DeltaActionTransformFn(mask=self.delta, mapping=self.schema.feature_mapping,
+                                                       robot_type=meta.robot_type)
+        if self.has_action:
+            action_size = sum(meta.features[k]["shape"][0] for k in self.action_keys)
+            if config.action_mode == "delta" and (self.delta.numel() != action_size or state_size != action_size):
+                raise ValueError("Delta action requires an explicit schema mask and aligned state/action coordinates")
+            self.action_sizes = [meta.features[k]["shape"][0] for k in self.action_keys]
+        _reorder(torch.zeros(state_size), self.schema.state_reorder, config.state_dim)
+        if self.has_action:
+            _reorder(torch.zeros(action_size), self.schema.action_reorder, config.action_dim)
+
+    def encode(self, state, action=None):
+        cfg = self.config
+        raw = torch.cat([torch.as_tensor(state[k], dtype=torch.float32) for k in self.state_keys], -1)
+        if raw.ndim != 1 or not torch.isfinite(raw).all():
+            raise ValueError("Current state must be a finite vector")
+        normalized_state = self.normalize_state({key: torch.as_tensor(state[key], dtype=torch.float32)
+                                           for key in self.state_keys})
+        result = {"state": _reorder(torch.cat([normalized_state[k] for k in self.state_keys], -1),
+                                    self.schema.state_reorder, cfg.state_dim), "state_valid": torch.tensor(True)}
+        if action is None:
+            return result
+        values = {key: torch.as_tensor(action[key], dtype=torch.float32) for key in self.action_keys}
+        chunk = torch.cat([values[k] for k in self.action_keys], -1)
+        if chunk.ndim != 2 or not torch.isfinite(chunk).all():
+            raise ValueError("Actions must be a finite [chunk,source_action_dim] tensor")
+        if cfg.action_mode == "delta":
+            data = {**values, **{k: torch.as_tensor(state[k], dtype=torch.float32) for k in self.state_keys}}
+            values = self.delta_transform(data)
+            values = {key: values[key] for key in self.action_keys}
+        norm = self.normalize_action(values)
+        result["action"] = _reorder(torch.cat([norm[k] for k in self.action_keys], -1),
+                                    self.schema.action_reorder, cfg.action_dim)
+        return result
+
+    def decode(self, action, state):
+        """Return absolute actions in canonical schema order, in physical units."""
+        if action.shape[-1] != self.config.action_dim or not torch.isfinite(action).all():
+            raise ValueError("Invalid normalized action chunk")
+        mean = torch.cat([torch.from_numpy(self.stats[k]["mean"]) for k in self.action_keys])
+        std = torch.cat([torch.from_numpy(self.stats[k]["std"]) + 1e-6 for k in self.action_keys])
+        mean = _reorder(mean, self.schema.action_reorder, self.config.action_dim).to(action)
+        std = _reorder(std, self.schema.action_reorder, self.config.action_dim).to(action)
+        out = action.float() * std + mean
+        if self.config.action_mode == "delta":
+            raw = torch.cat([torch.as_tensor(state[k], device=action.device, dtype=torch.float32)
+                             for k in self.state_keys], -1)
+            if action.ndim == 3 and raw.ndim == 1 and action.shape[0] == 1:
+                raw = raw[None]
+            if raw.shape[:-1] != action.shape[:-2] or not torch.isfinite(raw).all():
+                raise ValueError("Raw current state batch must match the action batch exactly")
+            offset = _reorder(raw * self.delta.to(raw.device), self.schema.action_reorder, self.config.action_dim)
+            out = out + offset.unsqueeze(-2)
+        return out
 
 
 class LoadedEpisodeMetadata:
@@ -106,8 +271,22 @@ class LoadedEpisodeMetadata:
 
 
 class WSA1_5Dataset(Dataset):
-    def __init__(self, base, config: WSA1_5DatasetConfig, *, include_3d_targets=True, text_embedding_shape=None):
+    def __init__(self, base, config: WSA1_5DatasetConfig, *, include_3d_targets=True, text_embedding_shape=None,
+                 action_config=None, training=True):
         self.base, self.config = base, config
+        if type(training) is not bool:
+            raise TypeError("training must be boolean")
+        self.augmentation_config = (
+            load_visual_augmentation(config.image_augmentation_config,
+                                     image_augment=config.image_augment, object_paste=config.object_paste)
+            if training else None
+        )
+        self.action_config = action_config
+        self.action_codec = None
+        if action_config is not None:
+            if config.action_mode != action_config.action_mode:
+                raise ValueError("dataset.action_mode and policy.action_mode must match")
+            self.action_codec = ActionCodec(base.meta, action_config)
         if type(include_3d_targets) is not bool:
             raise TypeError("include_3d_targets must be boolean")
         self.include_3d_targets = include_3d_targets
@@ -115,6 +294,10 @@ class WSA1_5Dataset(Dataset):
         self.meta = base.meta
         self.root = Path(base.root)
         base._ensure_hf_dataset_loaded()
+        if self.action_codec is not None and self.action_codec.has_action:
+            action_table = base.hf_dataset.select_columns(self.action_codec.action_keys).with_format("arrow")[:]
+            if any(column.null_count for column in action_table.columns) and not action_table.drop_null().num_rows:
+                raise ValueError("Source declares action features but has no valid action rows; mark world-only sources explicitly")
         # Arrow bypasses the HF per-scalar Torch transform and honors filtered row order.
         columns = ["timestamp", "frame_index", "episode_index"]
         table = base.hf_dataset.select_columns(columns).with_format("arrow")[:]
@@ -164,23 +347,8 @@ class WSA1_5Dataset(Dataset):
             if key and key in base.meta.features and base.meta.features[key]["dtype"] != "video":
                 raise ValueError(f"WSA V3 adapter expects a video feature for {key}")
         sidecar_path = self.root / config.sidecar_file
-        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8")) if sidecar_path.exists() else []
-        if not isinstance(sidecar, list):
-            raise ValueError("Verified sidecar schema is a list of episode objects")
-        annotations = {}
-        for row in sidecar:
-            if not isinstance(row, dict) or row.get("episode_index") is None:
-                logging.warning("[WSA sidecar] dropped annotation without episode_index")
-                continue
-            try:
-                ep = int(row["episode_index"])
-            except (TypeError, ValueError):
-                raise ValueError("Invalid non-null sidecar episode_index") from None
-            if isinstance(row["episode_index"], bool) or isinstance(row["episode_index"], float) and row["episode_index"] != ep:
-                raise ValueError("Sidecar episode_index must be integral, never rounded")
-            if ep in annotations:
-                raise ValueError(f"Duplicate sidecar episode_index {ep}")
-            annotations[ep] = row
+        annotations = ({} if action_config is not None and not config.use_subtask
+                       else load_sidecar_annotations(sidecar_path))
         self.sidecar_digest = hashlib.sha256(sidecar_path.read_bytes() if sidecar_path.exists() else b"").hexdigest()
         self.segments = []
         self._build_segments(annotations)
@@ -239,13 +407,44 @@ class WSA1_5Dataset(Dataset):
                 ids.add(sid)
                 occupied[first:last + 1] = True
                 self._add_segment(Segment(int(ep), int(start + first), int(start + last),
-                                          sid, condition_text(annotation, subtask), True))
-            # Missing labels: blank condition, bounded interval, no endpoint/3D supervision.
+                                          sid, self._condition_text(annotation, subtask), True))
+            # Missing subtask labels retain the original task, without endpoint/3D supervision.
             missing = np.flatnonzero(~occupied)
             for run in np.split(missing, np.flatnonzero(np.diff(missing) > 1) + 1):
                 if len(run):
-                    self._add_segment(Segment(int(ep), int(start + run[0]), int(start + run[-1]),
-                                              -1, "", False))
+                    self._add_task_segments(ep, start, run, annotation)
+
+    def _add_task_segments(self, ep, start, run, annotation):
+        tasks = episode_task_texts(annotation, self.meta.episodes[ep])
+        if len(tasks) == 1:
+            self._add_segment(Segment(ep, int(start + run[0]), int(start + run[-1]),
+                                      -1, self._condition_text({"task_instruction": tasks[0]}), False))
+            return
+        # Multiple tasks in one episode must follow the frame's actual task_index.
+        column = "task_index"
+        if "galaxea" in self.repo_id and "coarse_task_index" in self.base.hf_dataset.column_names:
+            column = "coarse_task_index"
+        table = self.base.hf_dataset.select_columns([column]).with_format("arrow")[start + run[0]:start + run[-1] + 1]
+        indices = table[column]
+        if indices.null_count or not pa.types.is_integer(indices.type):
+            raise ValueError(f"Episode {ep} has invalid {column}")
+        indices = indices.to_numpy()
+        names = self.base.meta.tasks.index
+        if (indices < 0).any() or (indices >= len(names)).any():
+            raise ValueError(f"Episode {ep} has out-of-range {column}")
+        cuts = np.flatnonzero(indices[1:] != indices[:-1]) + 1
+        for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, len(indices)], strict=True):
+            task = names[int(indices[lo])]
+            if task not in tasks:
+                raise ValueError(f"Episode {ep} frame task is absent from episode tasks")
+            self._add_segment(Segment(ep, int(start + run[lo]), int(start + run[hi - 1]),
+                                      -1, self._condition_text({"task_instruction": task}), False))
+
+    def _condition_text(self, annotation, subtask=None):
+        if self.action_config is None:
+            return condition_text(annotation, subtask)
+        return action_prompt(annotation["task_instruction"], self.action_codec.control_mode,
+                             self.action_config.action_mode, annotation=annotation, subtask=subtask)
 
     def _add_segment(self, segment):
         self.segments.append(segment)
@@ -291,10 +490,28 @@ class WSA1_5Dataset(Dataset):
         future_ts = self.timestamps[future_indices]
         all_ts = np.concatenate(([self.timestamps[idx]], future_ts))
         need_goal = self.include_3d_targets and segment.metadata_valid
-        goal_in_window = need_goal and segment.last <= future_indices[-1]
+        goal_index = segment.last
+        history_count = 0
+        if self.action_config is not None:
+            cfg = self.action_config
+            entry = self.meta.episodes[segment.episode]
+            first, end = entry["dataset_from_index"], entry["dataset_to_index"]
+            history, history_valid = history_indices(idx - first, cfg.num_history_frame, cfg.history_frame_stride)
+            history_count = cfg.num_history_frame
+            all_ts = np.concatenate((all_ts, self.timestamps[first + history[:-1]]))
+            if not segment.metadata_valid:
+                need_goal = self.include_3d_targets and self.config.allow_endframe_3d
+                goal_index = end - 1
+        goal_in_window = need_goal and goal_index <= future_indices[-1]
         if goal_in_window:
-            all_ts = np.concatenate((all_ts, [self.timestamps[segment.last]]))
+            all_ts = np.concatenate((all_ts, [self.timestamps[goal_index]]))
         views, view_valid = zip(*(self._decode(key, all_ts, segment.episode) for key in self.view_keys), strict=True)
+        augment_params = None
+        if self.augmentation_config is not None:
+            shapes = {name: view.shape[-2:] for name, view, valid in
+                      zip(CAMERA_WEIGHTS, views, view_valid, strict=True) if valid.any()}
+            augment_params = sample_pixel_augmentation(self.augmentation_config, shapes)
+            views = self._augment_views(views, view_valid, augment_params)
         window_length = 1 + self.config.future_frames
         canvas, pixels_valid = compose_rgb_views([view[:window_length] for view in views],
                                                  [mask[:window_length] for mask in view_valid],
@@ -319,7 +536,10 @@ class WSA1_5Dataset(Dataset):
                 goal_views = [view[-1].clone() for view in views]
                 goal_valid = [bool(mask[-1]) for mask in view_valid]
             elif need_goal:
-                goals = [self._decode(key, [self.timestamps[segment.last]], segment.episode) for key in self.view_keys]
+                goals = [self._decode(key, [self.timestamps[goal_index]], segment.episode) for key in self.view_keys]
+                if augment_params is not None:
+                    frames, masks = zip(*goals, strict=True)
+                    goals = list(zip(self._augment_views(frames, masks, augment_params), masks, strict=True))
                 goal_views = [frames[0].clone() for frames, _ in goals]
                 goal_valid = [bool(mask[0]) for _, mask in goals]
             else:
@@ -330,17 +550,61 @@ class WSA1_5Dataset(Dataset):
                 "goal_view_valid": torch.tensor(goal_valid),
             })
         condition = build_inference_condition(normalized[0], segment.text, observed_valid=pixels_valid[0])
+        if self.action_config is not None:
+            if history_count:
+                history_canvas, history_pixels = compose_rgb_views(
+                    [view[window_length:window_length + history_count] for view in views],
+                    [mask[window_length:window_length + history_count] for mask in view_valid],
+                    self.config.rgb_height, self.config.rgb_width)
+                condition["history_rgb"] = history_canvas * 2 - 1
+                condition["history_valid"] = history_pixels & history_valid[:-1, None, None, None]
+            condition.update(self._action_sample(idx, segment.episode, targets))
         if self.text_embeddings is not None:
             condition["text_embedding"], condition["text_valid"] = self.text_embeddings.get(segment.text)
         return {
             **condition,
             "targets": targets, "sample_id": f"{self.repo_id}:{segment.episode}:{int(self.frame_indices[idx])}",
             "episode_index": segment.episode, "subtask_id": segment.subtask,
-            "start_timestamp": float(self.timestamps[idx]), "goal_timestamp": float(self.timestamps[segment.last]),
+            "start_timestamp": float(self.timestamps[idx]), "goal_timestamp": float(self.timestamps[goal_index]),
             "frame_timestamps": torch.from_numpy(future_ts.copy()), "future_frame_valid": valid_time,
             "metadata_valid": segment.metadata_valid, "sidecar_digest": self.sidecar_digest,
             "prompt_version": PROMPT_VERSION,
         }
+
+    @staticmethod
+    def _augment_views(views, masks, params):
+        return [apply_pixel_augmentation(frames, params, name).masked_fill(~mask[:, None, None, None], 0)
+                if mask.any() else frames
+                for name, frames, mask in zip(CAMERA_WEIGHTS, views, masks, strict=True)]
+
+    def _action_sample(self, idx, ep, targets):
+        cfg, codec = self.action_config, self.action_codec
+        entry = self.meta.episodes[ep]
+        requested = idx + np.arange(cfg.action_chunk_size) * cfg.action_frame_stride
+        valid = torch.from_numpy(requested < entry["dataset_to_index"])
+        indices = np.minimum(requested, entry["dataset_to_index"] - 1)
+        action = torch.zeros(cfg.action_chunk_size, cfg.action_dim)
+        mask = torch.zeros_like(action, dtype=torch.bool)
+        state = {"state": torch.zeros(cfg.state_dim), "state_valid": torch.tensor(False)}
+        if codec.has_state:
+            keys = codec.state_keys + (codec.action_keys if codec.has_action else [])
+            table = self.base.hf_dataset.select_columns(keys).with_format("arrow")[idx:int(indices[-1]) + 1]
+            raw_state = {key: table[key][0].as_py() for key in codec.state_keys}
+            raw_action = ({key: [table[key][int(i) - idx].as_py() for i in indices] for key in codec.action_keys}
+                          if codec.has_action else None)
+            if raw_action is not None:
+                for step in range(cfg.action_chunk_size):
+                    if any(raw_action[key][step] is None for key in codec.action_keys):
+                        valid[step] = False
+                        for key, size in zip(codec.action_keys, codec.action_sizes, strict=True):
+                            raw_action[key][step] = [0.0] * size  # Explicitly masked missing label, never supervision.
+            state = codec.encode(raw_state, raw_action)
+            if codec.has_action:
+                action = state.pop("action")
+                dims = _reorder(torch.ones(sum(codec.action_sizes)), codec.schema.action_reorder, cfg.action_dim).bool()
+                mask = valid[:, None] & dims[None]
+        targets.update(action=action, action_valid_mask=mask)
+        return state
 
 
 def wsa1_5_collate(samples):

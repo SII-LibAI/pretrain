@@ -9,6 +9,8 @@ import sys
 from types import SimpleNamespace
 
 import draccus
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from lerobot.configs.train import TrainPipelineConfig
@@ -20,10 +22,14 @@ PROJECT = Path(__file__).resolve().parents[1]
 
 
 def add_dataset(root):
-    (root / "meta").mkdir(parents=True)
+    (root / "meta").mkdir(parents=True, exist_ok=True)
     (root / "meta/info.json").write_text(json.dumps({"total_frames": 40, "total_episodes": 1}), encoding="utf-8")
-    (root / "data").mkdir()
-    (root / "videos").mkdir()
+    (root / "data").mkdir(exist_ok=True)
+    (root / "videos").mkdir(exist_ok=True)
+    episode_dir = root / "meta/episodes/chunk-000"
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"episode_index": [0], "tasks": [["knit"]],
+                             "dataset_from_index": [0], "dataset_to_index": [40]}), episode_dir / "file-000.parquet")
 
 
 @pytest.fixture
@@ -62,6 +68,23 @@ def parse_policy(arguments):
         f"--{key.removeprefix('policy.')}={value}" for key, value in arguments.items()
         if key.startswith("policy.") and key != "policy.type"
     ]])
+
+
+@pytest.mark.parametrize("image_augment,object_paste", [("false", "false"), ("true", "false"),
+                                                       ("false", "true"), ("true", "true")])
+def test_launcher_passes_independent_rgb_augmentation_switches(launch, image_augment, object_paste):
+    args = launch(IMAGE_AUGMENT=image_augment, OBJECT_PASTE=object_paste,
+                  IMAGE_AUGMENTATION_CONFIG="custom recipe.yaml", PET_NNODES="1", PET_NODE_RANK="0",
+                  PET_NPROC_PER_NODE="1", PET_MASTER_ADDR="127.0.0.1", PET_MASTER_PORT="29500")
+    assert args["dataset.image_augment"] == image_augment
+    assert args["dataset.object_paste"] == object_paste
+    assert args["dataset.image_augmentation_config"] == "custom recipe.yaml"
+    config = draccus.parse(WSA1_5DatasetConfig, args=["--repo_id=fixture", *[
+        f"--{name}={args['dataset.' + name]}"
+        for name in ["image_augment", "object_paste", "image_augmentation_config"]
+    ]])
+    assert config.image_augment == (image_augment == "true")
+    assert config.object_paste == (object_paste == "true")
 
 
 def test_launcher_preserves_assigned_defaults_and_removes_supervision_switch(launch):

@@ -7,8 +7,10 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-GROUPS = ("O", "R", "M", "G")
-VISIBLE = {"O": ("O",), "R": ("O", "R"), "M": ("O", "M"), "G": GROUPS}
+WORLD_GROUPS = ("O", "R", "M", "G")
+GROUPS = (*WORLD_GROUPS, "A")
+VISIBLE = {"O": ("O",), "R": ("O", "R"), "M": ("O", "M"), "G": ("O", "R", "M", "G"),
+           "A": ("O", "G", "A")}
 
 
 def build_causal_attention_mask(lengths: Mapping[str, int], *, valid_tokens=None, device=None):
@@ -18,7 +20,7 @@ def build_causal_attention_mask(lengths: Mapping[str, int], *, valid_tokens=None
     key padding, returning [B,1,N,N]; without padding the result is [N,N].
     """
     if set(lengths) - set(GROUPS) or any(not isinstance(n, int) or n < 0 for n in lengths.values()):
-        raise ValueError("Expected non-negative integer O/R/M/G token lengths")
+        raise ValueError("Expected non-negative integer O/R/M/G/A token lengths")
     offsets, cursor = {}, 0
     for group in GROUPS:
         n = lengths.get(group, 0)

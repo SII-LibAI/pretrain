@@ -516,6 +516,7 @@ class WanVideoDiT(torch.nn.Module):
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
         control_camera_latents_input: Optional[torch.Tensor] = None,
+        temporal_rope_positions=None,
     ) -> Dict[str, Any]:
         x, timestep, context_mask = self._validate_forward_inputs(
             x=x,
@@ -600,8 +601,16 @@ class WanVideoDiT(torch.nn.Module):
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
+        # PrismWAM's explicit ordinal frame positions; default keeps Stage-1 RoPE unchanged.
+        temporal_freqs = self.freqs[0][:f]
+        if temporal_rope_positions is not None:
+            positions = list(temporal_rope_positions)
+            if len(positions) != f or any(type(p) is not int or not 0 <= p < self.freqs[0].shape[0] for p in positions):
+                raise ValueError("Temporal RoPE positions must match latent frames and fit the frequency table")
+            indices = torch.tensor(positions, dtype=torch.long, device=self.freqs[0].device)
+            temporal_freqs = self.freqs[0].index_select(0, indices)
         freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            temporal_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)

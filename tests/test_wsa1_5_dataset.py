@@ -11,7 +11,7 @@ import torch
 from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5DatasetConfig
 from lerobot.datasets.utils import load_nested_dataset
 from lerobot.policies.wsa1_5.dataset_wsa1_5 import (
-    WSA1_5Dataset, build_inference_condition, compose_rgb_views, wsa1_5_collate,
+    WSA1_5Dataset, build_inference_condition, compose_rgb_views, condition_text, wsa1_5_collate,
 )
 
 
@@ -25,6 +25,10 @@ def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, includ
               future_frames=32):
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "meta").mkdir(exist_ok=True)
+    episode_dir = tmp_path / "meta/episodes/chunk-000"
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"episode_index": [0], "tasks": [["knit"]],
+                             "dataset_from_index": [0], "dataset_to_index": [40]}), episode_dir / "file-000.parquet")
     if annotations:
         (tmp_path / "meta/sidecar.json").write_text(json.dumps([{
             "episode_index": 0, "task_instruction": "knit", "scene": "home", "subtasks": [
@@ -35,7 +39,7 @@ def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, includ
     features = {key: {"dtype": "video", "shape": [16, 16, 3]} for key in ["rgb", "observation.motion"]}
     meta = SimpleNamespace(features=features, episodes=[{
         **{f"videos/{key}/from_timestamp": 2.0 for key in features},
-        "dataset_from_index": 0, "dataset_to_index": 40,
+        "dataset_from_index": 0, "dataset_to_index": 40, "tasks": ["knit"],
     }], robot_type="egodex_v", total_episodes=1, stats={})
     meta.get_video_file_path = lambda ep, key: key
     meta.episodes = {0: meta.episodes[0], "dataset_from_index": [0], "dataset_to_index": [40]}
@@ -204,7 +208,7 @@ def test_filtered_reader_rejects_missing_or_extra_columns(tmp_path, columns):
 def test_missing_annotations_and_collate(tmp_path, monkeypatch):
     ds, _ = make_data(tmp_path, monkeypatch, False)
     sample = ds[0]
-    assert sample["condition_text"] == ""
+    assert sample["condition_text"] == condition_text({"task_instruction": "knit"})
     assert not sample["metadata_valid"]
     assert not sample["targets"]["goal_view_valid"].any()
     batch = wsa1_5_collate([sample, ds[39]])
@@ -243,7 +247,7 @@ def test_duplicate_views_rejected():
 
 
 @pytest.mark.parametrize("field", ["episode_index", "subtasks", "start_frame"])
-def test_null_annotation_fields_clear_condition(tmp_path, monkeypatch, field):
+def test_null_annotation_fields_retain_original_task(tmp_path, monkeypatch, field):
     ds, _ = make_data(tmp_path, monkeypatch)
     path = tmp_path / "meta/sidecar.json"
     sidecar = json.loads(path.read_text())
@@ -254,5 +258,29 @@ def test_null_annotation_fields_clear_condition(tmp_path, monkeypatch, field):
     path.write_text(json.dumps(sidecar))
     rebuilt = WSA1_5Dataset(ds.base, ds.config)
     sample = rebuilt[np.flatnonzero(rebuilt.sample_indices == 0)[0]]
-    assert sample["condition_text"] == "" and not sample["metadata_valid"]
+    assert sample["condition_text"] == condition_text({"task_instruction": "knit"})
+    assert not sample["metadata_valid"]
     assert not sample["targets"]["goal_view_valid"].any()
+
+
+def test_subtask_gaps_keep_task_only_text_and_mask_3d(tmp_path, monkeypatch):
+    ds, _ = make_data(tmp_path, monkeypatch)
+    path = tmp_path / "meta/sidecar.json"
+    sidecar = json.loads(path.read_text())
+    sidecar[0]["subtasks"] = sidecar[0]["subtasks"][:1]
+    path.write_text(json.dumps(sidecar))
+    rebuilt = WSA1_5Dataset(ds.base, ds.config)
+    prompt = "You are a robot control agent,follow the instruction.\nTask: knit"
+    for index in (10, 20, 39):
+        sample = rebuilt[index]
+        assert sample["condition_text"] == prompt
+        assert sample["subtask_id"] == -1 and not sample["metadata_valid"]
+        assert not sample["targets"]["goal_view_valid"].any()
+    assert "Subtask: loop" in rebuilt[0]["condition_text"]
+
+
+def test_missing_original_task_is_not_replaced_by_empty_text(tmp_path, monkeypatch):
+    ds, _ = make_data(tmp_path, monkeypatch, annotations=False)
+    ds.base.meta.episodes[0]["tasks"] = []
+    with pytest.raises(ValueError, match="original task"):
+        WSA1_5Dataset(ds.base, ds.config)

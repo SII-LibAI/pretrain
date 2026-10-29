@@ -29,12 +29,17 @@ def decode_video_frames(path, timestamps, tolerance_s, backend, num_threads=1):
         stream = container.streams.video[0]
         # Each GPU has its own DataLoader workers; FFmpeg auto-threading oversubscribes the node.
         stream.codec_context.thread_count = num_threads
-        container.seek(int(unique[0] / float(stream.time_base)), stream=stream, backward=True, any_frame=False)
+        if stream.start_time is None:
+            raise ValueError(f"Video stream has no start timestamp: {path}")
+        pts_offset = float(stream.start_time * stream.time_base)
+        # Queries use the file's logical timeline; seek uses the original PTS timeline.
+        seek_pts = stream.start_time + int(np.floor(unique[0] / float(stream.time_base)))
+        container.seek(seek_pts, stream=stream, backward=True, any_frame=False)
         previous, previous_ts = None, None
         for frame in container.decode(stream):
             if frame.pts is None:
                 raise ValueError(f"Video frame has no presentation timestamp: {path}")
-            timestamp = float(frame.pts * frame.time_base)
+            timestamp = float(frame.pts * frame.time_base) - pts_offset
             while len(selected) < len(unique) and unique[len(selected)] <= timestamp:
                 requested = unique[len(selected)]
                 if previous is not None and abs(previous_ts - requested) <= abs(timestamp - requested):

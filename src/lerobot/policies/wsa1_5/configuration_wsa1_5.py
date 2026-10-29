@@ -7,7 +7,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import MultiGroupCosineDecayWithWarmupSchedulerConfig
 
-from .temporal import TemporalLayout
+from .utils.temporal import TemporalLayout
 
 
 @PreTrainedConfig.register_subclass("WSA_1_5")
@@ -72,9 +72,67 @@ class WSA1_5Config(PreTrainedConfig):
     scheduler_warmup_steps: int = 2000
     scheduler_decay_steps: int = 600000
     scheduler_decay_lr_ratio: float = 0.1
+    enable_action: bool = False
+    state_dim: int | None = None
+    action_dim: int | None = None
+    action_hidden_dim: int = 1024
+    action_ffn_dim: int = 4096
+    action_num_layers: int | None = None  # None follows the world backbone depth.
+    action_chunk_size: int = 32
+    action_frame_stride: int = 1
+    action_sampler_steps: int = 10
+    action_flow_shift: float = 5.0  # WSA-L action scheduler, independent of RGB shift.
+    action_mode: str = "delta"
+    num_history_frame: int = 4
+    history_frame_stride: int = 2
+    sparse_frame_encoding: str = "joint"  # joint video VAE | independent one-frame VAE calls.
+    lambda_action: float = 1.0
+    action_lr: float = 1e-4
+    rgb_finetune_mode: str = "lora"  # Applied only when enable_action=True.
+    rgb_lora_rank: int = 16
+    rgb_lora_alpha: int = 32
+    rgb_lora_dropout: float = 0.0
+    rgb_lora_target_modules: tuple[str, ...] = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o")
+    init_checkpoint_path: str | None = None
 
     def __post_init__(self):
         super().__post_init__()
+        if type(self.enable_action) is not bool:
+            raise TypeError("enable_action must be boolean")
+        if self.sparse_frame_encoding not in {"joint", "independent"}:
+            raise ValueError("sparse_frame_encoding must be joint or independent")
+        if self.enable_action:
+            for name in ["state_dim", "action_dim", "action_hidden_dim", "action_ffn_dim", "action_chunk_size",
+                         "action_frame_stride", "action_sampler_steps", "history_frame_stride",
+                         "rgb_lora_rank", "rgb_lora_alpha"]:
+                if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                    raise ValueError(f"Action post-training requires explicit positive integer {name}")
+            if type(self.num_history_frame) is not int or self.num_history_frame < 0:
+                raise ValueError("num_history_frame must be a non-negative integer")
+            if self.sparse_frame_encoding == "joint" and self.num_history_frame % 4:
+                raise ValueError("PrismWAM video history requires num_history_frame to be a multiple of 4 (history + current = 4n+1)")
+            if self.action_num_layers is not None and (type(self.action_num_layers) is not int
+                                                       or self.action_num_layers != self.num_layers):
+                raise ValueError("Parallel MoT requires action_num_layers == num_layers")
+            if self.action_hidden_dim % 2:
+                raise ValueError("Action positional embedding requires even action_hidden_dim")
+            if self.action_mode not in {"abs", "delta"}:
+                raise ValueError("action_mode must be abs or delta")
+            if self.rgb_finetune_mode not in {"frozen", "lora", "full"}:
+                raise ValueError("rgb_finetune_mode must be frozen, lora or full")
+            if self.freeze_rgb and self.rgb_finetune_mode != "frozen":
+                raise ValueError("freeze_rgb conflicts with rgb_finetune_mode; select frozen explicitly")
+            for name in ["lambda_action", "action_lr", "action_flow_shift", "rgb_lora_dropout"]:
+                if not math.isfinite(getattr(self, name)):
+                    raise ValueError(f"{name} must be finite")
+            if self.lambda_action < 0 or min(self.action_lr, self.action_flow_shift) <= 0:
+                raise ValueError("Action loss weight must be non-negative and LR/flow shift positive")
+            if not 0 <= self.rgb_lora_dropout < 1 or not self.rgb_lora_target_modules:
+                raise ValueError("Invalid RGB LoRA dropout or empty target modules")
+            if not self.enable_3d_queries:
+                raise ValueError("Action generation requires predicted Goal 3D queries")
+        elif self.init_checkpoint_path is not None:
+            raise ValueError("init_checkpoint_path is for action post-training, not Stage-1 resume")
         TemporalLayout(future_frames=self.future_frames)
         if self.n_obs_steps != 1:
             raise ValueError("Only one observed RGB timepoint is supported")
@@ -88,6 +146,8 @@ class WSA1_5Config(PreTrainedConfig):
             self.enable_3d = None
         if type(self.enable_3d_queries) is not bool:
             raise ValueError("3D query switch must be boolean")
+        if self.enable_action and not self.enable_3d_queries:
+            raise ValueError("Action generation requires predicted Goal 3D queries")
         scalars = ["lambda_rgb", "lambda_motion", "lambda_3d", "feature_mse_weight", "feature_cosine_weight",
                    "rgb_lr", "motion_lr", "goal_lr", "heads_lr", "optimizer_weight_decay", "flow_shift",
                    "scheduler_decay_lr_ratio"]
@@ -133,6 +193,8 @@ class WSA1_5Config(PreTrainedConfig):
             raise ValueError("Per-module learning rates must be positive")
         effective = [self.lambda_rgb if self.enable_rgb else 0, self.lambda_motion if self.enable_motion else 0,
                      self.lambda_3d * (self.feature_mse_weight + self.feature_cosine_weight) if self.use_3d_supervision else 0]
+        if self.enable_action:
+            effective.append(self.lambda_action)
         if not any(weight > 0 for weight in effective):
             raise ValueError("At least one enabled modality must have positive effective loss weight")
 
@@ -163,6 +225,8 @@ class WSA1_5Config(PreTrainedConfig):
 
     def get_scheduler_preset(self):
         rates = {"rgb": self.rgb_lr, "motion": self.motion_lr, "3d": self.goal_lr, "heads": self.heads_lr}
+        if self.enable_action:
+            rates["action"] = self.action_lr
         return MultiGroupCosineDecayWithWarmupSchedulerConfig(auto_scale_to_training_steps=False, group_schedules={name: {
             "peak_lr": lr, "decay_lr": lr * self.scheduler_decay_lr_ratio, "num_warmup_steps": self.scheduler_warmup_steps,
             "num_decay_steps": self.scheduler_decay_steps,
@@ -192,14 +256,27 @@ class WSA1_5DatasetConfig(DatasetConfig):
     motion_log_every: int = 10000
     video_decode_threads: int = 1
     prefetch_factor: int = 2
+    use_subtask: bool = False  # Action stage only; Stage-1 keeps its original sidecar behavior.
+    allow_endframe_3d: bool = False
+    image_augment: bool = False
+    object_paste: bool = False
+    image_augmentation_config: str = "configs/augmentation/robotwin_conservative.yaml"
 
     def __post_init__(self):
         super().__post_init__()
+        if type(self.use_subtask) is not bool or type(self.allow_endframe_3d) is not bool:
+            raise TypeError("use_subtask and allow_endframe_3d must be boolean")
+        if type(self.image_augment) is not bool or type(self.object_paste) is not bool:
+            raise TypeError("image_augment and object_paste must be boolean")
+        if (self.image_augment or self.object_paste) and (
+            not isinstance(self.image_augmentation_config, str) or not self.image_augmentation_config.strip()
+        ):
+            raise ValueError("image_augmentation_config must be a nonempty YAML path when augmentation is enabled")
         TemporalLayout(future_frames=self.future_frames)
         if self.streaming:
             raise ValueError("WSA endpoint sampling requires map-style LeRobot data")
-        if self.use_imagenet_stats or self.use_external_stats or self.image_transforms.enable:
-            raise ValueError("WSA uses explicit Wan [-1,1] normalization; external stats/image transforms are unsupported")
+        if self.use_imagenet_stats or self.image_transforms.enable:
+            raise ValueError("WSA uses explicit Wan [-1,1] image normalization; image stats/transforms are unsupported")
         if any(group.inputs or group.outputs for group in [self.repack_transforms, self.data_transforms, self.model_transforms]):
             raise ValueError("WSA adapter does not support custom transform groups; refusing to ignore them")
         for name in ["future_frames", "frame_stride", "rgb_height", "rgb_width", "motion_height", "motion_width",

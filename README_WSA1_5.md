@@ -1,5 +1,7 @@
 # WSA1.5 使用说明
 
+第二阶段 Action Post-training 见 [WSA1.5 Action 使用说明](README_WSA1_5_ACTION.md)。`enable_action=False` 保留本文的第一阶段 world-only 路径。
+
 当前 `WSA_1_5` policy 输入当前 RGB 和文本，预测未来 `future_frames` 帧 RGB、同长度的三通道 motion，以及可选的子任务终点 3D 特征；不预测 action。默认未来 16 帧，支持任意正的 4 的倍数。
 
 MoT 中 O 只包含当前图像 token，R/M 分别包含未来 RGB/motion token，不拼接文本 token。文本按 WSA-L 的方式作为固定 context，经各层 cross-attention 条件化 O、R、M；O/R 共用 RGB 专家的文本投影，Motion 使用独立投影适配自己的 hidden 维度。G 不含文本 cross-attention，通过后续层读取已融合文本的 O/R/M 表示间接获得文本条件。文本 padding mask 继续作用于 cross-attention。此次调整不改变参数形状或文本缓存格式，旧 checkpoint 可严格加载，但前向行为已有变化，不能保证与旧版结果一致。
@@ -142,7 +144,7 @@ bash launch/wsa_1_5_pretrain.sh \
 
 显式列表应用到所有选中的数据集；混合不同相机命名的数据时应注册各自 schema。`egodex_v` 已将 `observation.image` 映射到 image0。
 
-RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部统计、增强或自定义 transform。缺失图像在原始像素域填 `0`，归一化后为 `-1`，并通过无效 mask 排除监督。Omega 的目标图像保持原始 `[0,1]`，直接双线性缩放至 `256×256`，再交给教师内部归一化。Motion 训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
+RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 1` 映射到 `[-1,1]`，再输入 WanVAE；不使用 ImageNet mean/std，不叠加外部图像统计或自定义 transform。默认不增广；可通过 `dataset.image_augment` 和 `dataset.object_paste` 独立开启 LingBot 的 RGB 增广及物体截图粘贴，配方由 `dataset.image_augmentation_config` 指定，Stage-1 与 Action 阶段共用。详见 [Clean → Random 配方与使用方式](README_WSA1_5_ACTION.md#clean--random-图像增广)。缺失图像在原始像素域填 `0`，归一化后为 `-1`，并通过无效 mask 排除监督。Omega 的目标图像使用与训练 RGB 相同的增广参数，保持 `[0,1]`，直接双线性缩放至 `256×256`，再交给教师内部归一化。Motion 标签不做图像增广，训练的是解码后的三通道值；通道含义、scale/offset 和物理单位须由数据制作阶段明确。代码不猜测这些参数，视频解码一致也不等于原始 XYZ 物理误差已验证。
 
 ### 子任务标注
 
@@ -169,7 +171,7 @@ RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 
 
 hand_used：0=左手、1=右手、2=双手。区间不能越界或重叠，子任务编号不能重复。文本只读取示例中的任务、子任务、手和场景字段；物理语义应写进这些文本，额外 JSON 字段不会自动输入模型。
 
-未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。文本条件和 3D 目标图像仍对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。缺失标注使用空文本、关闭相应 3D 标签；缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频仍会报错。
+未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。文本条件和 3D 目标图像仍对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。没有子任务或当前帧不在有效子任务标注内时，prompt 使用 prefix + 原始 task，不附加 Subtask/Hand/Scene 字段，并关闭相应 3D 标签；原始 task 优先来自 sidecar 的 `task_instruction`，缺失时读取 LeRobot episode 的 `tasks`，多 task episode 按帧的 `task_index` 区分。原始 task 缺失或非法会报错，不再使用空 prompt。缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频仍会报错。
 
 未来时间 mask 与 WSA-L 一致：每四帧一组，只要组内至少一帧有效，对应 latent 就保留；全部无效才屏蔽，不再把无效历史累计传播到后续组。部分有效组的 VAE 编码仍包含补齐帧的贡献。空间 mask 继续屏蔽缺失相机区域；RGB 越界帧保留重复末帧的像素，motion 越界帧在原始像素域填 `0`、归一化后为 `-1`，二者的时间 mask 都为无效。
 
@@ -193,7 +195,7 @@ python util_scripts/precompute_wsa1_5_text_embeddings.py \
 
 `--data-root` 可以是单个数据集，也可以是合集目录。文本预计算与训练统一调用 [find 发现脚本](util_scripts/discover_wsa1_5_datasets.sh)，扫描该目录本身及任意层级子目录，通过 `meta/info.json`、`data/` 和 `videos/` 识别数据集；Python 文本模块不再保留另一套 discover。扫描错误、找不到数据集、错误的标注结构都会报错。
 
-每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；另计算一个用于缺失标注帧的空文本 embedding。`--batch-size` 默认为 8，整批调用 tokenizer 和 UMT5，末批不足时按实际数量编码，再逐条保存。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
+每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；同时计算各 episode 的 prefix + 原始 task，用于没有有效子任务的帧，不再强制生成空文本 embedding。预计算仅读取 sidecar 和 episode 元数据，不扫描全量帧表。`--batch-size` 默认为 8，整批调用 tokenizer 和 UMT5，末批不足时按实际数量编码，再逐条保存。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
 
 默认 `max_text_length=512`，使用 Wan 的 4096 维 UMT5 特征。更改长度时，预计算用 `--max-text-length`，训练同步设置 `--policy.max_text_length`。自定义标注位置时，两边同步指定 `--sidecar-file` 和 `--dataset.sidecar_file`；缓存位置分别用 `--embedding-dir` 和 `--dataset.text_embedding_dir`。
 

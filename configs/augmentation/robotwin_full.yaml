@@ -1,0 +1,27 @@
+# Probabilities below are conditional on entering the 90% augmentation branch.
+keep_original_prob: 0.10
+color_prob: 0.80
+brightness: [0.25, 1.10]
+contrast: [0.5, 1.5]
+saturation: [0.4, 1.6]
+temperature: [0.90, 1.10]
+affine_prob: 0.50
+scale: [0.90, 1.10]
+translate: 0.06
+occlusion_prob: 0.95
+occlusion_area: [0.02, 0.10]
+occlusion_aspect: [0.5, 2.0]
+paste_prob: 0.50
+paste_area: [0.01, 0.05]
+crops_dir: assets/RoboTwin_Clean_Object_Crops
+# Each operation independently selects top/left/right with weights 0.50/0.25/0.25.
+gaussian_noise_prob: 0.50
+noise_std: [0.005, 0.03]
+salt_pepper_prob: 0.15
+salt_pepper_amount: [0.001, 0.01]
+gaussian_blur_prob: 0.25
+blur_sigma: [0.2, 1.2]
+motion_blur_prob: 0.10
+motion_kernel: [3, 5]
+jpeg_prob: 0.30
+jpeg_quality: [35, 90]

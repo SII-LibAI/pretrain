@@ -1,0 +1,27 @@
+# Suggested first ablation; unspecified settings use VisualAugmentationConfig defaults.
+keep_original_prob: 0.10
+color_prob: 0.80
+brightness: [0.65, 1.10]
+contrast: [0.8, 1.2]
+saturation: [0.8, 1.2]
+temperature: [0.95, 1.05]
+affine_prob: 0.25
+scale: [0.97, 1.03]
+translate: 0.02
+gaussian_noise_prob: 0.25
+noise_std: [0.003, 0.015]
+salt_pepper_prob: 0.05
+salt_pepper_amount: [0.001, 0.003]
+gaussian_blur_prob: 0.15
+blur_sigma: [0.2, 0.7]
+motion_blur_prob: 0.05
+motion_kernel: [3, 3]
+jpeg_prob: 0.15
+jpeg_quality: [65, 95]
+occlusion_prob: 0.95
+occlusion_area: [0.01, 0.04]
+occlusion_aspect: [0.5, 2.0]
+paste_prob: 0.50
+paste_area: [0.005, 0.025]
+crops_dir: assets/RoboTwin_Clean_Object_Crops
+# Each operation independently selects top/left/right with weights 0.50/0.25/0.25.

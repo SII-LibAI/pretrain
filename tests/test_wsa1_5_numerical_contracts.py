@@ -10,7 +10,7 @@ from lerobot.policies.wsa1_5.attention import build_causal_attention_mask, maske
 from lerobot.policies.wsa1_5.future_3d import geometric_feature_loss
 from lerobot.policies.wsa1_5.initialization import interpolate_wan_state
 from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy
-from lerobot.policies.wsa1_5.temporal import TemporalLayout
+from lerobot.policies.wsa1_5.utils.temporal import TemporalLayout
 from lerobot.policies.wsa1_5.vendor.helpers.state_dict_converters import wan_video_dit_state_dict_converter
 from lerobot.policies.wsa1_5.vendor.scheduler import WanContinuousFlowMatchScheduler
 from test_wsa1_5_dataset import make_data

@@ -9,7 +9,7 @@ from PIL import Image
 
 from lerobot.datasets.transformed_dataset import MultiLeRobotDataset
 from lerobot.policies.wsa1_5.dataset_wsa1_5 import wsa1_5_collate
-from lerobot.policies.wsa1_5.visualization import save_training_sample
+from lerobot.policies.wsa1_5.utils.visualization import save_training_sample
 from test_wsa1_5_dataset import make_data
 from test_wsa1_5_launch import bash, launch
 

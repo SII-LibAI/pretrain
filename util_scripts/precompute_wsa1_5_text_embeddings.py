@@ -64,13 +64,6 @@ PY
 """
 
 """在 GPU 服务器为每个 LeRobot 数据集预计算唯一一种 WSA1.5 文本缓存。"""
-import argparse
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import tempfile
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -78,26 +71,35 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import torch
 from safetensors.torch import save_file
 
-from lerobot.policies.wsa1_5.dataset_wsa1_5 import condition_text
+from lerobot.datasets.utils import load_episodes
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import condition_text, episode_task_texts, load_sidecar_annotations
 from lerobot.policies.wsa1_5.text_embeddings import PROMPT_VERSION, TextEmbeddingCache, encode_text, text_embedding_path
 
 
-def dataset_prompts(root, sidecar_file="meta/sidecar.json"):
+def dataset_prompts(root, sidecar_file="meta/sidecar.json", *, action_mode=None, use_subtask=False):
     path = Path(root) / sidecar_file
-    rows = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
-    if not isinstance(rows, list):
-        raise ValueError(f"Sidecar must be a list: {path}")
-    prompts = {""}  # Unannotated frames use the same explicit blank condition as training.
-    for row in rows:
-        if not isinstance(row, dict) or row.get("episode_index") is None:
-            continue
+    annotations = {} if action_mode is not None and not use_subtask else load_sidecar_annotations(path)
+    render = condition_text
+    if action_mode is not None:
+        from lerobot.dataset_schemas import get_schema
+        from lerobot.policies.wsa1_5.dataset_wsa1_5 import action_prompt, control_mode
+        info = json.loads((Path(root) / "meta/info.json").read_text(encoding="utf-8"))
+        mode = control_mode(get_schema(info["robot_type"]))
+        def render(row, subtask=None):
+            return action_prompt(row["task_instruction"], mode, action_mode, annotation=row, subtask=subtask)
+    episodes = load_episodes(Path(root))
+    columns = ["episode_index"] + (["tasks"] if "tasks" in episodes.column_names else [])
+    prompts = set()
+    for metadata in episodes.select_columns(columns).with_format(None):
+        row = annotations.get(int(metadata["episode_index"]), {})
+        prompts.update(render({"task_instruction": task}) for task in episode_task_texts(row, metadata))
         subtasks = row.get("subtasks")
         if subtasks is not None and not isinstance(subtasks, list):
             raise ValueError(f"subtasks must be a list or null: {path}")
         for subtask in subtasks or []:
             required = ["start_frame", "end_frame", "subtask_id"]
             if isinstance(subtask, dict) and all(subtask.get(key) is not None for key in required):
-                prompts.add(condition_text(row, subtask))
+                prompts.add(render(row, subtask))
     return sorted(prompts)
 
 
@@ -157,6 +159,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="每批编码的文本数量")
     parser.add_argument("--sidecar-file", default="meta/sidecar.json")
     parser.add_argument("--embedding-dir", default="meta/wsa1_5_text_embeddings")
+    parser.add_argument("--action-mode", choices=["abs", "delta"], help="Build Stage-2 robot-control prompts")
+    parser.add_argument("--use-subtask", action="store_true", help="Stage-2 includes actual sidecar subtask text")
     args = parser.parse_args()
     if args.max_text_length <= 0:
         parser.error("--max-text-length must be positive")
@@ -188,7 +192,7 @@ def main():
     roots = sorted({(args.data_root / repo).resolve() for repo in repos})
     work, offset, skipped = [], 0, 0
     for root in roots:
-        prompts = dataset_prompts(root, args.sidecar_file)
+        prompts = dataset_prompts(root, args.sidecar_file, action_mode=args.action_mode, use_subtask=args.use_subtask)
         assigned = [text for index, text in enumerate(prompts, start=offset) if index % world_size == rank]
         offset += len(prompts)
         pending = pending_prompts(root / args.embedding_dir, assigned, args.max_text_length, 4096)

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 PROMPT_VERSION = "wsa1_5.task-subtask-hand-scene.v1"
+PROMPT_PREFIX = "You are a robot control agent,follow the instruction."
 
 
 def text_embedding_path(directory, text):

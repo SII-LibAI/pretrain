@@ -1,8 +1,10 @@
-"""Server-side checkpoint loading and explicit width interpolation rules."""
+"""Checkpoint loading, expert initialization and RGB LoRA adapters."""
 from pathlib import Path
 import logging
+import math
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 
@@ -33,6 +35,28 @@ def read_checkpoint(path):
             raise ValueError(f"Duplicate checkpoint shard keys: {sorted(duplicate)}")
         state.update(shard)
     return state
+
+
+def load_stage1_policy(module, directory):
+    """Only Action/LoRA keys may be absent; every original tensor must match."""
+    import json
+
+    directory = Path(directory)
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    if config.get("enable_action", False):
+        raise ValueError("init_checkpoint_path expects Stage-1; use policy.path/resume for Stage-2")
+    state = read_checkpoint(directory / "model.safetensors")
+    expected = module.state_dict()
+    added = {key for key in expected if key.startswith("action_expert.") or ".lora_a" in key or ".lora_b" in key}
+    missing, unexpected = set(expected) - set(state), set(state) - set(expected)
+    if missing != added or unexpected:
+        raise ValueError(f"Stage-1 initialization mismatch: missing={sorted(missing - added)}, unexpected={sorted(unexpected)}")
+    for key, value in state.items():
+        if value.shape != expected[key].shape:
+            raise ValueError(f"Stage-1 shape mismatch for {key}: {tuple(value.shape)} != {tuple(expected[key].shape)}")
+    report = load_report(module, state, name="Stage-1 -> Action post-training", strict=False)
+    logging.info("[WSA init] loaded=%d new_action_or_lora=%d; optimizer/scheduler/RNG/step start fresh", len(state), len(added))
+    return report
 
 
 def resize_axes(value, shape):
@@ -118,3 +142,42 @@ def load_report(module, state, *, name, strict=True):
     if strict and (report.missing_keys or report.unexpected_keys):
         raise RuntimeError(f"Incomplete {name} checkpoint: missing={report.missing_keys}, unexpected={report.unexpected_keys}")
     return report
+
+
+class LoRALinear(nn.Linear):
+    def __init__(self, base, rank, alpha, dropout):
+        super().__init__(base.in_features, base.out_features, bias=base.bias is not None,
+                         device=base.weight.device, dtype=base.weight.dtype)
+        self.weight, self.bias = base.weight, base.bias
+        self.weight.requires_grad_(False)
+        if self.bias is not None:
+            self.bias.requires_grad_(False)
+        self.lora_a = nn.Parameter(base.weight.new_empty(rank, base.in_features))
+        self.lora_b = nn.Parameter(base.weight.new_zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
+        self.scale = alpha / rank
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, value):
+        return F.linear(value, self.weight, self.bias) + F.linear(F.linear(self.dropout(value), self.lora_a), self.lora_b) * self.scale
+
+
+def configure_rgb(rgb, config):
+    mode = config.rgb_finetune_mode
+    rgb.requires_grad_(mode == "full")
+    if mode != "lora":
+        return []
+    matches = []
+    for target in config.rgb_lora_target_modules:
+        found = [(name, module) for name, module in rgb.named_modules()
+                 if name.startswith("blocks.") and name.endswith("." + target) and isinstance(module, nn.Linear)]
+        if not found:
+            raise ValueError(f"RGB LoRA target does not match any actual Linear: {target}")
+        for name, module in found:
+            if isinstance(module, LoRALinear):
+                raise ValueError(f"Overlapping RGB LoRA targets: {name}")
+            parent, attr = name.rsplit(".", 1)
+            setattr(rgb.get_submodule(parent), attr, LoRALinear(module, config.rgb_lora_rank,
+                                                               config.rgb_lora_alpha, config.rgb_lora_dropout))
+            matches.append(name)
+    return matches

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.utils import make_grid
 
-from .dataset_wsa1_5 import WSA1_5Dataset, compose_rgb_views
+from ..dataset_wsa1_5 import WSA1_5Dataset, compose_rgb_views
 
 
 def _save_image(image, path):

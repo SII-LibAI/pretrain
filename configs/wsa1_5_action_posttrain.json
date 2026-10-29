@@ -1,0 +1,30 @@
+{
+  "policy": {
+    "type": "WSA_1_5", "device": "cuda", "dtype": "bfloat16", "push_to_hub": false,
+    "enable_action": true, "state_dim": 16, "action_dim": 16,
+    "action_hidden_dim": 1024, "action_ffn_dim": 4096,
+    "action_chunk_size": 32, "action_frame_stride": 1,
+    "action_sampler_steps": 10, "action_flow_shift": 5.0,
+    "num_history_frame": 4, "history_frame_stride": 2, "action_mode": "delta",
+    "sparse_frame_encoding": "joint",
+    "future_frames": 32, "load_text_encoder": false,
+    "enable_3d_queries": true, "lambda_rgb": 1.0, "lambda_motion": 1.0,
+    "lambda_3d": 0.01, "lambda_action": 1.0,
+    "rgb_finetune_mode": "lora", "rgb_lora_rank": 16, "rgb_lora_alpha": 32,
+    "rgb_lora_dropout": 0.0, "action_lr": 0.0001,
+    "rgb_lr": 0.00001, "motion_lr": 0.00005, "goal_lr": 0.00005, "heads_lr": 0.0001,
+    "scheduler_warmup_steps": 2000, "scheduler_decay_steps": 100000
+  },
+  "dataset": {
+    "type": "wsa1_5", "root": "data", "repo_id": ["robotwin_aloha/task"],
+    "action_mode": "delta", "use_external_stats": true,
+    "future_frames": 32, "video_backend": "pyav", "use_subtask": false,
+    "allow_endframe_3d": true, "video_decode_threads": 1, "prefetch_factor": 2,
+    "image_augment": false, "object_paste": false,
+    "image_augmentation_config": "configs/augmentation/robotwin_conservative.yaml"
+  },
+  "output_dir": "outputs/wsa1_5_action/run_001",
+  "batch_size": 1, "num_workers": 4, "steps": 100000,
+  "log_freq": 10, "save_freq": 10000, "eval_freq": 0,
+  "wandb": {"enable": false}
+}

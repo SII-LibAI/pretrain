@@ -1,5 +1,6 @@
-"""World-only policy integrated with InternVLA's existing trainer and checkpoints."""
+"""World pretraining and optional action post-training with the existing trainer."""
 from contextlib import contextmanager
+from collections import deque
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -11,14 +12,14 @@ import torch.nn.functional as F
 from lerobot.policies.pretrained import PreTrainedPolicy
 
 from .configuration_wsa1_5 import WSA1_5Config
-from .experts import FrozenWanVAE, RGBVideoExpert, MotionDiTExpert, WorldFlow, wan_config
+from .experts import ActionExpert, FrozenWanVAE, RGBVideoExpert, MotionDiTExpert, WorldFlow, wan_config
 from .future_3d import Future3DExpert, geometric_feature_loss
-from .initialization import interpolate_wan_state, load_report, read_checkpoint
+from .initialization import configure_rgb, interpolate_wan_state, load_report, read_checkpoint, load_stage1_policy
 from .teacher import OmegaTeacher
-from .temporal import TemporalLayout
 from .text_embeddings import encode_text, validate_text_embedding
-from .timing import StageTimer
-from .validation import require_bool, require_finite
+from .utils.temporal import ObservationHistory, TemporalLayout
+from .utils.timing import StageTimer
+from .utils.validation import require_bool, require_finite
 from .vendor.helpers.state_dict_converters import wan_video_dit_state_dict_converter
 
 
@@ -50,7 +51,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.layout = TemporalLayout(future_frames=config.future_frames)
         self.model_dtype = getattr(torch, config.dtype)
         if components is None:
-            components = self._build_components(initialize_pretrained)
+            components = self._build_components(initialize_pretrained and config.init_checkpoint_path is None)
         self.flow = components.flow
         if self.flow.layout != self.layout:
             raise ValueError("WorldFlow temporal layout must match policy.future_frames")
@@ -61,10 +62,20 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.text_encoder = components.text_encoder
         self.tokenizer = components.tokenizer
         self.teacher = OmegaTeacher(config.omega_checkpoint_path, config.teacher_layers,
-                                    dtype=self.model_dtype) if config.use_3d_supervision else None
+                                    dtype=self.model_dtype) if config.use_3d_supervision and not config.enable_action else None
+        self.action_expert = None
+        if config.enable_action:
+            weight_dtype = torch.float32 if config.trainable_weights_fp32 else self.model_dtype
+            with construction_dtype(weight_dtype):
+                self.action_expert = ActionExpert(config)
+                matches = configure_rgb(self.flow.rgb, config)
+            logging.info("[WSA action] RGB mode=%s LoRA targets=%s", config.rgb_finetune_mode, matches)
+            if initialize_pretrained and config.init_checkpoint_path:
+                load_stage1_policy(self, config.init_checkpoint_path)
         self._motion_placeholder_latent = None
         self._motion_placeholder_key = None
         self._freeze_modules()
+        self.reset()
 
     def _apply(self, fn, recurse=True):
         self._motion_placeholder_latent = None
@@ -76,13 +87,17 @@ class WSA1_5_Policy(PreTrainedPolicy):
 
     def prepare_for_training(self, device, *, log_parameters=True):
         """Load the enabled teacher on each rank and summarize main modules once."""
-        if self.teacher is not None:
+        if self.config.enable_action and self.config.use_3d_supervision and self.teacher is None:
+            self.teacher = OmegaTeacher(self.config.omega_checkpoint_path, self.config.teacher_layers, dtype=self.model_dtype)
+        if self.teacher is not None and not self.config.enable_action:
             self.teacher._load(device)
         if not log_parameters:
             return
         modules = {"RGB/Observation": self.flow.rgb, "Motion": self.flow.motion,
                    "Future3D": self.future_3d, "Wan VAE": self.vae, "UMT5": self.text_encoder,
                    "VGGT-Omega": self.teacher.model if self.teacher is not None else None}
+        if self.config.enable_action:
+            modules["Action"] = self.action_expert
         for name, module in modules.items():
             if module is None:
                 logging.info("[WSA parameters] %s disabled", name)
@@ -166,16 +181,29 @@ class WSA1_5_Policy(PreTrainedPolicy):
         if self.flow.motion is not None and cfg.freeze_motion:
             self.flow.motion.requires_grad_(False)
         if self.future_3d is not None:
-            # R/M cannot read G, so without 3D loss these parameters have no
-            # gradient path. Freeze them to avoid unused trainable DDP parameters.
-            if cfg.freeze_3d or not cfg.use_3d_supervision:
+            action_supervision = cfg.enable_action and cfg.lambda_action > 0
+            if cfg.freeze_3d or not (cfg.use_3d_supervision or action_supervision):
                 self.future_3d.requires_grad_(False)
-            if cfg.freeze_heads:
+            if cfg.freeze_heads or not cfg.use_3d_supervision:
                 self.future_3d.feature_heads.requires_grad_(False)
+            if action_supervision and not cfg.use_3d_supervision and not cfg.freeze_3d:
+                # At the final layer A reads G's K/V; G's own output is unused without 3D loss.
+                last = self.future_3d.blocks[-1]
+                for module in [last.self_attn.q, last.self_attn.norm_q, last.self_attn.o, last.ffn, last.norm2]:
+                    module.requires_grad_(False)
         if self.vae is not None:
             self.vae.eval().requires_grad_(False)
         if self.text_encoder is not None:
             self.text_encoder.eval().requires_grad_(False)
+        if cfg.enable_action:
+            if not cfg.enable_rgb:
+                self.flow.rgb.head.requires_grad_(False)
+                last = self.flow.rgb.blocks[-1]
+                for module in [last.self_attn.q, last.self_attn.norm_q, last.self_attn.o, last.ffn,
+                               last.norm2, last.norm3, last.cross_attn]:
+                    module.requires_grad_(False)
+            if cfg.lambda_action == 0:
+                self.action_expert.requires_grad_(False)
 
     def train(self, mode=True):
         super().train(mode)
@@ -189,7 +217,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
         groups = []
         cfg = self.config
         for name, module, lr in [("rgb", self.flow.rgb, cfg.rgb_lr), ("motion", self.flow.motion, cfg.motion_lr),
-                                 ("3d", self.future_3d, cfg.goal_lr)]:
+                                 ("3d", self.future_3d, cfg.goal_lr), ("action", self.action_expert, cfg.action_lr)]:
             if module is None:
                 continue
             params = [p for key, p in module.named_parameters() if p.requires_grad and not key.startswith("feature_heads.")]
@@ -204,13 +232,101 @@ class WSA1_5_Policy(PreTrainedPolicy):
         return groups
 
     def reset(self):
-        pass
+        self._action_queue = deque()
+        self._history = None
 
-    def select_action(self, *args, **kwargs):
-        raise NotImplementedError("WSA1.5 predicts world representations; call predict_future")
+    def select_action(self, batch, **kwargs):
+        if not self.config.enable_action:
+            raise NotImplementedError("WSA1.5 predicts world representations; call predict_future")
+        if self.config.action_frame_stride != 1 or kwargs.get("return_world", False):
+            raise ValueError("select_action requires action_frame_stride=1 and tensor output; use predict_action_chunk")
+        if self._history is None:
+            self._history = ObservationHistory(self.config.num_history_frame, self.config.history_frame_stride)
+        if "history_rgb" in batch:
+            raise ValueError("select_action maintains history; use predict_action_chunk for explicit history")
+        self._history.append(batch["observed_rgb"], batch["observed_valid"])
+        if not self._action_queue:
+            prepared = dict(batch)
+            if self.config.num_history_frame:
+                frames, masks = self._history.sample()
+                prepared.update(history_rgb=frames[:, :-1], history_valid=masks[:, :-1])
+            chunk = self.predict_action_chunk(prepared, **kwargs)
+            self._action_queue.extend(chunk.unbind(1))
+        return self._action_queue.popleft()
 
-    def predict_action_chunk(self, *args, **kwargs):
-        raise NotImplementedError("WSA1.5 has no action expert")
+    @torch.no_grad()
+    def predict_action_chunk(self, batch, *, seed=0, codec=None, raw_state=None, return_normalized=False,
+                             return_world=False):
+        if not self.config.enable_action:
+            raise NotImplementedError("WSA1.5 has no action expert")
+        if not return_normalized and (codec is None or raw_state is None):
+            raise ValueError("Physical action output requires the matching ActionCodec and current raw_state")
+        if codec is not None and (codec.config.action_mode != self.config.action_mode
+                                  or codec.config.action_dim != self.config.action_dim):
+            raise ValueError("ActionCodec coordinates disagree with the saved policy")
+        was_training = self.training
+        self.eval()
+        try:
+            with self.compute_context():
+                observed, context, valid, spatial, pixels = self.encode_observation(
+                    batch["observed_rgb"], batch["condition_text"], batch["observed_valid"],
+                    text_embedding=batch.get("text_embedding"), text_valid=batch.get("text_valid"))
+                history = self.encode_history(batch)
+                rgb_shape, motion_shape = self._shapes(observed.shape[0])
+                generated = self.flow.sample_latents(
+                    observed, context, valid, rgb_shape=rgb_shape, motion_shape=motion_shape,
+                    motion_placeholder=self._placeholder(observed.shape[0], observed.device) if motion_shape else None,
+                    seed=seed, steps=self.config.action_sampler_steps, observed_valid=spatial,
+                    future_3d=self.future_3d, goal_view_valid=self.observed_view_validity(pixels),
+                    action_expert=self.action_expert, state=batch["state"], return_features=return_world, **history)
+                result = generated["action"]
+                result = result if return_normalized else codec.decode(result, raw_state)
+                if not return_world:
+                    return result
+                rgb, motion, features = generated["rgb"], generated["motion"], generated["3d"]
+                goal_valid = self.observed_view_validity(pixels).repeat_interleave(273, 1).reshape(-1, 3, 273)
+                features = {key: value.masked_fill(~goal_valid[..., None], 0) for key, value in features.items()}
+                world = {"actions": result, "goal_3d_layer_features": features,
+                         "goal_3d_features": features[self.config.teacher_layers[-1]], "goal_3d_valid": goal_valid}
+                for name, latent in [("rgb", rgb), ("motion", motion)]:
+                    decoded = None if latent is None else self.layout.future_from_decoded(self.vae.decode(latent))
+                    if decoded is not None:
+                        require_finite(decoded, f"Decoded {name}")
+                        decoded = (decoded.clamp(-1, 1) + 1) / 2
+                    world[f"future_{name}"] = decoded
+                world["future_rgb_valid"] = (pixels & (rgb is not None))[:, None].expand(
+                    -1, self.config.future_frames, -1, -1, -1)
+                if world["future_rgb"] is not None:
+                    world["future_rgb"] = world["future_rgb"].masked_fill(~world["future_rgb_valid"], 0)
+                return world
+        finally:
+            self.train(was_training)
+
+    def encode_history(self, batch):
+        if not self.config.enable_action or self.config.num_history_frame == 0:
+            return {}
+        frames, valid = batch["history_rgb"], batch["history_valid"]
+        count = self.config.num_history_frame
+        if frames.shape != (batch["observed_rgb"].shape[0], count, 3, self.config.rgb_height, self.config.rgb_width):
+            raise ValueError("Historical RGB shape disagrees with num_history_frame")
+        require_bool(valid, "Historical RGB validity")
+        if valid.shape != frames[:, :, :1].shape:
+            raise ValueError("Historical RGB mask shape mismatch")
+        video = torch.cat([frames, batch["observed_rgb"][:, None]], 1).transpose(1, 2)
+        pixels = torch.cat([valid, batch["observed_valid"][:, None]], 1)
+        if self.config.sparse_frame_encoding == "independent":
+            # PrismWAM sparse memory resets VAE temporal state for every observation.
+            encoded = torch.cat([self._encode_video(video[:, :, index:index + 1])
+                                 for index in range(count + 1)], 2)
+            b, t = pixels.shape[:2]
+            spatial = F.interpolate(pixels.flatten(0, 1).float(), size=encoded.shape[-2:], mode="area") >= 1 - 1e-6
+            return {"history_latent": encoded,
+                    "history_valid": spatial.reshape(b, t, 1, *encoded.shape[-2:]).transpose(1, 2)}
+        # PrismWAM RoboTwin jointly encodes history and current as a 4n+1 video.
+        encoded = self._encode_video(video)
+        first = F.interpolate(pixels[:, 0].float(), size=encoded.shape[-2:], mode="area") >= 1 - 1e-6
+        rest = TemporalLayout(future_frames=count).latent_validity(pixels[:, 1:], encoded.shape[-2:])
+        return {"history_latent": encoded, "history_valid": torch.cat([first[:, :, None], rest], 2)}
 
     @torch.no_grad()
     def _encode_text(self, texts):
@@ -329,6 +445,9 @@ class WSA1_5_Policy(PreTrainedPolicy):
             masks["motion"] = torch.cat([torch.zeros_like(future_valid[:, :, :1]), future_valid], 2)
         teacher, teacher_valid = {}, None
         if self.config.use_3d_supervision:
+            if self.teacher is None:
+                self.teacher = OmegaTeacher(self.config.omega_checkpoint_path, self.config.teacher_layers,
+                                            dtype=self.model_dtype)
             teacher, teacher_valid = self.teacher.features(target["goal_rgb_views"], target["goal_view_valid"], observed.device)
         return clean, masks, teacher, teacher_valid
 
@@ -364,20 +483,37 @@ class WSA1_5_Policy(PreTrainedPolicy):
             require_bool(teacher_valid, "Teacher feature validity")
             # An absent observed camera has no corresponding active G queries.
             teacher_valid = teacher_valid & self.observed_view_validity(pixel_valid).repeat_interleave(273, 1).reshape(-1, 3, 273)
-        weights = {"rgb": self.config.lambda_rgb, "motion": self.config.lambda_motion, "3d": self.config.lambda_3d}
+        weights = {"rgb": self.config.lambda_rgb, "motion": self.config.lambda_motion, "3d": self.config.lambda_3d,
+                   "action": self.config.lambda_action}
         states, velocities, timesteps = {}, {}, {}
         for name, value in clean.items():
             condition = observed if name == "rgb" else self._placeholder(observed.shape[0], observed.device)
             states[name], velocities[name], timesteps[name] = self.flow.training_state(value, condition)
+        action_args = {}
+        if self.config.enable_action:
+            mask = target["action_valid_mask"]
+            require_bool(mask, "Action element validity")
+            require_bool(batch["state_valid"], "State validity")
+            if batch["state_valid"].shape != (observed.shape[0],):
+                raise ValueError("state_valid must have one boolean per sample")
+            if (mask.flatten(1).any(1) & ~batch["state_valid"]).any():
+                raise ValueError("Valid action supervision requires valid current state")
+            noisy, action_velocity, action_t = self.action_expert.training_state(target["action"])
+            action_args = dict(action_expert=self.action_expert, action_latent=noisy, action_t=action_t,
+                               state=batch["state"], action_valid=mask.any(-1))
         prediction = self.flow.velocity(observed, context, context_valid, states.get("rgb"), states.get("motion"),
                                         timesteps.get("rgb"), timesteps.get("motion"), observed_valid=observed_valid,
                                         rgb_valid=masks.get("rgb"), motion_valid=masks.get("motion"),
                                         future_3d=self.future_3d,
-                                        goal_view_valid=self.observed_view_validity(pixel_valid), timer=timer)
+                                        goal_view_valid=self.observed_view_validity(pixel_valid), timer=timer,
+                                        **self.encode_history(batch), **action_args)
         losses, metrics = {}, {}
         for name in clean:
             losses[name] = self.flow.flow_loss(prediction[name], velocities[name], timesteps[name], masks[name])
             metrics[f"loss_{name}_flow"] = losses[name].detach().item()
+        if self.config.enable_action:
+            losses["action"] = self.action_expert.loss(prediction["action"], action_velocity, action_t, mask)
+            metrics["loss_action_flow"] = losses["action"].detach().item()
         if self.config.use_3d_supervision:
             losses["3d"], feature_metrics = geometric_feature_loss(prediction["3d"], teacher_targets, teacher_valid,
                                                                   mse_weight=self.config.feature_mse_weight,
