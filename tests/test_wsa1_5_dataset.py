@@ -53,7 +53,7 @@ def make_data(tmp_path, monkeypatch, annotations=True, *, frame_stride=1, includ
         return torch.tensor(times)[:, None, None, None].expand(-1, 3, 16, 16) / 4
     monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames", decode)
     config = WSA1_5DatasetConfig(repo_id="test", view_keys=["rgb", "", ""], motion_log_every=0,
-                               frame_stride=frame_stride, future_frames=future_frames)
+                               frame_stride=frame_stride, future_frames=future_frames, use_subtask=True)
     return WSA1_5Dataset(base, config, include_3d_targets=include_3d_targets), seen
 
 

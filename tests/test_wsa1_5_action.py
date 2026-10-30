@@ -325,6 +325,57 @@ def test_stage1_initialization_and_old_keys(tmp_path):
         load_stage1_policy(stage2, tmp_path)
 
 
+@pytest.mark.parametrize("source_online,target_online", [(True, False), (True, True), (False, False)])
+def test_stage1_text_encoder_transfer_respects_target_mode(tmp_path, source_online, target_online):
+    stage1 = action_policy(enable_action=False, lambda_rgb=1, load_text_encoder=source_online)
+    if source_online:
+        stage1.text_encoder = nn.Linear(8, 8).eval().requires_grad_(False)
+        assert not any(parameter.requires_grad for parameter in stage1.text_encoder.parameters())
+    stage1.save_pretrained(tmp_path)
+    stage2 = action_policy(rgb_finetune_mode="lora", lambda_rgb=1, load_text_encoder=target_online)
+    if target_online:
+        stage2.text_encoder = nn.Linear(8, 8).eval().requires_grad_(False)
+    report = load_stage1_policy(stage2, tmp_path)
+    assert not report.unexpected_keys
+    assert all(key.startswith("action_expert.") or ".lora_" in key for key in report.missing_keys)
+    for key, value in stage1.state_dict().items():
+        if key.startswith("text_encoder.") and not target_online:
+            continue
+        torch.testing.assert_close(stage2.state_dict()[key], value)
+
+
+@pytest.mark.parametrize("damage", ["extra_world_key", "missing_world_key", "world_shape", "undeclared_text_encoder"])
+def test_dropping_stage1_umt5_does_not_relax_other_checkpoint_checks(tmp_path, damage):
+    stage1 = action_policy(enable_action=False, lambda_rgb=1, load_text_encoder=True)
+    stage1.text_encoder = nn.Linear(8, 8).eval().requires_grad_(False)
+    stage1.save_pretrained(tmp_path)
+    state = dict(stage1.state_dict())
+    key = "flow.rgb.patch_embedding.weight"
+    if damage == "extra_world_key":
+        state["flow.rgb.stray.weight"] = torch.zeros(1)
+    elif damage == "missing_world_key":
+        del state[key]
+    elif damage == "world_shape":
+        state[key] = state[key][:1]
+    else:
+        config_path = tmp_path / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["load_text_encoder"] = False
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+    save_file(state, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="mismatch"):
+        load_stage1_policy(action_policy(rgb_finetune_mode="lora", lambda_rgb=1), tmp_path)
+
+
+def test_offline_stage1_cannot_silently_initialize_an_online_text_encoder(tmp_path):
+    stage1 = action_policy(enable_action=False, lambda_rgb=1)
+    stage1.save_pretrained(tmp_path)
+    stage2 = action_policy(load_text_encoder=True, lambda_rgb=1)
+    stage2.text_encoder = nn.Linear(8, 8).eval().requires_grad_(False)
+    with pytest.raises(ValueError, match="text_encoder"):
+        load_stage1_policy(stage2, tmp_path)
+
+
 def test_stage2_config_parse_and_old_stage1_defaults(tmp_path):
     with draccus.config_type("json"):
         parsed = draccus.parse(TrainPipelineConfig, "configs/wsa1_5_action_posttrain.json", args=[])
@@ -439,7 +490,7 @@ def test_stage2_prompt_precompute_matches_dataset(tmp_path, monkeypatch):
     from util_scripts.precompute_wsa1_5_text_embeddings import dataset_prompts
     for subtask in [False, True]:
         ds, _ = make_action_data(tmp_path, monkeypatch, use_subtask=subtask)
-        prompts = dataset_prompts(tmp_path, action_mode="delta", use_subtask=subtask)
+        prompts = dataset_prompts(tmp_path, enable_action=True, action_mode="delta", use_subtask=subtask)
         assert {s.text for s in ds.segments} <= set(prompts)
 
 

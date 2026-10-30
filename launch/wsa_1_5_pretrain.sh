@@ -65,6 +65,7 @@ else
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"
         --dataset.video_decode_threads="${VIDEO_DECODE_THREADS:-1}"
         --dataset.prefetch_factor="${PREFETCH_FACTOR:-2}"
+        --dataset.use_subtask="${USE_SUBTASK:-true}"
         --dataset.image_augment="${IMAGE_AUGMENT:-false}"
         --dataset.object_paste="${OBJECT_PASTE:-false}"
         --dataset.image_augmentation_config="${IMAGE_AUGMENTATION_CONFIG:-configs/augmentation/robotwin_conservative.yaml}"

@@ -46,7 +46,8 @@ def launch(monkeypatch, tmp_path, bash):
     for name in ["RESUME_CONFIG", "RGB_LR", "MOTION_LR", "GOAL_LR", "HEADS_LR", "LAMBDA_RGB",
                  "LAMBDA_MOTION", "LAMBDA_3D", "FEATURE_MSE_WEIGHT", "FEATURE_COSINE_WEIGHT",
                  "SCHEDULER_WARMUP_STEPS", "SCHEDULER_DECAY_STEPS",
-                 "PROC_PER_NODE", "NODE_COUNT", "WEIGHT_RULES_PATH", "ENABLE_3D_QUERIES", "FUTURE_FRAMES"]:
+                 "PROC_PER_NODE", "NODE_COUNT", "WEIGHT_RULES_PATH", "ENABLE_3D_QUERIES", "FUTURE_FRAMES",
+                 "USE_SUBTASK"]:
         monkeypatch.delenv(name, raising=False)
 
     default_root = tmp_path / "parent/fixture"
@@ -85,6 +86,14 @@ def test_launcher_passes_independent_rgb_augmentation_switches(launch, image_aug
     ]])
     assert config.image_augment == (image_augment == "true")
     assert config.object_paste == (object_paste == "true")
+
+
+@pytest.mark.parametrize("use_subtask", [None, "false", "true"])
+def test_launcher_subtask_prompt_switch_matches_precompute(launch, use_subtask):
+    overrides = {} if use_subtask is None else {"USE_SUBTASK": use_subtask}
+    args = launch(PET_NNODES="1", PET_NODE_RANK="0", PET_NPROC_PER_NODE="1",
+                  PET_MASTER_ADDR="127.0.0.1", PET_MASTER_PORT="29500", **overrides)
+    assert args["dataset.use_subtask"] == (use_subtask or "true")
 
 
 def test_launcher_preserves_assigned_defaults_and_removes_supervision_switch(launch):

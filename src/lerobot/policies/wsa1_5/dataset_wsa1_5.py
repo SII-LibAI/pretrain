@@ -78,7 +78,9 @@ class Segment:
 
 def condition_text(episode, subtask=None):
     # Only read fields verified in the real sample. Unknown optional fields are empty.
-    task = episode.get("task_instruction", "") or ""
+    task = episode.get("task_instruction")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("Prompt requires a nonempty original task instruction")
     prefix = f"{PROMPT_PREFIX}\nTask: {task}"
     if subtask is None:
         return prefix
@@ -93,11 +95,19 @@ def episode_task_texts(annotation, metadata):
     task = annotation.get("task_instruction")
     if task is not None and not isinstance(task, str):
         raise ValueError("Original task_instruction must be a string")
-    tasks = [task] if task else metadata.get("tasks", [])
+    tasks = [task] if task and task.strip() else metadata.get("tasks", [])
     if (not isinstance(tasks, list) or not tasks
             or any(not isinstance(value, str) or not value.strip() for value in tasks)):
         raise ValueError("Missing or invalid original task in sidecar and episode metadata")
     return list(dict.fromkeys(tasks))
+
+
+def resolve_subtask_annotation(annotation, metadata):
+    """Resolve the original task before rendering any valid subtask prompt."""
+    tasks = episode_task_texts(annotation, metadata)
+    if len(tasks) != 1:
+        raise ValueError("Subtask requires an unambiguous original task_instruction when episode metadata has multiple tasks")
+    return {**annotation, "task_instruction": tasks[0]}
 
 
 def load_sidecar_annotations(path):
@@ -406,8 +416,9 @@ class WSA1_5Dataset(Dataset):
                     raise ValueError(f"Episode {ep} has duplicate/overlapping subtasks")
                 ids.add(sid)
                 occupied[first:last + 1] = True
+                text_annotation = resolve_subtask_annotation(annotation, self.meta.episodes[ep])
                 self._add_segment(Segment(int(ep), int(start + first), int(start + last),
-                                          sid, self._condition_text(annotation, subtask), True))
+                                          sid, self._condition_text(text_annotation, subtask), True))
             # Missing subtask labels retain the original task, without endpoint/3D supervision.
             missing = np.flatnonzero(~occupied)
             for run in np.split(missing, np.flatnonzero(np.diff(missing) > 1) + 1):
@@ -441,6 +452,8 @@ class WSA1_5Dataset(Dataset):
                                       -1, self._condition_text({"task_instruction": task}), False))
 
     def _condition_text(self, annotation, subtask=None):
+        if not self.config.use_subtask:
+            subtask = None
         if self.action_config is None:
             return condition_text(annotation, subtask)
         return action_prompt(annotation["task_instruction"], self.action_codec.control_mode,

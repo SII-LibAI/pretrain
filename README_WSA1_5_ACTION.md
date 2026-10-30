@@ -70,6 +70,23 @@ RoboTwin AgileX Aloha 的注册名为 `aloha_robotwin`：每臂 xyz(3)＋quatern
 
 前缀变化需要重算对应文本缓存。单独切换历史编码方式不改变 prompt，不需要重算文本 embedding。
 
+有效子任务分支与预计算共用原始任务回退：sidecar 缺少或留空 `task_instruction` 时，使用 episode metadata 的单一有效 task。两边均缺失则报错；多个候选且无法确定时要求 sidecar 明确任务，不生成空 Task，也不任取候选。此前受影响的缓存需重新运行预计算补齐修正后的文本，已有正确缓存会跳过。
+
+文本预计算脚本使用与训练相同的阶段开关：`policy.enable_action=false` 对应 `--no-enable-action`（默认），生成一阶段 prompt；`policy.enable_action=true` 对应 `--enable-action`，生成动作训练 prompt。`--action-mode delta|abs` 只决定动作表示，默认 `delta`，关闭动作训练时不追加 Control Mode/Action Mode 字段。相机/动作字段是否存在不负责选择预计算阶段。
+
+子任务选择同样对齐：训练 `--dataset.use_subtask=false` 对应 `--no-use-subtask`（默认），训练 `true` 对应 `--use-subtask`。例如动作训练使用：
+
+```bash
+python util_scripts/precompute_wsa1_5_text_embeddings.py \
+  --data-root "$DATA_ROOT" \
+  --text-encoder-path "$TEXT_ENCODER_PATH" --tokenizer-path "$TOKENIZER_PATH" \
+  --enable-action --action-mode delta --no-use-subtask
+
+# 需要子任务文本时，仅将 --no-use-subtask 换成 --use-subtask。
+```
+
+一阶段预计算将上例的 `--enable-action` 换成 `--no-enable-action`。缓存文件按完整 prompt 的 SHA256 区分，两阶段及是否包含子任务的文本可在 `meta/wsa1_5_text_embeddings/` 共存；已有且校验通过的相同文本直接跳过。切换开关后为所需文本补算即可，不必删除原缓存，也不需改训练的 `text_embedding_dir`。`precompute_dataset(..., enable_action=True|False, action_mode="delta", use_subtask=True|False)` 直接调用同样生效。
+
 保留四种 loss、action LR 和既有 `step_s/input_s/mot_s/pred_s/backward_s/optimizer_s`。不新增 Action 梯度范数或单独动作阶段耗时日志。
 
 ## Clean → Random 图像增广
@@ -159,16 +176,16 @@ python util_scripts/infer_wsa1_5_action.py \
   --input observations.pt --output actions.pt --seed 0
 ```
 
-不设置 `EXTERNAL_STATS_PATH` 时采用本体/abs-delta 自动路径。文本缓存继续使用 `util_scripts/precompute_wsa1_5_text_embeddings.py --action-mode delta`，并提供实际 UMT5/tokenizer 路径。
+不设置 `EXTERNAL_STATS_PATH` 时采用本体/abs-delta 自动路径。动作训练的文本缓存使用 `util_scripts/precompute_wsa1_5_text_embeddings.py --enable-action --action-mode delta`，并提供实际 UMT5/tokenizer 路径及对应的子任务开关。
 
 推理输入包含当前 RGB/mask、原始历史 RGB/mask、task 列表和按 schema 源 key 保存的 `raw_state`。CLI 负责 prompt 和 state 归一化，并自动使用 checkpoint 中保存的编码模式。`return_world=true` 可返回同次联合采样的 world 输出；默认不解码视频。episode 或任务切换时调用 `reset()`。
 
-Stage-1 初始化要求原参数 key/shape 匹配，只允许缺少新的 Action/LoRA 参数。Stage-2 resume 沿用完整保存配置及原 optimizer/scheduler/RNG/step 体系。改变编码模式会改变 O 的表示与 token 数，应作为新实验，不在 resume 时无声切换。
+Stage-1 初始化要求原参数 key/shape 匹配，只允许缺少新的 Action/LoRA 参数。在线文本编码的 Stage-1 checkpoint 会保存冻结 UMT5；若目标 Stage-2 使用离线文本缓存（`load_text_encoder=false`），加载器仅在源配置声明启用 UMT5 时排除 `text_encoder.*`，并记录排除数量，其余参数仍严格检查。两阶段均在线时照常完整加载 UMT5；源 checkpoint 不含 UMT5 而目标要求在线时，仍拒绝缺失权重。该转换仅用于 Stage-1 → Stage-2 初始化，完整 checkpoint/resume 的严格加载规则不变。Stage-2 resume 沿用完整保存配置及原 optimizer/scheduler/RNG/step 体系。改变编码模式会改变 O 的表示与 token 数，应作为新实验，不在 resume 时无声切换。
 
 ## 验证边界
 
-CPU 测试检查两种 VAE 调用方式、时间长度、mask、RoPE、配置序列化、launcher 默认值/覆盖、单次并行 MoT、Action 梯度、普通 stats 路径、abs/delta、checkpoint 和在线历史。增广测试覆盖独立开关、Stage-1/Action 多帧重放、独立解码的终点、单视角 paste、透明通道、触发概率、缺失相机、评测关闭，以及 state/action/motion 标签保持原样。测试使用小尺寸随机模块、合成数据和真实截图素材。
+CPU 测试检查两种 VAE 调用方式、时间长度、mask、RoPE、配置序列化、launcher 默认值/覆盖、单次并行 MoT、Action 梯度、普通 stats 路径、abs/delta、checkpoint 和在线历史。文本缓存测试覆盖 `enable_action` 阶段选择、两种 `use_subtask` 选择与训练 prompt 一致、缓存共存与跳过已有文件，以及模拟多卡划分/续算。增广测试覆盖独立开关、Stage-1/Action 多帧重放、独立解码的终点、单视角 paste、透明通道、触发概率、缺失相机、评测关闭，以及 state/action/motion 标签保持原样。测试使用小尺寸随机模块、合成数据和真实截图素材。
 
-增广接入后回归：**457 passed, 11 deselected**（86.90 秒）。新增代码 Ruff、修改生产代码的导入检查、Python 编译及两个 launcher 的 shell syntax 检查均通过；45 张素材及随附索引与 LingBot 原文件逐一校验一致，像素变换应用函数也保持原实现。测试报告见 [JUnit XML](outputs/wsa1_5_action_cpu_results.xml)。
+UMT5 迁移与子任务原始 task 回退修复后，完整 CPU 回归：**505 passed, 11 deselected**（105.15 秒）。新增用例覆盖冻结文本编码器的完整 checkpoint 保存/迁移、保留原参数严格校验，以及缺失/null/空白任务在两阶段训练与预计算中的一致回退。Ruff 导入检查、Python 编译通过。报告见 [JUnit XML](outputs/wsa1_5_action_cpu_results.xml)；45 张素材及随附索引此前已校验与 LingBot 原文件一致，像素变换应用函数保持原实现。
 
 旧 pretrain launcher 的 PET 环境及默认参数与 11 项原测试不匹配，仍单独列出。未加载完整 Wan/Omega/WSA 权重，未运行 GPU、正式训练或真实 DDP；独立编码会增加 O tokens，实际显存、延迟及任务效果需服务器验证。

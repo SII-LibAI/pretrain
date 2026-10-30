@@ -256,7 +256,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     motion_log_every: int = 10000
     video_decode_threads: int = 1
     prefetch_factor: int = 2
-    use_subtask: bool = False  # Action stage only; Stage-1 keeps its original sidecar behavior.
+    use_subtask: bool = False  # Controls prompt text in both stages; Stage-1 retains sidecar 3D labels.
     allow_endframe_3d: bool = False
     image_augment: bool = False
     object_paste: bool = False

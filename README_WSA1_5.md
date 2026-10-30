@@ -173,6 +173,8 @@ hand_used：0=左手、1=右手、2=双手。区间不能越界或重叠，子�
 
 未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。文本条件和 3D 目标图像仍对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。没有子任务或当前帧不在有效子任务标注内时，prompt 使用 prefix + 原始 task，不附加 Subtask/Hand/Scene 字段，并关闭相应 3D 标签；原始 task 优先来自 sidecar 的 `task_instruction`，缺失时读取 LeRobot episode 的 `tasks`，多 task episode 按帧的 `task_index` 区分。原始 task 缺失或非法会报错，不再使用空 prompt。缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频仍会报错。
 
+有效子任务也先解析原始 task：sidecar 的 `task_instruction` 缺失、null、空字符串或全空白时，训练与预计算共同回退到 episode metadata 的单一 `tasks` 文本，再附加 Subtask/Hand/Scene。两处都没有有效任务时明确报错，即使子任务覆盖了整个 episode 也不例外。若有效子任务对应的 metadata 有多个候选 task，需在 sidecar 明确填写 `task_instruction`，不会任取第一个；没有子任务的多 task episode 仍按帧 `task_index` 选择。没有子任务标注的数据本来就使用 metadata 的 task，不会因此产生空 `Task:`。受旧漏洞影响的空 Task 子任务缓存应重新运行预计算补齐；正确文本的缓存继续复用。
+
 未来时间 mask 与 WSA-L 一致：每四帧一组，只要组内至少一帧有效，对应 latent 就保留；全部无效才屏蔽，不再把无效历史累计传播到后续组。部分有效组的 VAE 编码仍包含补齐帧的贡献。空间 mask 继续屏蔽缺失相机区域；RGB 越界帧保留重复末帧的像素，motion 越界帧在原始像素域填 `0`、归一化后为 `-1`，二者的时间 mask 都为无效。
 
 不按监督可用性过滤、跳过或重新采样 batch。全无效监督按 WSA-L 返回零损失，仍执行正常的梯度累积、优化器及 scheduler 流程，不因无监督抛异常；即使当前梯度为零，优化器已有动量和 weight decay 仍可能更新参数。
@@ -190,12 +192,18 @@ python util_scripts/precompute_wsa1_5_text_embeddings.py \
   --data-root "$DATA_ROOT" \
   --text-encoder-path "$TEXT_ENCODER_PATH" \
   --tokenizer-path "$TOKENIZER_PATH" \
+  --no-enable-action \
+  --use-subtask \
   --batch-size 8
 ```
 
 `--data-root` 可以是单个数据集，也可以是合集目录。文本预计算与训练统一调用 [find 发现脚本](util_scripts/discover_wsa1_5_datasets.sh)，扫描该目录本身及任意层级子目录，通过 `meta/info.json`、`data/` 和 `videos/` 识别数据集；Python 文本模块不再保留另一套 discover。扫描错误、找不到数据集、错误的标注结构都会报错。
 
-每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；同时计算各 episode 的 prefix + 原始 task，用于没有有效子任务的帧，不再强制生成空文本 embedding。预计算仅读取 sidecar 和 episode 元数据，不扫描全量帧表。`--batch-size` 默认为 8，整批调用 tokenizer 和 UMT5，末批不足时按实际数量编码，再逐条保存。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
+预计算使用与训练相同的阶段开关：`--no-enable-action` 对应 `policy.enable_action=false` 的一阶段训练，也是脚本默认值；`--enable-action` 对应 `policy.enable_action=true` 的动作训练。阶段由这个开关明确指定，不根据数据集是否声明 action 字段自动切换。`--action-mode abs|delta` 仅设置动作表示，默认 `delta`，只有开启动作训练时才影响 prompt；单独传这个参数不会开启动作 prompt。
+
+`--use-subtask` 为带真实 Subtask/Hand/Scene 的文本预计算缓存，`--no-use-subtask` 只计算原始 task 文本；默认关闭。两阶段均生效，必须与训练的 `--dataset.use_subtask=true|false` 一致。Stage-1 launcher 默认 `USE_SUBTASK=true`，保持原有子任务文本；可用 `USE_SUBTASK=false` 关闭文本中的子任务字段，Stage-1 原有的子任务分段和 3D 监督仍保留。旧 Stage-1 配置中的 `use_subtask=false` 此前未参与文本生成，如要保持旧实验的子任务 prompt，需显式设为 `true`。
+
+每个数据集的缓存位于 `meta/wsa1_5_text_embeddings/<文本SHA256>.safetensors`。文本复用训练适配器的 `condition_text` 规则，每个不同文本只计算一次；开启子任务时也计算各 episode 的 prefix + 原始 task，用于没有有效子任务的帧。两种模式可在同一目录共存，训练按实际 prompt 查找对应哈希；相同的 task 文本直接复用已有文件，不覆盖、不重复计算。预计算仅读取 sidecar 和 episode 元数据，不扫描全量帧表。`--batch-size` 默认为 8，整批调用 tokenizer 和 UMT5，末批不足时按实际数量编码，再逐条保存。缓存保存 BF16 context 和布尔 token mask，落盘时移除末尾 padding，读取时补回 512 tokens。训练文本超过上限时明确报错，不截断。
 
 默认 `max_text_length=512`，使用 Wan 的 4096 维 UMT5 特征。更改长度时，预计算用 `--max-text-length`，训练同步设置 `--policy.max_text_length`。自定义标注位置时，两边同步指定 `--sidecar-file` 和 `--dataset.sidecar_file`；缓存位置分别用 `--embedding-dir` 和 `--dataset.text_embedding_dir`。
 

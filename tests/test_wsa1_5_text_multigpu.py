@@ -15,8 +15,9 @@ from test_wsa1_5_text_embeddings import TinyEncoder, tokenize
 
 
 @pytest.mark.parametrize("dataset_count,world_size", [(1, 4), (3, 4), (1, 8)])
+@pytest.mark.parametrize("use_subtask", [False, True])
 def test_multigpu_partitions_all_prompts_without_duplicates_or_missing_files(
-    tmp_path, monkeypatch, dataset_count, world_size,
+    tmp_path, monkeypatch, dataset_count, world_size, use_subtask,
 ):
     root = tmp_path / "dataset collection"
     repos = ["."] if dataset_count == 1 else [".", "a/b", "z"]
@@ -33,7 +34,7 @@ def test_multigpu_partitions_all_prompts_without_duplicates_or_missing_files(
     tokenizer_path = tmp_path / "tokenizer"
     tokenizer_path.mkdir()
     all_tasks = [(path, text) for path in sorted((root / repo).resolve() for repo in repos)
-                 for text in script.dataset_prompts(path)]
+                 for text in script.dataset_prompts(path, use_subtask=use_subtask)]
     model_ranks, bindings, assignments = [], [], []
 
     class Encoder(TinyEncoder):
@@ -64,7 +65,8 @@ def test_multigpu_partitions_all_prompts_without_duplicates_or_missing_files(
     monkeypatch.setattr(sys, "argv", ["precompute", "--data-root", str(root),
                                      "--text-encoder-path", str(encoder_path),
                                      "--tokenizer-path", str(tokenizer_path),
-                                     "--batch-size", "2", "--max-text-length", "4"])
+                                     "--batch-size", "2", "--max-text-length", "4",
+                                     "--use-subtask" if use_subtask else "--no-use-subtask"])
     def run_rank(rank, workers):
         monkeypatch.setenv("WORLD_SIZE", str(workers))
         monkeypatch.setenv("RANK", str(rank))

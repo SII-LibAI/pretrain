@@ -17,6 +17,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=4 \
   --data-root "$DATA_ROOT" \
   --text-encoder-path "$WAN_MODEL_PATH/models_t5_umt5-xxl-enc-bf16.pth" \
   --tokenizer-path "$WAN_MODEL_PATH/google/umt5-xxl" \
+  --no-enable-action \
+  --use-subtask \
   --batch-size 128
 
 check
@@ -72,15 +74,21 @@ import torch
 from safetensors.torch import save_file
 
 from lerobot.datasets.utils import load_episodes
-from lerobot.policies.wsa1_5.dataset_wsa1_5 import condition_text, episode_task_texts, load_sidecar_annotations
+from lerobot.policies.wsa1_5.dataset_wsa1_5 import (
+    condition_text, episode_task_texts, load_sidecar_annotations, resolve_subtask_annotation,
+)
 from lerobot.policies.wsa1_5.text_embeddings import PROMPT_VERSION, TextEmbeddingCache, encode_text, text_embedding_path
 
 
-def dataset_prompts(root, sidecar_file="meta/sidecar.json", *, action_mode=None, use_subtask=False):
+def dataset_prompts(root, sidecar_file="meta/sidecar.json", *, enable_action=False, action_mode="delta", use_subtask=False):
+    if type(enable_action) is not bool:
+        raise TypeError("enable_action must be boolean")
     path = Path(root) / sidecar_file
-    annotations = {} if action_mode is not None and not use_subtask else load_sidecar_annotations(path)
+    annotations = {} if enable_action and not use_subtask else load_sidecar_annotations(path)
     render = condition_text
-    if action_mode is not None:
+    if enable_action:
+        if action_mode not in {"abs", "delta"}:
+            raise ValueError("Action text precomputation requires action_mode abs or delta")
         from lerobot.dataset_schemas import get_schema
         from lerobot.policies.wsa1_5.dataset_wsa1_5 import action_prompt, control_mode
         info = json.loads((Path(root) / "meta/info.json").read_text(encoding="utf-8"))
@@ -93,13 +101,15 @@ def dataset_prompts(root, sidecar_file="meta/sidecar.json", *, action_mode=None,
     for metadata in episodes.select_columns(columns).with_format(None):
         row = annotations.get(int(metadata["episode_index"]), {})
         prompts.update(render({"task_instruction": task}) for task in episode_task_texts(row, metadata))
+        if not use_subtask:
+            continue
         subtasks = row.get("subtasks")
         if subtasks is not None and not isinstance(subtasks, list):
             raise ValueError(f"subtasks must be a list or null: {path}")
         for subtask in subtasks or []:
             required = ["start_frame", "end_frame", "subtask_id"]
             if isinstance(subtask, dict) and all(subtask.get(key) is not None for key in required):
-                prompts.add(render(row, subtask))
+                prompts.add(render(resolve_subtask_annotation(row, metadata), subtask))
     return sorted(prompts)
 
 
@@ -117,12 +127,14 @@ def pending_prompts(directory, prompts, max_length, text_dim):
 @torch.no_grad()
 def precompute_dataset(root, encoder, tokenizer, device, *, max_length=512, text_dim=4096,
                        sidecar_file="meta/sidecar.json", embedding_dir="meta/wsa1_5_text_embeddings", batch_size=8,
-                       prompts=None):
+                       enable_action=False, action_mode="delta", use_subtask=False, prompts=None):
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("Text encoding batch_size must be a positive integer")
     directory = Path(root) / embedding_dir
     directory.mkdir(parents=True, exist_ok=True)
-    prompts = dataset_prompts(root, sidecar_file) if prompts is None else prompts
+    if prompts is None:
+        prompts = dataset_prompts(root, sidecar_file, enable_action=enable_action,
+                                  action_mode=action_mode, use_subtask=use_subtask)
     total = len(prompts)
     prompts = pending_prompts(directory, prompts, max_length, text_dim)
     for offset in range(0, len(prompts), batch_size):
@@ -159,8 +171,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="每批编码的文本数量")
     parser.add_argument("--sidecar-file", default="meta/sidecar.json")
     parser.add_argument("--embedding-dir", default="meta/wsa1_5_text_embeddings")
-    parser.add_argument("--action-mode", choices=["abs", "delta"], help="Build Stage-2 robot-control prompts")
-    parser.add_argument("--use-subtask", action="store_true", help="Stage-2 includes actual sidecar subtask text")
+    parser.add_argument("--enable-action", action=argparse.BooleanOptionalAction, default=False,
+                        help="Build Action training prompts when enabled; match policy.enable_action")
+    parser.add_argument("--action-mode", choices=["abs", "delta"], default="delta",
+                        help="Absolute/delta representation when Action is enabled; match policy.action_mode")
+    parser.add_argument("--use-subtask", action=argparse.BooleanOptionalAction, default=False,
+                        help="Include actual Subtask/Hand/Scene text in Stage-1 or Action prompts; match dataset.use_subtask")
     args = parser.parse_args()
     if args.max_text_length <= 0:
         parser.error("--max-text-length must be positive")
@@ -192,7 +208,8 @@ def main():
     roots = sorted({(args.data_root / repo).resolve() for repo in repos})
     work, offset, skipped = [], 0, 0
     for root in roots:
-        prompts = dataset_prompts(root, args.sidecar_file, action_mode=args.action_mode, use_subtask=args.use_subtask)
+        prompts = dataset_prompts(root, args.sidecar_file, enable_action=args.enable_action,
+                                  action_mode=args.action_mode, use_subtask=args.use_subtask)
         assigned = [text for index, text in enumerate(prompts, start=offset) if index % world_size == rank]
         offset += len(prompts)
         pending = pending_prompts(root / args.embedding_dir, assigned, args.max_text_length, 4096)
@@ -201,7 +218,8 @@ def main():
             work.append((root, pending))
     print(f"[WSA text rank {rank}/{world_size}] pending={sum(len(texts) for _, texts in work)} "
           f"skipped={skipped} global_total={offset} "
-          f"across {len(work)} datasets; device={args.device}", flush=True)
+          f"across {len(work)} datasets; device={args.device} "
+          f"enable_action={args.enable_action} use_subtask={args.use_subtask}", flush=True)
     if not work:
         return
     for path in [args.text_encoder_path, args.tokenizer_path]:
@@ -222,7 +240,9 @@ def main():
     for root, prompts in work:
         precompute_dataset(root, encoder, tokenizer, args.device,
                            max_length=args.max_text_length, sidecar_file=args.sidecar_file,
-                           embedding_dir=args.embedding_dir, batch_size=args.batch_size, prompts=prompts)
+                           embedding_dir=args.embedding_dir, batch_size=args.batch_size,
+                           enable_action=args.enable_action, action_mode=args.action_mode,
+                           use_subtask=args.use_subtask, prompts=prompts)
     print(f"[WSA text rank {rank}/{world_size}] done", flush=True)
 
 

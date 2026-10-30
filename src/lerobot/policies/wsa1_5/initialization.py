@@ -38,7 +38,7 @@ def read_checkpoint(path):
 
 
 def load_stage1_policy(module, directory):
-    """Only Action/LoRA keys may be absent; every original tensor must match."""
+    """Load matching world weights; omit source UMT5 only for an offline-text target."""
     import json
 
     directory = Path(directory)
@@ -46,6 +46,11 @@ def load_stage1_policy(module, directory):
     if config.get("enable_action", False):
         raise ValueError("init_checkpoint_path expects Stage-1; use policy.path/resume for Stage-2")
     state = read_checkpoint(directory / "model.safetensors")
+    omitted_text = set()
+    if config.get("load_text_encoder", False) is True and not module.config.load_text_encoder and module.text_encoder is None:
+        omitted_text = {key for key in state if key.startswith("text_encoder.")}
+        for key in omitted_text:
+            del state[key]
     expected = module.state_dict()
     added = {key for key in expected if key.startswith("action_expert.") or ".lora_a" in key or ".lora_b" in key}
     missing, unexpected = set(expected) - set(state), set(state) - set(expected)
@@ -55,7 +60,8 @@ def load_stage1_policy(module, directory):
         if value.shape != expected[key].shape:
             raise ValueError(f"Stage-1 shape mismatch for {key}: {tuple(value.shape)} != {tuple(expected[key].shape)}")
     report = load_report(module, state, name="Stage-1 -> Action post-training", strict=False)
-    logging.info("[WSA init] loaded=%d new_action_or_lora=%d; optimizer/scheduler/RNG/step start fresh", len(state), len(added))
+    logging.info("[WSA init] loaded=%d new_action_or_lora=%d omitted_frozen_umt5=%d; "
+                 "optimizer/scheduler/RNG/step start fresh", len(state), len(added), len(omitted_text))
     return report
 
 
