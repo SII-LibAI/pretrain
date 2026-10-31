@@ -1,10 +1,10 @@
-  bash -lc '
+bash -lc '
   source /root/miniconda3/etc/profile.d/conda.sh
   conda activate wsa15
 
   cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
 
   PROC_PER_NODE=8 \
-  NODE_COUNT=2 \
-  bash /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/launch/wsa_1_5_pretrain.sh
-  '
+  NODE_COUNT=1 \
+  bash /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/launch/wsa_1_5_posttrain_robotwin_clean.sh
+'

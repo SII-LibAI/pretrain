@@ -79,7 +79,7 @@ else
         --log_freq="${LOG_FREQ:-10}"
         --eval_freq="${EVAL_FREQ:-5000}"
         --wandb.enable="${WANDB_ENABLE:-true}"
-        --wandb.mode=offline
+        --wandb.mode="${WANDB_MODE:-offline}"
     )
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
 fi

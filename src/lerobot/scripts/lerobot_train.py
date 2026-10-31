@@ -177,8 +177,6 @@ def update_policy(
         output_dict.update({f"lr/{name}": lr for name, lr in group_lrs.items()})
         if "action" in group_lrs:
             output_dict["action_lr"] = group_lrs["action"]
-            if is_wsa:
-                train_metrics.action_lr = group_lrs["action"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
@@ -410,8 +408,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         for metric in ["input_s", "mot_s", "pred_s", "backward_s", "optimizer_s"]:
             train_metrics[metric] = AverageMeter(metric, ":.3f")
         if cfg.policy.enable_action:
-            for metric in ["loss_action_flow", "action_lr"]:
-                train_metrics[metric] = AverageMeter(metric, ":.3f")
+            train_metrics["loss_action_flow"] = AverageMeter("loss_action_flow", ":.3f")
 
 
     # Use effective batch size for proper epoch calculation in distributed training
