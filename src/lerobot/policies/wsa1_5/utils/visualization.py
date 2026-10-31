@@ -51,11 +51,19 @@ def save_training_sample(batch, dataset, output_dir, step):
 
     goal = torch.full_like(observed, -1)
     goal_valid = [False, False, False]
-    if metadata_valid:
+    targets = batch["targets"]
+    if "goal_rgb_views" in targets:
+        # Save the teacher's actual target, including any sample RGB augmentation.
+        views = [view.detach().cpu()[None] for view in targets["goal_rgb_views"][index]]
+        goal_valid = targets["goal_view_valid"][index].detach().cpu().tolist()
+    elif metadata_valid or (source.action_config is not None and config.allow_endframe_3d):
         views, flags = zip(*(source._decode(key, [goal_time], episode) for key in source.view_keys), strict=True)
-        canvas, _ = compose_rgb_views(views, flags, config.rgb_height, config.rgb_width)
-        goal = canvas[0] * 2 - 1
         goal_valid = [bool(flag[0]) for flag in flags]
+    else:
+        views = None
+    if views is not None:
+        canvas, _ = compose_rgb_views(views, goal_valid, config.rgb_height, config.rgb_width)
+        goal = canvas[0] * 2 - 1
 
     directory = Path(output_dir) / f"step_{step:08d}"
     directory.mkdir(parents=True, exist_ok=True)

@@ -38,7 +38,7 @@ class WSA1_5Config(PreTrainedConfig):
     rgb_width: int = 320
     motion_height: int = 192
     motion_width: int = 160
-    future_frames: int = 32
+    future_frames: int = 8
     teacher_layers: tuple[int, ...] = (4, 11, 17, 23)
     student_layers: tuple[int, ...] | None = None
     enable_rgb: bool = True
@@ -84,7 +84,7 @@ class WSA1_5Config(PreTrainedConfig):
     action_flow_shift: float = 5.0  # WSA-L action scheduler, independent of RGB shift.
     action_mode: str = "delta"
     num_history_frame: int = 4
-    history_frame_stride: int = 2
+    history_frame_stride: int = 4
     sparse_frame_encoding: str = "joint"  # joint video VAE | independent one-frame VAE calls.
     lambda_action: float = 1.0
     action_lr: float = 1e-4
@@ -243,7 +243,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     # Optional source keys in precisely the same order; empty entries mean absent.
     view_keys: list[str] = field(default_factory=list)
     future_frames: int = 32
-    frame_stride: int = 1
+    frame_stride: int = 4
     rgb_height: int = 384
     rgb_width: int = 320
     motion_height: int = 192

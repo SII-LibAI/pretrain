@@ -45,6 +45,7 @@ else
         --policy.omega_checkpoint_path="${OMEGA_CHECKPOINT_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/vggt-omega/vggt_omega_1b_256_text.pt}"
         --policy.enable_3d_queries="${ENABLE_3D_QUERIES:-true}"
         --policy.lambda_rgb="${LAMBDA_RGB:-1.0}"
+        --policy.enable_action=false
         --policy.lambda_motion="${LAMBDA_MOTION:-0.5}"
         --policy.lambda_3d="${LAMBDA_3D:-0.5}"
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"

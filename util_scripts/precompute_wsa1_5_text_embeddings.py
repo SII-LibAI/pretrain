@@ -9,16 +9,15 @@ import tempfile
 """
 run:
 WAN_MODEL_PATH=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B
-DATA_ROOT=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egodex-LerobotV3
+DATA_ROOT=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/RoboTwin
 cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8 \
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   util_scripts/precompute_wsa1_5_text_embeddings.py \
   --data-root "$DATA_ROOT" \
   --text-encoder-path "$WAN_MODEL_PATH/models_t5_umt5-xxl-enc-bf16.pth" \
   --tokenizer-path "$WAN_MODEL_PATH/google/umt5-xxl" \
-  --no-enable-action \
-  --use-subtask \
+  --enable-action \
   --batch-size 128
 
 check

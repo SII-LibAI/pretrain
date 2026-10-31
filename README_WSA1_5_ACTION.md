@@ -189,3 +189,11 @@ CPU 测试检查两种 VAE 调用方式、时间长度、mask、RoPE、配置序
 UMT5 迁移与子任务原始 task 回退修复后，完整 CPU 回归：**505 passed, 11 deselected**（105.15 秒）。新增用例覆盖冻结文本编码器的完整 checkpoint 保存/迁移、保留原参数严格校验，以及缺失/null/空白任务在两阶段训练与预计算中的一致回退。Ruff 导入检查、Python 编译通过。报告见 [JUnit XML](outputs/wsa1_5_action_cpu_results.xml)；45 张素材及随附索引此前已校验与 LingBot 原文件一致，像素变换应用函数保持原实现。
 
 旧 pretrain launcher 的 PET 环境及默认参数与 11 项原测试不匹配，仍单独列出。未加载完整 Wan/Omega/WSA 权重，未运行 GPU、正式训练或真实 DDP；独立编码会增加 O tokens，实际显存、延迟及任务效果需服务器验证。
+
+## 计算归一化
+python util_scripts/batch_compute_norm_stats.py \
+  --dataset_root /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/RoboTwin-LeRobot-v30 \
+  --output_dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/norm_stats_32 \
+  --action_mode delta \
+  --chunk_size 32 \
+  --num_workers 25
