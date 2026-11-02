@@ -86,7 +86,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
         return super()._load_from_state_dict(*args, **kwargs)
 
     def prepare_for_training(self, device, *, log_parameters=True):
-        """Load the enabled teacher on each rank and summarize main modules once."""
+        """Prepare each rank; Action defers teacher weights until valid 3D targets arrive."""
         if self.config.enable_action and self.config.use_3d_supervision and self.teacher is None:
             self.teacher = OmegaTeacher(self.config.omega_checkpoint_path, self.config.teacher_layers, dtype=self.model_dtype)
         if self.teacher is not None and not self.config.enable_action:
@@ -100,7 +100,10 @@ class WSA1_5_Policy(PreTrainedPolicy):
             modules["Action"] = self.action_expert
         for name, module in modules.items():
             if module is None:
-                logging.info("[WSA parameters] %s disabled", name)
+                if name == "VGGT-Omega" and self.teacher is not None:
+                    logging.info("[WSA parameters] %s enabled (lazy load on first valid 3D batch)", name)
+                else:
+                    logging.info("[WSA parameters] %s disabled", name)
                 continue
             logging.info("[WSA parameters] %s total=%.3fB trainable=%.3fB", name,
                          sum(p.numel() for p in module.parameters()) / 1e9,

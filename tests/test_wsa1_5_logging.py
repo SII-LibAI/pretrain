@@ -73,6 +73,24 @@ def test_nonmain_rank_loads_teacher_without_parameter_report(monkeypatch, caplog
     assert "[WSA parameters]" not in caplog.text
 
 
+@pytest.mark.parametrize("weight", [0.0, 1.0])
+@pytest.mark.parametrize("log_parameters", [False, True])
+def test_action_startup_distinguishes_lazy_teacher_from_disabled(monkeypatch, caplog, weight, log_parameters):
+    from test_wsa1_5_action import action_policy
+
+    policy = action_policy(lambda_3d=weight)
+    monkeypatch.setattr(OmegaTeacher, "_load", lambda *args: pytest.fail("Action teacher must load lazily"))
+    with caplog.at_level(logging.INFO):
+        policy.prepare_for_training(torch.device("cpu"), log_parameters=log_parameters)
+    assert (policy.teacher is not None) == (weight > 0)
+    if policy.teacher is not None:
+        assert policy.teacher.model is None
+    records = [record.getMessage() for record in caplog.records
+               if record.getMessage().startswith("[WSA parameters] VGGT-Omega")]
+    expected = ("enabled (lazy load on first valid 3D batch)" if weight else "disabled")
+    assert records == ([f"[WSA parameters] VGGT-Omega {expected}"] if log_parameters else [])
+
+
 @pytest.mark.parametrize("valid_checkpoint", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_teacher_load_is_visible_frozen_strict_and_preserves_rng(monkeypatch, caplog, valid_checkpoint, dtype):

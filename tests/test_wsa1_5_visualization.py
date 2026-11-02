@@ -83,6 +83,51 @@ def test_snapshot_resolves_selected_repo_in_multi_dataset(tmp_path, monkeypatch)
     assert seen and all(path.startswith(str(second.root)) for path, _ in seen)
 
 
+@pytest.mark.parametrize("subtask,annotations,endframe,expected_frame", [
+    (False, True, True, 39), (False, False, True, 39), (True, False, True, 39),
+    (False, True, False, None), (True, True, True, 9),
+])
+@pytest.mark.parametrize("include_3d_targets", [False, True])
+def test_action_snapshot_respects_endframe_goal_and_validity(
+    tmp_path, monkeypatch, subtask, annotations, endframe, expected_frame, include_3d_targets
+):
+    from test_wsa1_5_action import make_action_data
+
+    dataset, seen = make_action_data(tmp_path / "data", monkeypatch, use_subtask=subtask,
+                                    annotations=annotations, allow_endframe=endframe)
+    dataset.config.rgb_height, dataset.config.rgb_width = 96, 32
+    dataset.config.motion_height = dataset.config.motion_width = 32
+    dataset.include_3d_targets = include_3d_targets
+    batch = wsa1_5_collate([dataset[3]])
+    seen.clear()
+    directory = save_training_sample(batch, dataset, tmp_path / "validation", 20)
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    goal = np.asarray(Image.open(directory / "goal.png"))
+    assert metadata["goal_view_valid"] == [expected_frame is not None, False, False]
+    assert metadata["metadata_valid"] == (subtask and annotations)
+    if expected_frame is None:
+        assert not goal.any()
+    else:
+        assert metadata["goal_timestamp"] == pytest.approx(expected_frame / 30)
+        assert (goal[:64] == round((2 + expected_frame / 30) / 4 * 255)).all()
+    assert not goal[64:].any()
+    if include_3d_targets:
+        assert all(path.endswith("observation.motion") for path, _ in seen)
+
+
+def test_snapshot_saves_actual_batch_goal_instead_of_raw_video(tmp_path, monkeypatch):
+    dataset, seen = small_dataset(tmp_path / "data", monkeypatch)
+    batch = wsa1_5_collate([dataset[0]])
+    # A batch target may already contain sample-consistent RGB augmentation.
+    batch["targets"]["goal_rgb_views"][0][0].fill_(0.2)
+    seen.clear()
+    directory = save_training_sample(batch, dataset, tmp_path / "validation", 20)
+    goal = np.asarray(Image.open(directory / "goal.png"))
+    assert (goal[:64] == 51).all() and not goal[64:].any()
+    assert all(path.endswith("observation.motion") for path, _ in seen)
+    assert (batch["targets"]["goal_rgb_views"][0][0] == 0.2).all()
+
+
 def test_snapshot_rejects_wrong_source_and_preserves_decode_errors(tmp_path, monkeypatch):
     dataset, _ = small_dataset(tmp_path / "data", monkeypatch)
     batch = wsa1_5_collate([dataset[0]])

@@ -25,8 +25,8 @@ def preprocess_omega_views(views):
 class OmegaTeacher:
     """Not an nn.Module child: teacher weights are excluded from policy checkpoints.
 
-    The training entry loads weights before optimization; standalone target
-    extraction retains lazy loading. Inference never initializes VGGTOmega.
+    Stage-1 loads weights at training startup; Action and standalone target
+    extraction load on the first valid 3D batch. Inference never initializes VGGTOmega.
     Calling train() on the student cannot enable teacher dropout or gradients.
     """
     def __init__(self, checkpoint_path, layers=(4, 11, 17, 23), use_checkpoint=False, dtype=torch.bfloat16):
