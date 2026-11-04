@@ -64,10 +64,12 @@ class WSA1_5_Policy(PreTrainedPolicy):
         self.teacher = OmegaTeacher(config.omega_checkpoint_path, config.teacher_layers,
                                     dtype=self.model_dtype) if config.use_3d_supervision and not config.enable_action else None
         self.action_expert = None
+        self.proprio_encoder = None
         if config.enable_action:
             weight_dtype = torch.float32 if config.trainable_weights_fp32 else self.model_dtype
             with construction_dtype(weight_dtype):
                 self.action_expert = ActionExpert(config)
+                self.proprio_encoder = nn.Linear(config.state_dim, config.text_dim)
                 matches = configure_rgb(self.flow.rgb, config)
             logging.info("[WSA action] RGB mode=%s LoRA targets=%s", config.rgb_finetune_mode, matches)
         if initialize_pretrained and config.init_checkpoint_path:
@@ -101,6 +103,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                    "VGGT-Omega": self.teacher.model if self.teacher is not None else None}
         if self.config.enable_action:
             modules["Action"] = self.action_expert
+            modules["Proprio"] = self.proprio_encoder
         for name, module in modules.items():
             if module is None:
                 if name == "VGGT-Omega" and self.teacher is not None:
@@ -227,6 +230,8 @@ class WSA1_5_Policy(PreTrainedPolicy):
             if module is None:
                 continue
             params = [p for key, p in module.named_parameters() if p.requires_grad and not key.startswith("feature_heads.")]
+            if name == "action":
+                params += [p for p in self.proprio_encoder.parameters() if p.requires_grad]
             if params:
                 groups.append({"name": name, "params": params, "lr": lr})
         if self.future_3d is not None:
@@ -277,6 +282,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 observed, context, valid, spatial, pixels = self.encode_observation(
                     batch["observed_rgb"], batch["condition_text"], batch["observed_valid"],
                     text_embedding=batch.get("text_embedding"), text_valid=batch.get("text_valid"))
+                context, valid = self._append_proprio_to_context(context, valid, batch["state"], batch.get("state_valid"))
                 history = self.encode_history(batch)
                 rgb_shape, motion_shape = self._shapes(observed.shape[0])
                 generated = self.flow.sample_latents(
@@ -284,7 +290,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                     motion_placeholder=self._placeholder(observed.shape[0], observed.device) if motion_shape else None,
                     seed=seed, steps=self.config.action_sampler_steps, observed_valid=spatial,
                     future_3d=self.future_3d, goal_view_valid=self.observed_view_validity(pixels),
-                    action_expert=self.action_expert, state=batch["state"], return_features=return_world, **history)
+                    action_expert=self.action_expert, return_features=return_world, **history)
                 result = generated["action"]
                 result = result if return_normalized else codec.decode(result, raw_state)
                 if not return_world:
@@ -307,6 +313,22 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 return world
         finally:
             self.train(was_training)
+
+    def _append_proprio_to_context(self, context, valid, state, state_valid=None):
+        validate_text_embedding(context, valid, self.config.max_text_length, self.config.text_dim)
+        if state.shape != (context.shape[0], self.config.state_dim):
+            raise ValueError("Current state must be [B,state_dim]")
+        require_finite(state, "Current state")
+        if state_valid is None:
+            state_valid = torch.ones(context.shape[0], dtype=torch.bool, device=context.device)
+        require_bool(state_valid, "State validity")
+        if state_valid.shape != (context.shape[0],):
+            raise ValueError("State validity must be [B]")
+        token = self.proprio_encoder(state.to(device=context.device, dtype=self.proprio_encoder.weight.dtype))
+        token = token.to(context.dtype)
+        require_finite(token, "Projected state")
+        return (torch.cat([context, token[:, None]], 1),
+                torch.cat([valid, state_valid.to(context.device)[:, None]], 1))
 
     def encode_history(self, batch):
         if not self.config.enable_action or self.config.num_history_frame == 0:
@@ -485,6 +507,9 @@ class WSA1_5_Policy(PreTrainedPolicy):
         observed, context, context_valid, observed_valid, pixel_valid = self.encode_observation(
             batch["observed_rgb"], batch["condition_text"], batch["observed_valid"], latent=observed_latent,
             text_embedding=batch.get("text_embedding"), text_valid=batch.get("text_valid"))
+        if self.config.enable_action:
+            context, context_valid = self._append_proprio_to_context(
+                context, context_valid, batch["state"], batch["state_valid"])
         if teacher_valid is not None:
             require_bool(teacher_valid, "Teacher feature validity")
             # An absent observed camera has no corresponding active G queries.
@@ -506,7 +531,7 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 raise ValueError("Valid action supervision requires valid current state")
             noisy, action_velocity, action_t = self.action_expert.training_state(target["action"])
             action_args = dict(action_expert=self.action_expert, action_latent=noisy, action_t=action_t,
-                               state=batch["state"], action_valid=mask.any(-1))
+                               action_valid=mask.any(-1))
         prediction = self.flow.velocity(observed, context, context_valid, states.get("rgb"), states.get("motion"),
                                         timesteps.get("rgb"), timesteps.get("motion"), observed_valid=observed_valid,
                                         rgb_valid=masks.get("rgb"), motion_valid=masks.get("motion"),

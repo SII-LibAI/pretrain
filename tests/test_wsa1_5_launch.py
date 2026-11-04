@@ -96,6 +96,19 @@ def test_launcher_subtask_prompt_switch_matches_precompute(launch, use_subtask):
     assert args["dataset.use_subtask"] == (use_subtask or "true")
 
 
+def test_launcher_stage1_weight_initialization_and_resume_are_separate(launch):
+    env = dict(PET_NNODES="1", PET_NODE_RANK="0", PET_NPROC_PER_NODE="1",
+               PET_MASTER_ADDR="127.0.0.1", PET_MASTER_PORT="29500",
+               INIT_CHECKPOINT_PATH="/tmp/stage2/pretrained_model")
+    args = launch(STEPS="100000", extra_args=["--policy.future_frames=32", "--dataset.future_frames=32"], **env)
+    config = parse_policy(args)
+    assert not config.enable_action and config.init_checkpoint_path == env["INIT_CHECKPOINT_PATH"]
+    assert args["steps"] == "100000" and args.get("resume", "false") == "false"
+    assert config.future_frames == int(args["dataset.future_frames"]) == 32
+    args = launch(RESUME_CONFIG="/tmp/run/train_config.json", **env)
+    assert args["resume"] == "true" and "policy.init_checkpoint_path" not in args
+
+
 def test_launcher_preserves_assigned_defaults_and_removes_supervision_switch(launch):
     args = launch()
     config = parse_policy(args)

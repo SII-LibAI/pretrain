@@ -52,7 +52,7 @@ def load_stage1_policy(module, directory):
         for key in omitted_text:
             del state[key]
     expected = module.state_dict()
-    added = {key for key in expected if key.startswith("action_expert.") or ".lora_a" in key or ".lora_b" in key}
+    added = {key for key in expected if key.startswith(("action_expert.", "proprio_encoder.")) or ".lora_a" in key or ".lora_b" in key}
     missing, unexpected = set(expected) - set(state), set(state) - set(expected)
     if missing != added or unexpected:
         raise ValueError(f"Stage-1 initialization mismatch: missing={sorted(missing - added)}, unexpected={sorted(unexpected)}")
@@ -72,7 +72,7 @@ def load_world_policy(module, directory):
     directory = Path(directory)
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     state = read_checkpoint(directory / "model.safetensors")
-    omitted_action = {key for key in state if key.startswith("action_expert.")} if config.get("enable_action", False) else set()
+    omitted_action = {key for key in state if key.startswith(("action_expert.", "proprio_encoder."))} if config.get("enable_action", False) else set()
     for key in omitted_action:
         del state[key]
 

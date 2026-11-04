@@ -114,8 +114,6 @@ class WSA1_5Config(PreTrainedConfig):
             if self.action_num_layers is not None and (type(self.action_num_layers) is not int
                                                        or self.action_num_layers != self.num_layers):
                 raise ValueError("Parallel MoT requires action_num_layers == num_layers")
-            if self.action_hidden_dim % 2:
-                raise ValueError("Action positional embedding requires even action_hidden_dim")
             if self.action_mode not in {"abs", "delta"}:
                 raise ValueError("action_mode must be abs or delta")
             if self.rgb_finetune_mode not in {"frozen", "lora", "full"}:

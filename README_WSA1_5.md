@@ -374,6 +374,24 @@ unset RESUME_CONFIG
 
 使用本版本保存的 train_config.json，恢复 optimizer、scheduler、RNG 和 step。恢复模式沿用保存的配置，不重新应用 launcher 的默认值。文本缓存继续保留在各数据集；启用 3D 监督时仍需独立的 Omega 文件。默认完整 policy 含 Wan/VAE，不含 UMT5 或 teacher。
 
+只有 Stage-2 权重、需要重新训练 Stage-1 时，使用权重初始化而非断点恢复：
+
+```bash
+unset RESUME_CONFIG
+INIT_CHECKPOINT_PATH=/path/to/stage2/checkpoints/005000/pretrained_model \
+STEPS=100000 \
+OUTPUT_DIR=outputs/wsa1_5/world_retrain_from_stage2 \
+bash launch/wsa_1_5_pretrain.sh \
+  --policy.future_frames=32 \
+  --dataset.future_frames=32
+```
+
+`INIT_CHECKPOINT_PATH` 指向含 `config.json` 和 `model.safetensors` 的目录，也可以直接传 `--policy.init_checkpoint_path=...`。Stage-1 会严格加载 RGB、Motion、Future3D 和 VAE，去掉动作专家；若 Stage-2 使用 RGB LoRA，则先按保存的 `alpha/rank` 合并到 RGB 权重。Stage-2 未保存 UMT5 而本次启用在线文本编码时，从 `TEXT_ENCODER_PATH` 补载原冻结 UMT5，tokenizer 仍由 `TOKENIZER_PATH` 提供；不会随机初始化缺失的世界模型或文本权重。世界模型结构需与来源匹配，参数缺失、多余或形状不符均报错。启动参数、数据、帧数、分辨率和损失设置由本次 Stage-1 命令决定，应沿用原预训练设置。
+
+示例中的两处 `32` 请按原 Stage-1 实际帧数一起替换。当前 policy 与 dataset 的默认帧数分别为 8 和 32，故这里显式指定，不修改原默认配置。
+
+这条路径的 optimizer、scheduler、RNG 和 step 重新开始，原 Stage-2 文件只读。本例补训 10 万步，得到的是新实验，不能还原误删的 60 万步 checkpoint；52 万步到 60 万步的间隔本身为 8 万步，Stage-2 的更新也不能直接折算成 Stage-1 步数。学习率由新训练配置决定，不会自动恢复原实验后期的学习率；本次没有修改 launcher 的原有学习率、帧数或其他默认值。
+
 旧版本带 UMT5 参数、通用缓存配置、FP32 optimizer 状态或可学习 query 的 checkpoint 不能直接当作本版继续训练；本轮变更应从 Wan 权重新开实验，不修改旧配置强行恢复。
 
 推理不加载 Omega。当前 RGB 输入也须先执行 `img * 2 - 1`；RGB/motion 预测结果经过 VAE 解码、有限值检查和 `[-1,1]` 截断后，用 `(img + 1) / 2` 返回 `[0,1]`。默认无文本编码器时，从 `lerobot.policies.wsa1_5.text_embeddings.TextEmbeddingCache` 读取对应文本的 `(embedding, valid)`，加 batch 维后传给 `predict_future(..., text_embedding=embedding[None], text_valid=valid[None])`；输入仍只来自当前 RGB 和文本。`load_text_encoder=true` 保留给显式在线冻结编码的实验，其完整 checkpoint 会包含 UMT5；不能仅给默认离线训练所得 checkpoint 改这个开关，严格加载会拒绝缺失的文本编码器参数。

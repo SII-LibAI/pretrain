@@ -12,7 +12,11 @@ O/R/M/G/A 在同一次 MoT 中逐层并行计算。训练只做一次联合前�
 | G | 1 | 1 | 1 | 1 | 0 |
 | A | 1 | 0 | 0 | 1 | 1 |
 
-Action Expert 使用连续动作 projection、位置/RoPE、timestep modulation、Wan blocks 和 velocity head。state 经 projection 放进 A 的 cross-attention context；文本继续使用 UMT5。默认 Action hidden=1024、FFN=4096，深度和 attention head 几何与其他专家一致。
+Action Expert 使用连续动作 projection、RoPE、timestep modulation、Wan blocks 和 velocity head，不额外叠加动作正弦位置向量。state 按 WSA-L 方式经 policy 的 `proprio_encoder` 投影到 `text_dim`（默认 4096），追加到原始 UMT5 context 后，再分别经过 RGB、Motion、Action 的 context 投影。G 保持原有结构，通过 MoT 间接获得条件。默认 Action hidden=1024、FFN=4096，深度和 attention head 几何与其他专家一致。
+
+UMT5 文本缓存仍为 `[max_text_length,text_dim]`，state 在训练和动作推理时动态追加，缓存无需重算。混合数据中缺失 state 的样本会屏蔽这个附加 token。`proprio_encoder` 使用 Action 参数组的学习率。
+
+此结构与旧版“动作绝对位置向量 + Action 内部 state_encoder”的 Stage-2 权重不兼容，不能直接用于旧 Stage-2 的续训或评测；新后训练仍可从原 Stage-1 世界模型权重初始化。
 
 训练的 R/M 是标准 FM noisy target，因此 A 会经 G 受到未来 RGB/Motion 标签影响。这是当前并行训练语义，不能宣称动作分支独立于这些标签。真实 goal 图像和 Omega features 仍只作为损失标签。Action loss 可回传到未冻结的 G/O/world 参数。
 

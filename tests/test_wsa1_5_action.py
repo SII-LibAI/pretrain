@@ -232,7 +232,7 @@ def test_action_flow_gradient_mask_and_seed():
     loss, metrics = policy(batch)
     assert torch.isfinite(loss) and "loss_action_flow" in metrics
     loss.backward()
-    assert policy.action_expert.state_encoder.weight.grad.abs().sum() > 0
+    assert policy.proprio_encoder.weight.grad.abs().sum() > 0
     assert all(p.grad is not None for p in policy.action_expert.parameters() if p.requires_grad)
     assert all(p.grad is None for p in policy.flow.rgb.parameters())
     assert policy.future_3d.blocks[0].self_attn.k.weight.grad.abs().sum() > 0
@@ -245,6 +245,83 @@ def test_action_flow_gradient_mask_and_seed():
     zero, _ = policy(batch)
     assert zero.item() == 0
     zero.backward()
+
+
+@pytest.mark.parametrize("hidden_dim", [12, 13])
+def test_action_tokens_use_rope_without_extra_absolute_positions(hidden_dim):
+    policy = action_policy(action_hidden_dim=hidden_dim)
+    cfg = policy.config
+    batch = action_batch(cfg)
+    context, valid = policy._append_proprio_to_context(batch["text_embedding"], batch["text_valid"], batch["state"])
+    noisy = torch.ones(1, cfg.action_chunk_size, cfg.action_dim)
+    prepared = policy.action_expert.prepare(noisy, torch.tensor([500.]), context, valid)
+    torch.testing.assert_close(prepared.tokens, policy.action_expert.action_encoder(noisy), rtol=0, atol=0)
+    torch.testing.assert_close(prepared.tokens[:, 0], prepared.tokens[:, -1], rtol=0, atol=0)
+    assert not torch.equal(prepared.freqs[0], prepared.freqs[-1])
+    assert not hasattr(policy.action_expert, "position") and not hasattr(policy.action_expert, "state_encoder")
+
+
+def test_shared_proprio_context_reaches_world_and_action_in_training_and_inference():
+    policy = action_policy(enable_motion=True, lambda_rgb=1)
+    cfg = policy.config
+    batch = action_batch(cfg)
+    batch["text_valid"][:, -1] = False
+    batch["targets"].update(future_motion=torch.rand(1, cfg.future_frames, 3, cfg.motion_height, cfg.motion_width),
+                             motion_valid=torch.ones(1, cfg.future_frames, 1, cfg.motion_height, cfg.motion_width, dtype=torch.bool))
+    captured, proprio_calls = [], []
+    hook = policy.flow.mot.register_forward_pre_hook(lambda module, args: captured.append(args[0]))
+    state_hook = policy.proprio_encoder.register_forward_hook(lambda *args: proprio_calls.append(1))
+    loss, _ = policy(batch)
+    loss.backward()
+    assert policy.proprio_encoder.weight.grad.abs().sum() > 0
+    policy.predict_action_chunk(batch, seed=3, return_normalized=True)
+    hook.remove()
+    state_hook.remove()
+    assert len(captured) == 1 + cfg.action_sampler_steps and len(proprio_calls) == 2
+    assert policy.proprio_encoder.weight.shape == (cfg.text_dim, cfg.state_dim)
+    shared = torch.cat([batch["text_embedding"].masked_fill(~batch["text_valid"][..., None], 0),
+                        policy.proprio_encoder(batch["state"])[:, None]], 1)
+    valid = torch.cat([batch["text_valid"], torch.ones(1, 1, dtype=torch.bool)], 1)
+    for states in captured:
+        for name, expert in (("O", policy.flow.rgb), ("R", policy.flow.rgb),
+                             ("M", policy.flow.motion), ("A", policy.action_expert)):
+            torch.testing.assert_close(states[name].context, expert.text_embedding(shared))
+            torch.testing.assert_close(states[name].context_valid, valid)
+        assert states["G"].context is None
+    parameters = [p for group in policy.get_optim_params() for p in group["params"]]
+    assert len(parameters) == len({id(p) for p in parameters})
+    assert {id(p) for p in parameters} == {id(p) for p in policy.parameters() if p.requires_grad}
+    action_group = next(group for group in policy.get_optim_params() if group["name"] == "action")
+    assert {id(p) for p in policy.proprio_encoder.parameters()} <= {id(p) for p in action_group["params"]}
+
+
+def test_missing_state_is_masked_for_shared_world_conditioning():
+    policy = action_policy(lambda_rgb=1, lambda_action=0)
+    batch = action_batch(policy.config)
+    batch["state_valid"].zero_()
+    batch["targets"]["action_valid_mask"].zero_()
+    torch.manual_seed(7)
+    original, _ = policy(batch)
+    torch.manual_seed(7)
+    changed, _ = policy({**batch, "state": batch["state"] + 100})
+    torch.testing.assert_close(original, changed, rtol=0, atol=0)
+    original.backward()
+    assert not policy.proprio_encoder.weight.grad.any()
+    assert policy.proprio_encoder.weight.requires_grad
+    assert not any(p.requires_grad for p in policy.action_expert.parameters())
+    assert any(id(p) == id(policy.proprio_encoder.weight) for group in policy.get_optim_params() for p in group["params"])
+    predicted = policy.predict_action_chunk(batch, seed=4, return_normalized=True)
+    changed = policy.predict_action_chunk({**batch, "state": batch["state"] + 100}, seed=4, return_normalized=True)
+    torch.testing.assert_close(predicted, changed, rtol=0, atol=0)
+
+
+def test_legacy_action_state_projection_is_not_silently_loaded():
+    policy = action_policy()
+    legacy = {key: value for key, value in policy.state_dict().items() if not key.startswith("proprio_encoder.")}
+    legacy["action_expert.state_encoder.weight"] = torch.zeros(policy.config.action_hidden_dim, policy.config.state_dim)
+    legacy["action_expert.state_encoder.bias"] = torch.zeros(policy.config.action_hidden_dim)
+    with pytest.raises(RuntimeError, match="proprio_encoder"):
+        policy.load_state_dict(legacy, strict=True)
 
 
 def test_action_scheduler_direction_and_element_reduction():
@@ -337,7 +414,7 @@ def test_stage1_text_encoder_transfer_respects_target_mode(tmp_path, source_onli
         stage2.text_encoder = nn.Linear(8, 8).eval().requires_grad_(False)
     report = load_stage1_policy(stage2, tmp_path)
     assert not report.unexpected_keys
-    assert all(key.startswith("action_expert.") or ".lora_" in key for key in report.missing_keys)
+    assert all(key.startswith(("action_expert.", "proprio_encoder.")) or ".lora_" in key for key in report.missing_keys)
     for key, value in stage1.state_dict().items():
         if key.startswith("text_encoder.") and not target_online:
             continue

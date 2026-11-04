@@ -223,7 +223,8 @@ def test_real_tiny_policy_generates_physical_14d_joint_action(tmp_path):
     assert 0 <= action[6] <= 1 and 0 <= action[13] <= 1
 
 
-def test_checkpoint_loader_preserves_saved_geometry_modes_and_views(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sampler_steps", [None, 5, 20])
+def test_checkpoint_loader_preserves_saved_geometry_modes_and_views(tmp_path, monkeypatch, sampler_steps):
     from evaluation.RoboTwin.wsa1_5 import policy as wsa1_5
 
     cfg, _, _ = codec_fixture(tmp_path)
@@ -231,7 +232,7 @@ def test_checkpoint_loader_preserves_saved_geometry_modes_and_views(tmp_path, mo
     view_keys = ["observation.images.cam_right_wrist", "observation.images.cam_high", ""]
     (tmp_path / "train_config.json").write_text(json.dumps({"dataset": {"view_keys": view_keys}}), encoding="utf-8")
     args = SimpleNamespace(ckpt_path=tmp_path, action_mode="auto", dtype="auto", device="cpu",
-                           robot_type="aloha", stats_path=None, infer_horizon=2,
+                           robot_type="aloha", stats_path=None, infer_horizon=2, action_sampler_steps=sampler_steps,
                            tokenizer_path=None, text_cache=tmp_path / "cache", text_encoder_path=None, text_device="cpu")
     calls = []
 
@@ -243,6 +244,8 @@ def test_checkpoint_loader_preserves_saved_geometry_modes_and_views(tmp_path, mo
     agent = WSA1_5Agent.from_checkpoint(args)
     assert agent.view_keys == view_keys and agent.horizon == 2
     assert calls[0].action_mode == cfg.action_mode and not calls[0].load_text_encoder
+    assert agent.config.action_sampler_steps == (cfg.action_sampler_steps if sampler_steps is None else sampler_steps)
+    assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))["action_sampler_steps"] == cfg.action_sampler_steps
     for name in ("future_frames", "rgb_height", "rgb_width", "num_history_frame", "sparse_frame_encoding"):
         assert getattr(agent.config, name) == getattr(cfg, name)
     args.action_mode = "abs"
@@ -251,6 +254,12 @@ def test_checkpoint_loader_preserves_saved_geometry_modes_and_views(tmp_path, mo
     args.action_mode, args.dtype = "auto", "bfloat16"
     with pytest.raises(ValueError, match="dtype"):
         WSA1_5Agent.from_checkpoint(args)
+    assert len(calls) == 1
+    args.action_mode, args.dtype = "auto", "auto"
+    for invalid in (0, -1):
+        args.action_sampler_steps = invalid
+        with pytest.raises(ValueError, match="action_sampler_steps"):
+            WSA1_5Agent.from_checkpoint(args)
     assert len(calls) == 1
 
 
@@ -315,6 +324,7 @@ def test_wsa_dispatch_requests_joint_observations_and_qpos(tmp_path, monkeypatch
     monkeypatch.setattr(sys, "argv", ["inference.py", "--ckpt-path", str(tmp_path)])
     args = inference.parse_args()
     assert args.robot_type == "aloha"
+    assert args.action_sampler_steps is None
     task_args = {"data_type": {"endpose": False}}
     agent = SimpleNamespace(step=lambda *args: None, reset=lambda *args: None, action_type=WSA1_5Agent.action_type)
     calls = []
@@ -338,7 +348,8 @@ def bash_executable():
     return str(bash)
 
 
-def test_launcher_keeps_checkpoint_settings_and_paths(tmp_path):
+@pytest.mark.parametrize("sampler_steps", [None, "5"])
+def test_launcher_keeps_checkpoint_settings_and_paths(tmp_path, monkeypatch, sampler_steps):
     bash = bash_executable()
     checkpoint = tmp_path / "checkpoint with spaces"
     checkpoint.mkdir()
@@ -346,6 +357,9 @@ def test_launcher_keeps_checkpoint_settings_and_paths(tmp_path):
     (checkpoint / "model.safetensors").write_bytes(b"dry run only")
     env = {**os.environ, "ROBOTWIN_DRY_RUN": "1", "CONDA_PREFIX": "/tmp/wsa15-conda",
            "TEXT_CACHE": checkpoint.as_posix(), "STATS_PATH": (checkpoint / "config.json").as_posix()}
+    env.pop("ACTION_SAMPLER_STEPS", None)
+    if sampler_steps is not None:
+        env["ACTION_SAMPLER_STEPS"] = sampler_steps
     result = subprocess.run([bash, "evaluation/RoboTwin/wsa1_5/eval.sh", checkpoint.as_posix(),
                              (tmp_path / "results with spaces").as_posix(), "demo_randomized", "4"],
                             cwd=PROJECT, env=env, check=True, capture_output=True, text=True)
@@ -357,6 +371,9 @@ def test_launcher_keeps_checkpoint_settings_and_paths(tmp_path):
     assert options["--infer-horizon"] == "0" and options["--text-device"] == "cpu"
     assert options["--stats-path"].endswith("config.json")
     assert options["--robot-type"] == "aloha"
+    assert options.get("--action-sampler-steps") == sampler_steps
+    monkeypatch.setattr("sys.argv", command[2:])
+    assert inference.parse_args().action_sampler_steps == (int(sampler_steps) if sampler_steps else None)
 
 
 def test_multigpu_scheduler_forwards_wsa_defaults_and_collects_task_logs(tmp_path):
@@ -366,11 +383,13 @@ def test_multigpu_scheduler_forwards_wsa_defaults_and_collects_task_logs(tmp_pat
     (checkpoint / "model.safetensors").write_bytes(b"dry run only")
     output = tmp_path / "results"
     env = {**os.environ, "ROBOTWIN_DRY_RUN": "1", "CONDA_PREFIX": "/tmp/wsa15-conda",
-           "GPUS": "0,1", "JOBS_PER_GPU": "1", "TMPDIR": tmp_path.as_posix(), "BURNER_ENABLED": "false"}
-    for key in ("ACTION_MODE", "DTYPE", "INFER_HORIZON", "FORCE_RERUN"):
-        env.pop(key, None)
-    result = subprocess.run([bash_executable(), "evaluation/RoboTwin/wsa1_5/eval_ngpu.sh", checkpoint.as_posix(),
-                             output.as_posix(), "demo_randomized", "0", "1", "1"],
+           "GPUS": "0,1", "JOBS_PER_GPU": "1", "TMPDIR": tmp_path.as_posix(), "BURNER_ENABLED": "false",
+           "PRETRAINED_CKPT": checkpoint.as_posix(), "OUTPUT_ROOT": output.as_posix(),
+           "TASK_CONFIG": "demo_randomized", "TASK_START": "0", "TASK_END": "1", "NUM_EPISODES": "1",
+           "ACTION_MODE": "auto", "DTYPE": "auto", "INFER_HORIZON": "0", "ACTION_SAMPLER_STEPS": "7",
+           "TEXT_ENCODER_PATH": (checkpoint / "config.json").as_posix(), "TOKENIZER_PATH": checkpoint.as_posix()}
+    env.pop("FORCE_RERUN", None)
+    result = subprocess.run([bash_executable(), "evaluation/RoboTwin/wsa1_5/eval_ngpu.sh"],
                             cwd=PROJECT, env=env, capture_output=True, text=True)
     # A dry run emits commands but creates no videos, so the scheduler must report incomplete tasks.
     assert result.returncode != 0 and "reason=incomplete_output" in result.stdout + result.stderr
@@ -380,6 +399,7 @@ def test_multigpu_scheduler_forwards_wsa_defaults_and_collects_task_logs(tmp_pat
         assert "--policy-type" not in options
         assert options["--dtype"] == options["--action-mode"] == "auto"
         assert options["--infer-horizon"] == "0"
+        assert options["--action-sampler-steps"] == "20"
 
 
 @pytest.fixture

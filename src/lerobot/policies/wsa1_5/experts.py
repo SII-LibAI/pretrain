@@ -21,7 +21,7 @@ class MotionDiTExpert(WanVideoDiT):
     """An independent set of Wan-style Transformer weights; no observed motion."""
 
     def forward(self, *args, **kwargs):
-        raise RuntimeError("Use WorldFlow.velocity with RGB/text observations only")
+        raise RuntimeError("Use WorldFlow.velocity with the shared observed context")
 
 
 class ActionExpert(nn.Module):
@@ -30,7 +30,6 @@ class ActionExpert(nn.Module):
         self.config = config
         width = config.action_hidden_dim
         self.action_encoder = nn.Linear(config.action_dim, width)
-        self.state_encoder = nn.Linear(config.state_dim, width)
         self.text_embedding = nn.Sequential(nn.Linear(config.text_dim, width), nn.GELU(approximate="tanh"),
                                             nn.Linear(width, width))
         self.time_embedding = nn.Sequential(nn.Linear(config.freq_dim, width), nn.SiLU(), nn.Linear(width, width))
@@ -38,36 +37,30 @@ class ActionExpert(nn.Module):
         self.blocks = nn.ModuleList([DiTBlock(width, config.head_dim, config.num_heads, config.action_ffn_dim)
                                     for _ in range(config.action_num_layers or config.num_layers)])
         self.head = nn.Linear(width, config.action_dim)
-        positions = torch.arange(config.action_chunk_size, dtype=torch.float32)
-        self.register_buffer("position", sinusoidal_embedding_1d(width, positions)[None], persistent=False)
         self.register_buffer("freqs", precompute_freqs_cis(config.head_dim, config.action_chunk_size)[:, None],
                              persistent=False)
         self.scheduler = WanContinuousFlowMatchScheduler(shift=config.action_flow_shift)
 
-    def prepare(self, noisy, timestep, state, context, context_valid, valid=None):
+    def prepare(self, noisy, timestep, context, context_valid, valid=None):
         cfg = self.config
-        if noisy.shape != (state.shape[0], cfg.action_chunk_size, cfg.action_dim):
+        if noisy.ndim != 3 or noisy.shape[1:] != (cfg.action_chunk_size, cfg.action_dim):
             raise ValueError("Action noise must be [B,action_chunk_size,action_dim]")
-        if state.shape != (noisy.shape[0], cfg.state_dim) or timestep.shape != (noisy.shape[0],):
-            raise ValueError("Action state/timestep shape mismatch")
+        if timestep.shape != (noisy.shape[0],) or context.shape[0] != noisy.shape[0]:
+            raise ValueError("Action context/timestep batch mismatch")
         require_finite(noisy, "Action input")
-        require_finite(state, "Action state")
         self.scheduler._validate_timestep(timestep)
-        validate_text_embedding(context, context_valid, cfg.max_text_length, cfg.text_dim)
+        validate_text_embedding(context, context_valid, cfg.max_text_length + 1, cfg.text_dim)
         dtype = self.action_encoder.weight.dtype
-        tokens = self.action_encoder(noisy.to(dtype)) + self.position.to(noisy.device, dtype)
+        tokens = self.action_encoder(noisy.to(dtype))
         t = self.time_embedding(sinusoidal_embedding_1d(cfg.freq_dim, timestep).to(dtype))
         modulation = self.time_projection(t).reshape(noisy.shape[0], 6, -1)
-        # Proprioception is an Action-only context token; O/R/M/G never receive state.
         text = self.text_embedding(context.to(dtype))
-        text = torch.cat([text, self.state_encoder(state.to(dtype))[:, None]], 1)
-        text_valid = torch.cat([context_valid, torch.ones(noisy.shape[0], 1, dtype=torch.bool, device=noisy.device)], 1)
         if valid is None:
             valid = torch.ones(noisy.shape[:2], dtype=torch.bool, device=noisy.device)
         require_bool(valid, "Action token validity")
         if valid.shape != noisy.shape[:2]:
             raise ValueError("Action token validity shape mismatch")
-        return ExpertState(tokens, modulation, valid, self.freqs.to(noisy.device), text, text_valid)
+        return ExpertState(tokens, modulation, valid, self.freqs.to(noisy.device), text, context_valid)
 
     def training_state(self, target, *, noise=None, timestep=None):
         require_finite(target, "Action labels")
@@ -178,7 +171,7 @@ class WorldFlow(nn.Module):
 
     def velocity(self, observed_latent, text, text_valid, rgb_latent=None, motion_latent=None,
                  rgb_t=None, motion_t=None, *, future_3d=None, goal_view_valid=None, timer=None,
-                 action_expert=None, action_latent=None, action_t=None, state=None, action_valid=None,
+                 action_expert=None, action_latent=None, action_t=None, action_valid=None,
                  project_3d=True, **validity):
         states, experts, pre, obs_n = self.prepare_states(observed_latent, text, text_valid,
                                                        rgb_latent, motion_latent, rgb_t, motion_t, **validity)
@@ -191,9 +184,9 @@ class WorldFlow(nn.Module):
             experts["G"] = future_3d
             capture_layers = future_3d.student_layers
         if action_expert is not None:
-            if action_latent is None or action_t is None or state is None:
-                raise ValueError("Parallel action prediction requires action state, timestep and robot state")
-            states["A"] = action_expert.prepare(action_latent, action_t, state, text, text_valid, action_valid)
+            if action_latent is None or action_t is None:
+                raise ValueError("Parallel action prediction requires action noise and timestep")
+            states["A"] = action_expert.prepare(action_latent, action_t, text, text_valid, action_valid)
             experts["A"] = action_expert
         if timer is not None:
             timer.mark("input_s")
@@ -261,7 +254,7 @@ class WorldFlow(nn.Module):
     def sample_latents(self, observed_latent, text, text_valid, *, rgb_shape=None, motion_shape=None,
                        motion_placeholder=None, seed=0, steps=20, observed_valid=None,
                        future_3d=None, goal_view_valid=None, return_features=False,
-                       action_expert=None, state=None, history_latent=None, history_valid=None):
+                       action_expert=None, history_latent=None, history_valid=None):
         """Joint denoising; optional 3D features come from the last mixed forward.
 
         Inputs are observations/text plus shapes/constants; there is no motion
@@ -289,8 +282,6 @@ class WorldFlow(nn.Module):
         features = {}
         action = None
         if action_expert is not None:
-            if state is None:
-                raise ValueError("Action sampling requires the current normalized state")
             cfg = action_expert.config
             generator = torch.Generator(device=observed_latent.device).manual_seed(int(seed) + 2)
             action = torch.randn(observed_latent.shape[0], cfg.action_chunk_size, cfg.action_dim,
@@ -308,7 +299,7 @@ class WorldFlow(nn.Module):
                                      future_3d=future_3d, goal_view_valid=goal_view_valid,
                                      history_latent=history_latent, history_valid=history_valid,
                                      action_expert=action_expert, action_latent=action,
-                                     action_t=action_times[index].expand(observed_latent.shape[0]) if action is not None else None, state=state,
+                                     action_t=action_times[index].expand(observed_latent.shape[0]) if action is not None else None,
                                      project_3d=return_features or action_expert is None)
             features = velocity.get("3d", {})
             if rgb is not None:
