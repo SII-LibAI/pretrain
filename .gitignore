@@ -45,6 +45,8 @@ develop-eggs/
 .installed.cfg
 *.egg
 MANIFEST
+evaluation/RoboTwin/output
+norm_stats
 lib/
 lib64/
 datasets/

@@ -89,6 +89,8 @@ def parse_args():
     parser.add_argument("--num-episodes", type=int, default=100)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--infer-horizon", type=int, default=0, help="0 uses the checkpoint action chunk size")
+    parser.add_argument("--action-sampler-steps", type=int, default=None,
+                        help="Positive denoising step count; defaults to the checkpoint action_sampler_steps")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--robot-type", default="aloha")
     parser.add_argument("--stats-path", type=Path, help="Optional training stats; defaults to checkpoint stats.json")

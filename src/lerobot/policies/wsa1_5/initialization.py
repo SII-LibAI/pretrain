@@ -65,6 +65,65 @@ def load_stage1_policy(module, directory):
     return report
 
 
+def load_world_policy(module, directory):
+    """Initialize Stage-1 from saved world weights, merging any RGB LoRA first."""
+    import json
+
+    directory = Path(directory)
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    state = read_checkpoint(directory / "model.safetensors")
+    omitted_action = {key for key in state if key.startswith("action_expert.")} if config.get("enable_action", False) else set()
+    for key in omitted_action:
+        del state[key]
+
+    merged = 0
+    if config.get("enable_action", False) and config.get("rgb_finetune_mode") == "lora":
+        rank, alpha = config["rgb_lora_rank"], config["rgb_lora_alpha"]
+        if type(rank) is not int or rank <= 0 or type(alpha) is not int or alpha <= 0:
+            raise ValueError("Invalid source RGB LoRA rank/alpha")
+        prefixes = set()
+        for target in config["rgb_lora_target_modules"]:
+            matches = {f"flow.rgb.{name}" for name, layer in module.flow.rgb.named_modules()
+                       if name.startswith("blocks.") and name.endswith("." + target) and isinstance(layer, nn.Linear)}
+            if not matches or prefixes & matches:
+                raise ValueError(f"Source RGB LoRA target mismatch: {target}")
+            prefixes.update(matches)
+        for prefix in sorted(prefixes):
+            keys = [f"{prefix}.{suffix}" for suffix in ("weight", "lora_a", "lora_b")]
+            if any(key not in state for key in keys):
+                raise ValueError(f"Incomplete source RGB LoRA weights: {prefix}")
+            weight, a, b = [state[key] for key in keys]
+            if (weight.ndim != 2 or a.shape != (rank, weight.shape[1])
+                    or b.shape != (weight.shape[0], rank)):
+                raise ValueError(f"Source RGB LoRA shape mismatch: {prefix}")
+            if not all(torch.isfinite(value).all() for value in (weight, a, b)):
+                raise ValueError(f"Non-finite source RGB LoRA weights: {prefix}")
+            state[keys[0]] = (weight.float() + (b.float() @ a.float()) * (alpha / rank)).to(weight.dtype)
+            del state[keys[1]], state[keys[2]]
+        merged = len(prefixes)
+
+    text_keys = {key for key in state if key.startswith("text_encoder.")}
+    restored_text = 0
+    if config.get("load_text_encoder", False):
+        if not module.config.load_text_encoder and module.text_encoder is None:
+            for key in text_keys:
+                del state[key]
+    elif text_keys:
+        raise ValueError("Source checkpoint has undeclared text_encoder weights")
+    elif module.config.load_text_encoder:
+        # Offline-text Stage-2 checkpoints omit the frozen UMT5, never initialize it randomly.
+        if module.text_encoder is None or not module.config.text_encoder_path:
+            raise ValueError("Provide text_encoder_path to restore frozen UMT5 for Stage-1")
+        text_state = read_checkpoint(module.config.text_encoder_path)
+        state.update({f"text_encoder.{key}": value for key, value in text_state.items()})
+        restored_text = len(text_state)
+
+    report = load_report(module, state, name="Checkpoint -> Stage-1 world initialization", strict=True)
+    logging.info("[WSA init] loaded=%d omitted_action=%d merged_rgb_lora=%d restored_frozen_umt5=%d; "
+                 "optimizer/scheduler/RNG/step start fresh", len(state), len(omitted_action), merged, restored_text)
+    return report
+
+
 def resize_axes(value, shape):
     """Linear interpolation along each changed axis, never silent slicing.
 

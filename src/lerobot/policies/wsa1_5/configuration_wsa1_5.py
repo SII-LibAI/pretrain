@@ -93,7 +93,7 @@ class WSA1_5Config(PreTrainedConfig):
     rgb_lora_alpha: int = 32
     rgb_lora_dropout: float = 0.0
     rgb_lora_target_modules: tuple[str, ...] = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o")
-    init_checkpoint_path: str | None = None
+    init_checkpoint_path: str | None = None  # Weight-only initialization; optimizer and step start fresh.
 
     def __post_init__(self):
         super().__post_init__()
@@ -131,8 +131,6 @@ class WSA1_5Config(PreTrainedConfig):
                 raise ValueError("Invalid RGB LoRA dropout or empty target modules")
             if not self.enable_3d_queries:
                 raise ValueError("Action generation requires predicted Goal 3D queries")
-        elif self.init_checkpoint_path is not None:
-            raise ValueError("init_checkpoint_path is for action post-training, not Stage-1 resume")
         TemporalLayout(future_frames=self.future_frames)
         if self.n_obs_steps != 1:
             raise ValueError("Only one observed RGB timepoint is supported")

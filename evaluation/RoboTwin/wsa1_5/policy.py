@@ -120,6 +120,10 @@ class WSA1_5Agent:
             raise ValueError("action_mode must match the saved checkpoint; use auto")
         if args.dtype not in (None, "auto", cfg.dtype):
             raise ValueError("dtype must match the saved checkpoint; use auto")
+        if args.action_sampler_steps is not None:
+            if type(args.action_sampler_steps) is not int or args.action_sampler_steps <= 0:
+                raise ValueError("action_sampler_steps must be a positive integer")
+            cfg.action_sampler_steps = args.action_sampler_steps
         cfg.device = args.device
         if args.tokenizer_path:
             cfg.tokenizer_path = str(args.tokenizer_path)
@@ -134,9 +138,9 @@ class WSA1_5Agent:
             if data_cfg.get("use_subtask"):
                 logging.warning("RoboTwin evaluation uses the original task instruction; no ground-truth subtask/endpoint is supplied")
         policy = WSA1_5_Policy.from_pretrained(args.ckpt_path, config=cfg)
-        logging.info("[WSA eval] action_mode=%s dtype=%s history=%sx%s encoding=%s chunk=%s",
+        logging.info("[WSA eval] action_mode=%s dtype=%s history=%sx%s encoding=%s chunk=%s action_sampler_steps=%s",
                      cfg.action_mode, cfg.dtype, cfg.num_history_frame, cfg.history_frame_stride,
-                     cfg.sparse_frame_encoding, cfg.action_chunk_size)
+                     cfg.sparse_frame_encoding, cfg.action_chunk_size, cfg.action_sampler_steps)
         return cls(policy, codec, view_keys=view_keys, infer_horizon=args.infer_horizon,
                    text_cache=args.text_cache, text_encoder_path=args.text_encoder_path,
                    tokenizer_path=args.tokenizer_path, text_device=args.text_device)

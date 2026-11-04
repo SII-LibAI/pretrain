@@ -62,13 +62,12 @@ checkpoint 必须使用 `action_frame_stride=1`。
 ## 50 任务多卡评测
 
 ```bash
-GPUS=0,1,2,3 JOBS_PER_GPU=1 \
-TEXT_ENCODER_PATH=/path/to/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth \
-TOKENIZER_PATH=/path/to/Wan2.2-TI2V-5B/google/umt5-xxl \
-INFER_HORIZON=16 \
-bash evaluation/RoboTwin/wsa1_5/eval_ngpu.sh \
-  /path/to/stage2/checkpoints/last/pretrained_model \
-  outputs/robotwin/wsa1_5_clean2random demo_randomized 0 49 100
+GPUS=0,1 \
+TASK_CONFIG=demo_clean \
+OUTPUT_ROOT="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/evaluation/RoboTwin/output/eval_10000_demo_clean" \
+TEXT_ENCODER_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth" \
+TOKENIZER_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B/google/umt5-xxl" \
+bash evaluation/RoboTwin/wsa1_5/eval_ngpu.sh
 ```
 
 复用现有任务调度器，每个 worker 独立加载模型和仿真器。先使用每卡一个 worker。

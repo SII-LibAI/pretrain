@@ -39,6 +39,7 @@ COMMAND=(python -u "${SCRIPT_DIR}/inference.py"
   --text-device "${TEXT_DEVICE:-cpu}" --instruction-type "${INSTRUCTION_TYPE:-unseen}"
   --seed "${SEED:-42}" --fps "${FPS:-30}" --log-level "${LOG_LEVEL:-INFO}")
 STATS_PATH="${STATS_PATH:-${EXTERNAL_STATS_PATH:-}}"
+[[ -z "${ACTION_SAMPLER_STEPS:-}" ]] || COMMAND+=(--action-sampler-steps "$ACTION_SAMPLER_STEPS")
 [[ -z "$STATS_PATH" ]] || COMMAND+=(--stats-path "$(realpath "$STATS_PATH")")
 [[ -z "${TEXT_CACHE:-}" ]] || COMMAND+=(--text-cache "$(realpath "$TEXT_CACHE")")
 [[ -z "${TEXT_ENCODER_PATH:-}" ]] || COMMAND+=(--text-encoder-path "$(realpath "$TEXT_ENCODER_PATH")")

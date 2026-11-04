@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SINGLE_EVAL_SCRIPT="${SCRIPT_DIR}/eval.sh"
 
-GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
+GPUS="${GPUS:-0,1}"
 IFS=',' read -r -a GPU_ARR <<< "${GPUS}"
 NUM_GPUS=${#GPU_ARR[@]}
 JOBS_PER_GPU="${JOBS_PER_GPU:-1}"
@@ -18,24 +18,43 @@ if [[ ! "${JOBS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: JOBS_PER_GPU must be a positive integer; got ${JOBS_PER_GPU}" >&2
     exit 2
 fi
+export ACTION_SAMPLER_STEPS=20
 
-if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 CHECKPOINT OUTPUT_ROOT [TASK_CONFIG] [TASK_START] [TASK_END] [NUM_EPISODES]" >&2
-    echo "Example: GPUS=0,1,2,3,4,5,6,7 $0 /path/to/pretrained_model outputs/my_run demo_clean 0 49 100" >&2
-    exit 2
-fi
+# ============================================================
+# Project paths
+# ============================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+WORKSPACE_ROOT="$(dirname "${REPO_ROOT}")"
 
-PRETRAINED_CKPT="$1"
-OUTPUT_ROOT="$2"
-TASK_CONFIG="${3:-${TASK_CONFIG:-demo_clean}}"
-TASK_START="${4:-${TASK_START:-0}}"
-TASK_END="${5:-${TASK_END:-49}}"
-NUM_EPISODES="${6:-${NUM_EPISODES:-100}}"
+# ============================================================
+# Checkpoint & output
+# ============================================================
+PRETRAINED_CKPT="${PRETRAINED_CKPT:-${REPO_ROOT}/outputs/wsa1_5_robotwin/2026_10_31_08_40_08/checkpoints/010000/pretrained_model}"
 
-ACTION_MODE="${ACTION_MODE:-auto}"
-INFER_HORIZON="${INFER_HORIZON:-0}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/evaluation/RoboTwin/output/eval_10000_demo_randomized}"
+
+# ============================================================
+# Evaluation settings
+# ============================================================
+TASK_CONFIG="${TASK_CONFIG:-demo_randomized}"
+TASK_START="${TASK_START:-0}"
+TASK_END="${TASK_END:-49}"
+NUM_EPISODES="${NUM_EPISODES:-100}"
+
+# ============================================================
+# Wan2.2 text encoder & tokenizer
+# ============================================================
+WAN_MODEL_ROOT="${WAN_MODEL_ROOT:-${WORKSPACE_ROOT}/DATASET/model/Wan2.2-TI2V-5B}"
+
+TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-${WAN_MODEL_ROOT}/models_t5_umt5-xxl-enc-bf16.pth}"
+
+TOKENIZER_PATH="${TOKENIZER_PATH:-${WAN_MODEL_ROOT}/google/umt5-xxl}"
+
+ACTION_MODE="${ACTION_MODE:-delta}"
+INFER_HORIZON="${INFER_HORIZON:-24}"
 INFERENCE_BACKEND="${INFERENCE_BACKEND:-standard}"
-DTYPE="${DTYPE:-auto}"
+DTYPE="${DTYPE:-bfloat16}"
 FORCE_RERUN="${FORCE_RERUN:-false}"
 BURNER_ENABLED="${BURNER_ENABLED:-false}"
 BURNER_COMMAND="${BURNER_COMMAND:-python \"${SCRIPT_DIR}/../gpu_burner.py\"}"
@@ -293,6 +312,8 @@ worker_loop() {
                 "${INFER_HORIZON}" \
                 "${NUM_EPISODES}" \
                 "${DTYPE}" \
+                "${TEXT_ENCODER_PATH}" \
+                "${TOKENIZER_PATH}" \
                 >"${log_file}" 2>&1; then
             if task_is_complete "${output_path}"; then
                 echo "DONE worker=${worker_idx} gpu=${gpu} task=${task_idx}:${task_name}"
