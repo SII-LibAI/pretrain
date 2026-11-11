@@ -1,5 +1,11 @@
 # R1Lite dual-arm robot
 robot_type: r1lite
+unified_action_reorder: &unified_r1lite
+  - [0, 6, 58, 64]
+  - [12, 13, 14, 15]
+  - [6, 12, 65, 71]
+  - [13, 14, 16, 17]
+unified_state_reorder: *unified_r1lite
 action_mask_spec: [6, 6, -1, -1]
 # Reorder action dimensions with flexible src->dst mapping
 # Format: [src_start, src_end, dst_start, dst_end]

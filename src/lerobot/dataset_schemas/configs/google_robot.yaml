@@ -1,5 +1,9 @@
 # Google Robot robot
 robot_type: google_robot
+unified_action_reorder: &unified_google_robot
+  - [0, 7, 58, 65]
+  - [7, 8, 14, 15]
+unified_state_reorder: *unified_google_robot
 action_mask_spec: [7, -1]
 feature_mapping:
   observation.state:

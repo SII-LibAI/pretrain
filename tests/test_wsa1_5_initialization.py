@@ -1,15 +1,128 @@
 """Synthetic checkpoint tensors and tiny modules only; no pretrained model loading."""
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
-from lerobot.policies.wsa1_5.initialization import LoRALinear, interpolate_wan_state, load_world_policy
-from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy, WorldComponents
+from lerobot.policies.wsa1_5.initialization import LoRALinear, initialize_action_from_rgb, interpolate_wan_state, load_world_policy
+from lerobot.policies.wsa1_5.modeling_wsa1_5 import WSA1_5_Policy, WorldComponents, construction_dtype
 from test_wsa1_5_experts import small_flow
 from test_wsa1_5_policy_contract import small_config
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_action_wan_backbone_transfers_all_keys_and_keeps_new_io(dtype):
+    from lerobot.policies.wsa1_5.experts import ActionExpert
+    from test_wsa1_5_action import action_config, action_policy
+
+    with construction_dtype(dtype):
+        action = ActionExpert(action_config())
+    before = {key: value.clone() for key, value in action.state_dict().items()}
+    source = action_policy(enable_action=False, lambda_rgb=1).flow.rgb.state_dict()
+    source = {key: torch.linspace(-1, 1, value.numel()).reshape(value.shape).to(dtype)
+              for key, value in source.items()}
+    initialize_action_from_rgb(action, source)
+    backbone = {key: value for key, value in before.items() if not key.startswith(("action_encoder.", "head."))}
+    expected, _ = interpolate_wan_state(source, backbone, apply_alpha_scaling=True)
+    for key, value in action.state_dict().items():
+        torch.testing.assert_close(value, expected.get(key, before[key]), atol=0, rtol=0)
+
+    # Independently check both width axes and the WSA-L last-axis Alpha Scaling.
+    key = "blocks.0.ffn.0.weight"
+    reference = source[key].float()
+    reference = torch.nn.functional.interpolate(reference.T[:, None], size=24, mode="linear", align_corners=True)[:, 0].T
+    reference = torch.nn.functional.interpolate(reference[:, None], size=12, mode="linear", align_corners=True)[:, 0]
+    reference = (reference.to(dtype).float() * (16 / 12) ** 0.5).to(dtype)
+    torch.testing.assert_close(action.state_dict()[key], reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("damage", ["missing", "nonfinite", "head_geometry"])
+def test_action_wan_backbone_rejects_incomplete_source(damage):
+    from lerobot.policies.wsa1_5.experts import ActionExpert
+    from test_wsa1_5_action import action_config, action_policy
+
+    action = ActionExpert(action_config())
+    source = action_policy(enable_action=False, lambda_rgb=1).flow.rgb.state_dict()
+    key = "blocks.0.self_attn.q.weight"
+    if damage == "missing":
+        del source[key]
+    elif damage == "nonfinite":
+        source[key] = torch.full_like(source[key], float("nan"))
+    else:
+        source[key] = source[key][:1]
+    before = {key: value.clone() for key, value in action.state_dict().items()}
+    with pytest.raises((ValueError, RuntimeError), match="Incomplete Action|non-finite|geometry mismatch"):
+        initialize_action_from_rgb(action, source)
+    for key, value in action.state_dict().items():
+        torch.testing.assert_close(value, before[key], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("from_stage1", [False, True])
+@pytest.mark.parametrize("mode", ["full", "frozen", "lora"])
+def test_action_constructor_uses_loaded_rgb_and_preserves_checkpoint_on_reload(tmp_path, monkeypatch, from_stage1, mode):
+    from test_wsa1_5_action import action_config, action_policy
+
+    stage1 = action_policy(enable_action=False, lambda_rgb=1)
+    wan_state = {key: torch.full_like(value, 0.25) for key, value in stage1.flow.rgb.state_dict().items()}
+    with torch.no_grad():
+        for parameter in stage1.flow.rgb.parameters():
+            parameter.fill_(2.0)
+    stage1.save_pretrained(tmp_path / "stage1")
+    building = True
+
+    def components(self, initialize):
+        assert initialize == (building and not from_stage1)
+        result = deepcopy(WorldComponents(stage1.flow, stage1.future_3d, stage1.vae))
+        if initialize:
+            result.flow.rgb.load_state_dict(wan_state, strict=True)
+        else:
+            with torch.no_grad():
+                for parameter in result.flow.rgb.parameters():
+                    parameter.fill_(-0.75)
+        return result
+
+    monkeypatch.setattr(WSA1_5_Policy, "_build_components", components)
+    monkeypatch.setattr("lerobot.policies.wsa1_5.modeling_wsa1_5.read_checkpoint",
+                        lambda path: pytest.fail("Stage-1 transfer and full reload must not read original Wan assets"))
+    config = action_config(init_checkpoint_path=str(tmp_path / "stage1") if from_stage1 else None,
+                           wan_model_path="", rgb_finetune_mode=mode, rgb_lora_rank=2)
+    policy = WSA1_5_Policy(config)
+    action_state = policy.action_expert.state_dict()
+    backbone = {key: value for key, value in action_state.items() if not key.startswith(("action_encoder.", "head."))}
+    source = stage1.flow.rgb.state_dict() if from_stage1 else wan_state
+    expected, _ = interpolate_wan_state(source, backbone, apply_alpha_scaling=True)
+    for key, value in expected.items():
+        torch.testing.assert_close(action_state[key], value, atol=0, rtol=0)
+    torch.testing.assert_close(policy.flow.rgb.patch_embedding.weight,
+                               torch.full_like(policy.flow.rgb.patch_embedding.weight, 2.0 if from_stage1 else 0.25))
+
+    # A trained Action must be restored verbatim, without original Wan or Stage-1 assets.
+    with torch.no_grad():
+        policy.action_expert.blocks[0].ffn[0].weight.fill_(3.0)
+    policy.save_pretrained(tmp_path / "stage2")
+    building = False
+    monkeypatch.setattr("lerobot.policies.wsa1_5.modeling_wsa1_5.read_checkpoint",
+                        lambda path: pytest.fail("Full checkpoint loading must not read Wan assets"))
+    restored = WSA1_5_Policy.from_pretrained(tmp_path / "stage2")
+    for key, value in policy.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[key], value, atol=0, rtol=0)
+
+
+def test_action_rejects_invalid_stage1_before_initializing_action(tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+    from test_wsa1_5_action import action_config, action_policy
+
+    (tmp_path / "config.json").write_text(json.dumps({"enable_action": False}), encoding="utf-8")
+    save_file({}, tmp_path / "model.safetensors")
+    monkeypatch.setattr("lerobot.policies.wsa1_5.modeling_wsa1_5.initialize_action_from_rgb",
+                        lambda *args: pytest.fail("Validate Stage-1 before transferring its weights"))
+    template = action_policy(enable_action=False, lambda_rgb=1)
+    with pytest.raises(ValueError, match="Stage-1 initialization mismatch"):
+        WSA1_5_Policy(action_config(init_checkpoint_path=str(tmp_path)),
+                      components=WorldComponents(template.flow, template.future_3d, template.vae))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

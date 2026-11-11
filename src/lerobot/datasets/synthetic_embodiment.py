@@ -210,8 +210,8 @@ class SyntheticActionTable:
                 self._value_cache.popitem(last=False)
         return values
 
-    def read_values(self, body_id: int, start: int, stop: int) -> np.ndarray:
-        """Read ``[start:stop]`` without materializing the complete parquet column."""
+    def read_values(self, body_id: int, start: int, stop: int, *, offsets=None) -> np.ndarray:
+        """Read a slice, optionally selecting sampled offsets before checking finite values."""
         if start < 0 or stop < start or stop > self.num_rows:
             raise IndexError(f"Invalid annotation slice [{start}:{stop}] for {self.num_rows} rows")
         if start == stop:
@@ -230,6 +230,8 @@ class SyntheticActionTable:
             cursor = group_start + local_stop
             row_group += 1
         result = pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=0)
+        if offsets is not None:
+            result = result[offsets]
         if not np.isfinite(result).all():
             raise ValueError(
                 f"{self.path}: non-finite values for {self.specs[body_id].name!r} "

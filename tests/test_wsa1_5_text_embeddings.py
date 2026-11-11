@@ -255,8 +255,10 @@ def test_subtask_switch_builds_distinct_caches_matching_training(tmp_path, monke
             sample = cached[index]
             assert ("Subtask:" in sample["condition_text"]) == use_subtask
             assert sample["text_valid"].any()
-            if not enable_action:
-                assert sample["metadata_valid"] and sample["targets"]["goal_view_valid"].any()
+            assert sample["metadata_valid"] == use_subtask
+            assert sample["targets"]["goal_view_valid"].any()
+            if not use_subtask:
+                assert all(segment.subtask == -1 for segment in cached.segments)
         task = next(text for text in prompts if "Subtask:" not in text)
         task_path = text_embedding_path(directory, task)
         snapshot = (task_path.read_bytes(), task_path.stat().st_mtime_ns)

@@ -14,7 +14,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from .configuration_wsa1_5 import WSA1_5Config
 from .experts import ActionExpert, FrozenWanVAE, RGBVideoExpert, MotionDiTExpert, WorldFlow, wan_config
 from .future_3d import Future3DExpert, geometric_feature_loss
-from .initialization import configure_rgb, interpolate_wan_state, load_report, read_checkpoint, load_stage1_policy, load_world_policy
+from .initialization import configure_rgb, initialize_action_from_rgb, interpolate_wan_state, load_report, read_checkpoint, load_action_initialization, load_world_policy
 from .teacher import OmegaTeacher
 from .text_embeddings import encode_text, validate_text_embedding
 from .utils.temporal import ObservationHistory, TemporalLayout
@@ -72,11 +72,15 @@ class WSA1_5_Policy(PreTrainedPolicy):
                 self.proprio_encoder = nn.Linear(config.state_dim, config.text_dim)
                 matches = configure_rgb(self.flow.rgb, config)
             logging.info("[WSA action] RGB mode=%s LoRA targets=%s", config.rgb_finetune_mode, matches)
+        restored_action = False
         if initialize_pretrained and config.init_checkpoint_path:
             if config.enable_action:
-                load_stage1_policy(self, config.init_checkpoint_path)
+                restored_action = load_action_initialization(self, config.init_checkpoint_path)
             else:
                 load_world_policy(self, config.init_checkpoint_path)
+        if initialize_pretrained and self.action_expert is not None and not restored_action:
+            # Transfer only after loading Stage-1, so Action inherits its trained RGB backbone.
+            initialize_action_from_rgb(self.action_expert, self.flow.rgb.state_dict())
         self._motion_placeholder_latent = None
         self._motion_placeholder_key = None
         self._freeze_modules()

@@ -55,7 +55,6 @@ ACTION_MODE="${ACTION_MODE:-delta}"
 INFER_HORIZON="${INFER_HORIZON:-24}"
 INFERENCE_BACKEND="${INFERENCE_BACKEND:-standard}"
 DTYPE="${DTYPE:-bfloat16}"
-FORCE_RERUN="${FORCE_RERUN:-false}"
 BURNER_ENABLED="${BURNER_ENABLED:-false}"
 BURNER_COMMAND="${BURNER_COMMAND:-python \"${SCRIPT_DIR}/../gpu_burner.py\"}"
 BURNER_TRIGGER_UTIL="${BURNER_TRIGGER_UTIL:-60}"
@@ -188,10 +187,6 @@ task_is_complete() {
     local marker="${output_path}/.complete_${NUM_EPISODES}"
     local count
 
-    if [[ -f "${marker}" ]]; then
-        return 0
-    fi
-
     count="$(completed_episode_count "${output_path}")"
     if (( count >= NUM_EPISODES )); then
         touch "${marker}"
@@ -293,7 +288,7 @@ worker_loop() {
         output_path="${OUTPUT_ROOT}/robotwin/${TASK_CONFIG}/${task_name}"
         log_file="${LOG_ROOT}/${task_name}.log"
 
-        if [[ "${FORCE_RERUN}" != "true" ]] && task_is_complete "${output_path}"; then
+        if task_is_complete "${output_path}"; then
             echo "SKIP worker=${worker_idx} gpu=${gpu} task=${task_idx}:${task_name} status=complete"
             continue
         fi

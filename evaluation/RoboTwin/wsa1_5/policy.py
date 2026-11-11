@@ -187,7 +187,8 @@ class WSA1_5Agent:
         batch = {key: value.to(self.device) for key, value in batch.items()}
         self.history.append(batch["observed_rgb"], batch["observed_valid"])
         if not self.actions:
-            text = action_prompt(instruction, self.codec.control_mode, self.config.action_mode)
+            text = action_prompt(instruction, self.codec.control_mode, self.config.action_mode,
+                                 embodiment=self.codec.embodiment_name if self.config.action_space == "unified72" else None)
             batch["condition_text"] = [text]
             batch.update(self.text_condition(text))
             if self.config.num_history_frame:

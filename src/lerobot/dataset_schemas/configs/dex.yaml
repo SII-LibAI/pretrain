@@ -1,5 +1,9 @@
 # Dex (EgoDex) dual-arm robot
 robot_type: dex
+unified_action_reorder: &unified_dex
+  - [0, 7, 58, 65]
+  - [7, 14, 65, 72]
+unified_state_reorder: *unified_dex
 action_mask_spec: [14]
 feature_mapping:
   observation.state:

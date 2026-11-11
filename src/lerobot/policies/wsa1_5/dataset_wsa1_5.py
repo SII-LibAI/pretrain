@@ -10,6 +10,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -20,6 +21,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from lerobot.dataset_schemas import get_registry, get_schema
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.retarget_actions import action_offsets
 from lerobot.transforms.core import DeltaActionTransformFn, NormalizeTransformFn
 
 from .configuration_wsa1_5 import WSA1_5DatasetConfig
@@ -140,14 +142,20 @@ def control_mode(schema):
     return modes[schema.action_mode]
 
 
-def action_prompt(task, mode, action_mode, *, annotation=None, subtask=None):
+def action_prompt(task, mode, action_mode, *, annotation=None, subtask=None, embodiment=None):
     if not isinstance(task, str) or not task.strip():
         raise ValueError("Action prompt requires an actual task instruction")
+    text = condition_text({**(annotation or {}), "task_instruction": task}, subtask)
+    return _action_condition(text, mode, action_mode, embodiment)
+
+
+def _action_condition(text, mode, action_mode, embodiment=None):
     if mode not in {"joint", "endpose_effector"} or action_mode not in {"abs", "delta"}:
         raise ValueError("Invalid control/action mode")
-    # Preserve verified Stage-1 subtask/hand/scene semantics, using ordinary UMT5 text.
-
-    text = condition_text({**(annotation or {}), "task_instruction": task}, subtask)
+    if embodiment is not None:
+        if not isinstance(embodiment, str) or not embodiment.strip():
+            raise ValueError("Action conditioning requires a nonempty embodiment name")
+        text += f"\nRobot Embodiment: {embodiment}"
     return f"{text}\nControl Mode: {mode}\nAction Mode: {action_mode}"
 
 
@@ -170,8 +178,9 @@ def _reorder(value, spec, dim):
 
 class ActionCodec:
     """Use schema mappings and the stats already selected by the dataset factory."""
-    def __init__(self, meta, config):
-        self.schema = get_schema(meta.robot_type)
+    def __init__(self, meta, config, *, schema=None):
+        self.schema = (schema or get_schema(meta.robot_type)).for_action_space(config.action_space)
+        self.embodiment_name = self.schema.embodiment_name or self.schema.robot_type
         self.control_mode = control_mode(self.schema)
         self.config = config
         self.state_keys, self.action_keys = self.schema.get_state_keys(), self.schema.get_action_keys()
@@ -293,10 +302,31 @@ class WSA1_5Dataset(Dataset):
         )
         self.action_config = action_config
         self.action_codec = None
+        self.retarget_source = None
         if action_config is not None:
             if config.action_mode != action_config.action_mode:
                 raise ValueError("dataset.action_mode and policy.action_mode must match")
-            self.action_codec = ActionCodec(base.meta, action_config)
+            if (Path(base.root) / "meta/annotations/action.parquet").is_file():
+                from lerobot.datasets.retarget_actions import RetargetActionSource
+
+                if (action_config.action_space != "unified72" or not action_config.load_text_encoder
+                        or text_embedding_shape is not None):
+                    raise ValueError("Retarget training requires action_space=unified72 and load_text_encoder=true")
+                if not config.retarget_stats_dir:
+                    raise ValueError("Provide dataset.retarget_stats_dir for per-embodiment normalization")
+                self.retarget_source = RetargetActionSource(
+                    base.root, action_config.action_chunk_size, stride=action_config.action_frame_stride,
+                    embodiments=config.embodiments or None, action_mode=action_config.action_mode,
+                    stats_dir=config.retarget_stats_dir, row_group_cache_size=config.annotation_row_group_cache_size)
+                self.retarget_codecs = {}
+                for body in self.retarget_source.active_bodies:
+                    spec, schema = self.retarget_source.specs[body], self.retarget_source.schemas[body]
+                    meta = SimpleNamespace(robot_type=schema.robot_type,
+                                           features={key: {"shape": [spec.dim]} for key in ("observation.state", "action")},
+                                           stats=self.retarget_source.stats[spec.name])
+                    self.retarget_codecs[body] = ActionCodec(meta, action_config, schema=schema)
+            else:
+                self.action_codec = ActionCodec(base.meta, action_config)
         if type(include_3d_targets) is not bool:
             raise TypeError("include_3d_targets must be boolean")
         self.include_3d_targets = include_3d_targets
@@ -371,6 +401,13 @@ class WSA1_5Dataset(Dataset):
             self.segment_for_sample[cursor:cursor + length] = sid
             cursor += length
         assert cursor == len(self.timestamps), "Segments must cover every loaded row exactly once"
+        if self.retarget_source is not None:
+            self.annotation_rows = self.retarget_source.rows_for_base(base)
+            eligible = self.retarget_source.candidate_masks[self.annotation_rows[self.sample_indices]] != 0
+            self.sample_indices = self.sample_indices[eligible]
+            self.segment_for_sample = self.segment_for_sample[eligible]
+            if not len(self.sample_indices):
+                raise ValueError(f"No valid retarget action windows in {self.root}")
         self.text_embeddings = None
         if text_embedding_shape is not None:
             self.text_embeddings = TextEmbeddingCache(self.root / config.text_embedding_dir, *text_embedding_shape)
@@ -391,7 +428,7 @@ class WSA1_5Dataset(Dataset):
             annotation = annotations.get(int(ep), {})
             occupied = np.zeros(len(frames), dtype=bool)
             ids = set()
-            subtasks = annotation.get("subtasks")
+            subtasks = annotation.get("subtasks") if self.config.use_subtask else None
             if subtasks is not None and not isinstance(subtasks, list):
                 raise ValueError(f"Episode {ep} subtasks must be a list or null")
             for subtask in subtasks or []:
@@ -419,7 +456,7 @@ class WSA1_5Dataset(Dataset):
                 text_annotation = resolve_subtask_annotation(annotation, self.meta.episodes[ep])
                 self._add_segment(Segment(int(ep), int(start + first), int(start + last),
                                           sid, self._condition_text(text_annotation, subtask), True))
-            # Missing subtask labels retain the original task, without endpoint/3D supervision.
+            # Uncovered frames retain the original task; endpoint fallback is decided per sample.
             missing = np.flatnonzero(~occupied)
             for run in np.split(missing, np.flatnonzero(np.diff(missing) > 1) + 1):
                 if len(run):
@@ -454,10 +491,11 @@ class WSA1_5Dataset(Dataset):
     def _condition_text(self, annotation, subtask=None):
         if not self.config.use_subtask:
             subtask = None
-        if self.action_config is None:
+        if self.action_config is None or self.retarget_source is not None:
             return condition_text(annotation, subtask)
         return action_prompt(annotation["task_instruction"], self.action_codec.control_mode,
-                             self.action_config.action_mode, annotation=annotation, subtask=subtask)
+                             self.action_config.action_mode, annotation=annotation, subtask=subtask,
+                             embodiment=self.action_codec.embodiment_name if self.action_config.action_space == "unified72" else None)
 
     def _add_segment(self, segment):
         self.segments.append(segment)
@@ -469,6 +507,10 @@ class WSA1_5Dataset(Dataset):
     @property
     def num_episodes(self):
         return self.meta.total_episodes
+
+    @property
+    def checkpoint_stats(self):
+        return self.retarget_source.stats if self.retarget_source is not None else self.base.meta.stats.copy()
 
     def __len__(self):
         return self.num_frames
@@ -502,19 +544,17 @@ class WSA1_5Dataset(Dataset):
         valid_time = ~padding[f"{self.config.motion_key}_is_pad"]
         future_ts = self.timestamps[future_indices]
         all_ts = np.concatenate(([self.timestamps[idx]], future_ts))
-        need_goal = self.include_3d_targets and segment.metadata_valid
-        goal_index = segment.last
+        need_goal = self.include_3d_targets and (segment.metadata_valid or self.config.allow_endframe_3d)
+        goal_index = (segment.last if segment.metadata_valid else
+                      self.meta.episodes[segment.episode]["dataset_to_index"] - 1)
         history_count = 0
         if self.action_config is not None:
             cfg = self.action_config
             entry = self.meta.episodes[segment.episode]
-            first, end = entry["dataset_from_index"], entry["dataset_to_index"]
+            first = entry["dataset_from_index"]
             history, history_valid = history_indices(idx - first, cfg.num_history_frame, cfg.history_frame_stride)
             history_count = cfg.num_history_frame
             all_ts = np.concatenate((all_ts, self.timestamps[first + history[:-1]]))
-            if not segment.metadata_valid:
-                need_goal = self.include_3d_targets and self.config.allow_endframe_3d
-                goal_index = end - 1
         goal_in_window = need_goal and goal_index <= future_indices[-1]
         if goal_in_window:
             all_ts = np.concatenate((all_ts, [self.timestamps[goal_index]]))
@@ -571,7 +611,7 @@ class WSA1_5Dataset(Dataset):
                     self.config.rgb_height, self.config.rgb_width)
                 condition["history_rgb"] = history_canvas * 2 - 1
                 condition["history_valid"] = history_pixels & history_valid[:-1, None, None, None]
-            condition.update(self._action_sample(idx, segment.episode, targets))
+            condition.update(self._action_sample(idx, segment, targets))
         if self.text_embeddings is not None:
             condition["text_embedding"], condition["text_valid"] = self.text_embeddings.get(segment.text)
         return {
@@ -590,10 +630,23 @@ class WSA1_5Dataset(Dataset):
                 if mask.any() else frames
                 for name, frames, mask in zip(CAMERA_WEIGHTS, views, masks, strict=True)]
 
-    def _action_sample(self, idx, ep, targets):
+    def _action_sample(self, idx, segment, targets):
         cfg, codec = self.action_config, self.action_codec
-        entry = self.meta.episodes[ep]
-        requested = idx + np.arange(cfg.action_chunk_size) * cfg.action_frame_stride
+        if self.retarget_source is not None:
+            source = self.retarget_source
+            row = self.annotation_rows[idx]
+            candidates = source.candidates(row)
+            body = candidates[torch.randint(len(candidates), ()).item()]
+            codec = self.retarget_codecs[body]
+            raw_state, raw_action = source.read_window(body, row)
+            encoded = codec.encode({"observation.state": raw_state}, {"action": raw_action})
+            dims = _reorder(torch.ones(len(raw_state)), codec.schema.action_reorder, cfg.action_dim).bool()
+            targets.update(action=encoded.pop("action"), action_valid_mask=dims[None].expand(cfg.action_chunk_size, -1).clone())
+            encoded["embodiment"] = codec.embodiment_name
+            encoded["condition_text"] = _action_condition(segment.text, codec.control_mode, cfg.action_mode, codec.embodiment_name)
+            return encoded
+        entry = self.meta.episodes[segment.episode]
+        requested = idx + action_offsets(cfg.action_chunk_size, cfg.action_frame_stride)
         valid = torch.from_numpy(requested < entry["dataset_to_index"])
         indices = np.minimum(requested, entry["dataset_to_index"] - 1)
         action = torch.zeros(cfg.action_chunk_size, cfg.action_dim)
@@ -617,6 +670,8 @@ class WSA1_5Dataset(Dataset):
                 dims = _reorder(torch.ones(sum(codec.action_sizes)), codec.schema.action_reorder, cfg.action_dim).bool()
                 mask = valid[:, None] & dims[None]
         targets.update(action=action, action_valid_mask=mask)
+        if cfg.action_space == "unified72":
+            state["embodiment"] = codec.embodiment_name
         return state
 
 

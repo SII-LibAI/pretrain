@@ -1,5 +1,7 @@
 # WSA1.5 使用说明
 
+统一动作空间及 Human/UMI 混合中训练见 [WSA1.5 中训练说明](README_WSA1_5_MIDTRAIN.md)。
+
 第二阶段 Action Post-training 见 [WSA1.5 Action 使用说明](README_WSA1_5_ACTION.md)。`enable_action=False` 保留本文的第一阶段 world-only 路径。
 
 当前 `WSA_1_5` policy 输入当前 RGB 和文本，预测未来 `future_frames` 帧 RGB、同长度的三通道 motion，以及可选的子任务终点 3D 特征；不预测 action。默认未来 16 帧，支持任意正的 4 的倍数。
@@ -171,7 +173,7 @@ RGB/motion 视频解码得到 `[0,1]` 的浮点张量后，统一用 `img * 2 - 
 
 hand_used：0=左手、1=右手、2=双手。区间不能越界或重叠，子任务编号不能重复。文本只读取示例中的任务、子任务、手和场景字段；物理语义应写进这些文本，额外 JSON 字段不会自动输入模型。
 
-未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。文本条件和 3D 目标图像仍对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。没有子任务或当前帧不在有效子任务标注内时，prompt 使用 prefix + 原始 task，不附加 Subtask/Hand/Scene 字段，并关闭相应 3D 标签；原始 task 优先来自 sidecar 的 `task_instruction`，缺失时读取 LeRobot episode 的 `tasks`，多 task episode 按帧的 `task_index` 区分。原始 task 缺失或非法会报错，不再使用空 prompt。缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频仍会报错。
+未来 `future_frames` 帧按 frame_stride 采样，默认步长 1，允许跨子任务边界。复用 LeRobot 的 episode 索引与 padding mask，仅在 episode 剩余帧不足时重复末帧并将越界位置标记无效，不会取到下一个 episode。开启 `use_subtask` 且当前子任务有效时，文本条件和 3D 目标图像对应当前子任务及其终点。VAE 输入为 `1 + future_frames` 帧，latent 时间长度为 `1 + future_frames / 4`；例如未来 16 帧对应 17 帧输入、5 个 latent 时间步，未来 32 帧对应 33 帧输入、9 个 latent 时间步。Motion 首帧只是 padding，不进入 MoT 或 loss。关闭子任务、没有子任务或当前帧不在有效子任务标注内时，prompt 使用 prefix + 原始 task，不附加 Subtask/Hand/Scene 字段；此时 `allow_endframe_3d=true` 可在两个阶段使用 episode 尾帧作为 3D 目标，否则关闭相应标签。原始 task 优先来自 sidecar 的 `task_instruction`，缺失时读取 LeRobot episode 的 `tasks`，多 task episode 按帧的 `task_index` 区分。原始 task 缺失或非法会报错，不再使用空 prompt。缺失相机/motion 用 mask 屏蔽。声明存在但解码失败的视频仍会报错。
 
 有效子任务也先解析原始 task：sidecar 的 `task_instruction` 缺失、null、空字符串或全空白时，训练与预计算共同回退到 episode metadata 的单一 `tasks` 文本，再附加 Subtask/Hand/Scene。两处都没有有效任务时明确报错，即使子任务覆盖了整个 episode 也不例外。若有效子任务对应的 metadata 有多个候选 task，需在 sidecar 明确填写 `task_instruction`，不会任取第一个；没有子任务的多 task episode 仍按帧 `task_index` 选择。没有子任务标注的数据本来就使用 metadata 的 task，不会因此产生空 `Task:`。受旧漏洞影响的空 Task 子任务缓存应重新运行预计算补齐；正确文本的缓存继续复用。
 
@@ -281,7 +283,7 @@ G 使用 WSA 默认 slot_noise：819 个槽位，每视角 1 camera、16 registe
 
 Omega 的每个有效目标视角都从原始 `[0,1]` 浮点张量直接双线性缩放至 `256×256`（`mode="bilinear"`、`align_corners=false`），不裁剪、不补白，也不转成 uint8/PIL。完整画面映射到正方形，非正方形原图会改变宽高比。Omega 内部自行做 ImageNet 标准化，外部不重复归一化。
 
-教师每层直接输出 `[B_valid,3,273,2048]`，按原顺序与学生的 `1 camera + 16 register + 16×16 patch` 槽位对应；已删除 `FeatureAligner3D`，不再对教师特征插值或重排。有效视角的全部 273 个 token 都参与监督，不再生成空间 padding mask；缺失视角使用首个有效视角的图像替换，整组输出屏蔽，不伪造有效标签。完全没有有效目标视角的样本跳过教师前向。训练时仍要求对应的当前观测视角有效，缺少子任务标注时仍关闭该样本的 3D 监督。
+教师每层直接输出 `[B_valid,3,273,2048]`，按原顺序与学生的 `1 camera + 16 register + 16×16 patch` 槽位对应；已删除 `FeatureAligner3D`，不再对教师特征插值或重排。有效视角的全部 273 个 token 都参与监督，不再生成空间 padding mask；缺失视角使用首个有效视角的图像替换，整组输出屏蔽，不伪造有效标签。完全没有有效目标视角的样本跳过教师前向。训练时仍要求对应的当前观测视角有效；没有有效子任务时，开启 `allow_endframe_3d` 可改用 episode 尾帧监督，关闭时屏蔽该样本的 3D 监督。
 
 例如 `480×640`（高×宽）直接缩放到 `256×256` 后输入教师，得到固定 273 个 token，按相同索引监督学生。该流程改变了 3D 标签的空间对应关系，不应把旧特征插值或补白方案下的实验当作同一配置直接续训。
 
@@ -363,6 +365,37 @@ NUM_WORKERS=8 PREFETCH_FACTOR=1 VIDEO_DECODE_THREADS=1 \
 当前 checkout 的启动脚本显式设置 `--policy.load_text_encoder=true`，会在线编码文本；已有完整离线缓存时可把该参数设为 `false`，省去 UMT5。这里保留用户当前脚本值，不自动覆盖。资源参数测试先在相同小数据集比较 2→8 卡，再扩大到 16 卡和完整数据，才能区分规模与数据组成的影响。
 
 本地合成测试中，20 万帧/2,000 episode 的适配器初始化由 16.30s 降至 0.081s；34 帧视频中的 goal 引用改为独立单帧后，底层 storage 缩小 34 倍。这些数字不包含 Parquet、真实视频或 GPU/DDP，不能推算服务器训练加速比。
+
+## RoboTwin 视频适配：加载 Stage-1，不监督 Action
+
+复用 `launch/wsa_1_5_posttrain_robotwin_clean.sh` 的 Clean 数据集发现逻辑，通过 `ENABLE_ACTION=false` 进入世界模型训练。此时不构建 Action Expert 和 state 投影，不读取动作监督，也不使用 state/action 的归一化统计；RGB、Motion、Future3D、VAE 从 `INIT_CHECKPOINT_PATH` 指定的权重加载，optimizer、scheduler 和 step 重新开始。
+
+`USE_SUBTASK=false` 时，两阶段都不按子任务切段，也不使用子任务终点；仅保留 sidecar 原始 Task 或 episode metadata 中的 Task。配合 `ALLOW_ENDFRAME_3D=true`，每个样本使用所属 episode 的最后一帧，按相机有效性送入冻结 VGGT-Omega 提取监督特征。末帧只作为 3D 监督目标，不作为观测条件。`ENABLE_3D_QUERIES=true`、`LAMBDA_3D>0` 时才计算对应监督。
+
+下面使用在线 UMT5 编码文本，可以直接启动，无需准备另一套文本缓存。将初始化路径换成实际 Stage-1 checkpoint；Omega 路径默认沿用脚本配置，必要时设置 `OMEGA_CHECKPOINT_PATH`。
+
+```bash
+unset RESUME_CONFIG
+WAN_MODEL_PATH=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B
+
+ENABLE_ACTION=false \
+INIT_CHECKPOINT_PATH=/path/to/stage1/pretrained_model \
+USE_SUBTASK=false \
+ALLOW_ENDFRAME_3D=true \
+ENABLE_3D_QUERIES=true \
+LOAD_TEXT_ENCODER=true \
+TEXT_ENCODER_PATH="$WAN_MODEL_PATH/models_t5_umt5-xxl-enc-bf16.pth" \
+TOKENIZER_PATH="$WAN_MODEL_PATH/google/umt5-xxl" \
+LAMBDA_RGB=1.0 \
+LAMBDA_MOTION=0 \
+LAMBDA_3D=0.5 \
+OUTPUT_DIR="outputs/wsa1_5_robotwin_video/$(date +%Y_%m_%d_%H_%M_%S)" \
+bash launch/wsa_1_5_posttrain_robotwin_clean.sh
+```
+
+`LAMBDA_MOTION=0` 关闭 Motion loss，仍保留该模块以匹配 Stage-1 权重。RGB 和 3D 的 loss、学习率及训练步数继续由脚本参数控制；默认未来帧数为 8，修改时保持 policy/dataset 一致，并沿用来源模型所需的结构和分辨率。RGB 在此阶段默认全参数训练，`rgb_finetune_mode` 仅用于 Action 阶段。
+
+已有一阶段、无子任务文本缓存时，可改为 `LOAD_TEXT_ENCODER=false` 节省 UMT5 显存；缓存须由 `precompute_wsa1_5_text_embeddings.py --no-enable-action --no-use-subtask` 生成，Action prompt 的缓存不能替代。预计算与训练均保留原始任务文本的回退规则。
 
 ## 6. 断点恢复与推理
 

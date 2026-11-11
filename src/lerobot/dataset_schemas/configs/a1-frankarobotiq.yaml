@@ -1,5 +1,9 @@
 # Franka with Robotiq gripper (A1 old format)
 robot_type: frankarobotiq
+unified_action_reorder: &unified_frankarobotiq
+  - [0, 7, 58, 65]
+  - [7, 8, 14, 15]
+unified_state_reorder: *unified_frankarobotiq
 action_mask_spec: [7, -1]
 feature_mapping:
   observation.state:

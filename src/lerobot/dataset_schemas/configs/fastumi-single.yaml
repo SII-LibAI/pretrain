@@ -1,5 +1,8 @@
 # fast umi
 robot_type: fastumi_single
+unified_action_reorder: &unified_fastumi_single
+  - [0, 7, 0, 7]
+unified_state_reorder: *unified_fastumi_single
 action_mask_spec: [3,-4]
 feature_mapping:
   observation.state:

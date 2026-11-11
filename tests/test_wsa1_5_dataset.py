@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import datasets
@@ -215,6 +216,76 @@ def test_missing_annotations_and_collate(tmp_path, monkeypatch):
     assert batch["observed_rgb"].shape == (2, 3, 384, 320)
     assert len(batch["targets"]["goal_rgb_views"]) == 2
     assert not batch["targets"]["motion_valid"][1].any()
+
+
+@pytest.mark.parametrize("annotations", [False, True])
+@pytest.mark.parametrize("use_subtask", [False, True])
+@pytest.mark.parametrize("allow_endframe", [False, True])
+def test_stage1_subtask_and_episode_endpoints(tmp_path, monkeypatch, annotations, use_subtask, allow_endframe):
+    fixture, _ = make_data(tmp_path, monkeypatch, annotations=annotations, future_frames=4)
+    config = replace(fixture.config, use_subtask=use_subtask, allow_endframe_3d=allow_endframe)
+    dataset = WSA1_5Dataset(fixture.base, config)
+    assert dataset.action_config is None
+    if not use_subtask:
+        assert all(segment.subtask == -1 and not segment.metadata_valid for segment in dataset.segments)
+    for index in (3, 8, 38):  # Separate endpoint decode, endpoint in window, and episode padding.
+        sample = dataset[index]
+        has_subtask = annotations and use_subtask
+        endpoint = (9 if index < 10 else 39) if has_subtask else (39 if allow_endframe else None)
+        assert sample["targets"]["goal_view_valid"].tolist() == [endpoint is not None, False, False]
+        assert sample["metadata_valid"] == has_subtask
+        assert ("Subtask:" in sample["condition_text"]) == has_subtask
+        assert "Task: knit" in sample["condition_text"]
+        assert "state" not in sample and "action" not in sample["targets"]
+        if endpoint is not None:
+            assert sample["goal_timestamp"] == pytest.approx(endpoint / 30)
+            goal = sample["targets"]["goal_rgb_views"][0]
+            torch.testing.assert_close(goal, torch.full_like(goal, (2 + endpoint / 30) / 4))
+        else:
+            assert not any(view.any() for view in sample["targets"]["goal_rgb_views"])
+    dataset.include_3d_targets = False
+    assert "goal_rgb_views" not in dataset[3]["targets"]
+
+
+def test_stage1_task_only_ignores_subtask_bounds_but_keeps_original_task(tmp_path, monkeypatch):
+    fixture, _ = make_data(tmp_path, monkeypatch, future_frames=4)
+    sidecar = [{"episode_index": 0, "task_instruction": "original task",
+                "subtasks": [{"start_frame": 99, "end_frame": 1, "subtask_id": 0}]}]
+    (tmp_path / "meta/sidecar.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    dataset = WSA1_5Dataset(fixture.base, replace(fixture.config, use_subtask=False, allow_endframe_3d=True))
+    assert dataset[3]["condition_text"] == condition_text({"task_instruction": "original task"})
+    assert dataset[3]["goal_timestamp"] == pytest.approx(39 / 30)
+    with pytest.raises(ValueError, match="bounds"):
+        WSA1_5Dataset(fixture.base, fixture.config)
+
+
+def test_video_adaptation_trains_rgb_and_endframe_3d_without_actions(tmp_path, monkeypatch):
+    from test_wsa1_5_action import action_policy
+
+    fixture, _ = make_data(tmp_path, monkeypatch, future_frames=4)
+    config = replace(fixture.config, use_subtask=False, allow_endframe_3d=True,
+                     rgb_height=96, rgb_width=64, motion_height=32, motion_width=32)
+    dataset = WSA1_5Dataset(fixture.base, config)
+    batch = wsa1_5_collate([dataset[3]])
+    policy = action_policy(enable_action=False, lambda_rgb=1, lambda_3d=1)
+    batch["text_embedding"] = torch.randn(1, 4, 8)
+    batch["text_valid"] = torch.ones(1, 4, dtype=torch.bool)
+
+    class Teacher:
+        def features(self, views, valid, device):
+            torch.testing.assert_close(views[0][0], torch.full_like(views[0][0], (2 + 39 / 30) / 4))
+            return ({layer: torch.ones(1, 3, 273, 8, device=device) for layer in policy.config.teacher_layers},
+                    valid[..., None].expand(-1, -1, 273))
+
+    policy.teacher = Teacher()
+    assert policy.action_expert is None and policy.proprio_encoder is None
+    assert "action" not in {group["name"] for group in policy.get_optim_params()}
+    loss, metrics = policy.training_forward(batch)
+    assert metrics["loss_rgb_flow"] > 0 and metrics["loss_3d_feature"] > 0
+    assert "loss_action_flow" not in metrics and torch.isfinite(loss)
+    loss.backward()
+    for weight in [policy.flow.rgb.patch_embedding.weight, policy.future_3d.feature_heads["4"][1].weight]:
+        assert weight.grad is not None and torch.isfinite(weight.grad).all() and weight.grad.abs().sum() > 0
 
 
 def test_declared_video_decode_failure_raises(tmp_path, monkeypatch):

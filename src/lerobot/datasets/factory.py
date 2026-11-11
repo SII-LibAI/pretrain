@@ -387,14 +387,15 @@ def _build_single_dataset(
         if cfg.policy.enable_action:
             if cfg.dataset.action_mode != cfg.policy.action_mode:
                 raise ValueError("dataset.action_mode and policy.action_mode must match")
-            _apply_dataset_stats_overrides(cfg, base)
+            if not (root / "meta/annotations/action.parquet").is_file():
+                _apply_dataset_stats_overrides(cfg, base)
         elif cfg.dataset.use_external_stats:
             raise ValueError("Stage-1 WSA does not use external state/action statistics")
         dataset = WSA1_5Dataset(base, cfg.dataset, include_3d_targets=cfg.policy.use_3d_supervision,
                                text_embedding_shape=None if cfg.policy.load_text_encoder else
                                (cfg.policy.max_text_length, cfg.policy.text_dim),
                                action_config=cfg.policy if cfg.policy.enable_action else None)
-        return dataset, base.meta.stats.copy(), base.meta.robot_type
+        return dataset, dataset.checkpoint_stats, base.meta.robot_type
 
     use_synthetic_embodiments = isinstance(cfg.dataset, SyntheticEmbodimentDatasetConfig)
     input_transforms = cfg.dataset.data_transforms.inputs
@@ -578,8 +579,11 @@ def make_dataset(cfg: TrainPipelineConfig):
         for repo in all_repo_ids:
             root = Path(cfg.dataset.root) / repo if cfg.dataset.root else HF_LEROBOT_HOME / repo
             info = load_json(root / "meta/info.json")
-            schema = get_schema(info["robot_type"])
-            available |= all(key in info["features"] for key in schema.get_action_keys())
+            if (root / "meta/annotations/action.parquet").is_file():
+                available = True
+            else:
+                schema = get_schema(info["robot_type"])
+                available |= all(key in info["features"] for key in schema.get_action_keys())
         if not available:
             raise ValueError("Action supervision is enabled but none of the selected datasets declare actions")
 

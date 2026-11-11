@@ -55,7 +55,8 @@ def main():
     if cfg.num_history_frame:
         batch.update(history_rgb=inputs["history_rgb"], history_valid=inputs["history_valid"])
     batch["state"] = torch.stack(states)
-    batch["condition_text"] = [action_prompt(task, codec.control_mode, cfg.action_mode) for task in tasks]
+    batch["condition_text"] = [action_prompt(task, codec.control_mode, cfg.action_mode,
+                              embodiment=codec.embodiment_name if cfg.action_space == "unified72" else None) for task in tasks]
     if not cfg.load_text_encoder:
         cache = TextEmbeddingCache(args.text_cache or args.dataset_root / "meta/wsa1_5_text_embeddings",
                                    cfg.max_text_length, cfg.text_dim)

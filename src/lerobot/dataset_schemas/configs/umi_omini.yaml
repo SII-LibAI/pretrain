@@ -1,5 +1,11 @@
 # Franka Emika Panda robot (A1 old format)
 robot_type: genrobot_das_bimanual
+unified_action_reorder: &unified_genrobot_das_bimanual
+  - [0, 7, 0, 7]
+  - [7, 8, 14, 15]
+  - [8, 15, 7, 14]
+  - [15, 16, 16, 17]
+unified_state_reorder: *unified_genrobot_das_bimanual
 action_mask_spec: [3,-5,3,-5]
 feature_mapping:
   observation.state:

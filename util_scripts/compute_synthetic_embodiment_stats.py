@@ -8,20 +8,13 @@ import json
 import multiprocessing as mp
 from collections.abc import Sequence
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 
-from lerobot.datasets.synthetic_embodiment import (
-    DEFAULT_ANNOTATION_FILE,
-    EmbodimentSpec,
-    SyntheticActionTable,
-    _build_candidate_masks,
-    embodiment_schema_prefix,
-    load_embodiment_schemas,
-)
+from lerobot.datasets.synthetic_embodiment import DEFAULT_ANNOTATION_FILE, EmbodimentSpec
+from lerobot.datasets.retarget_actions import RetargetActionSource
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -117,47 +110,47 @@ def _compute_one_root(
     chunk_size: int,
     batch_size: int,
     action_mode: str,
-) -> tuple[tuple[EmbodimentSpec, ...], dict[str, tuple[RunningVectorStats, RunningVectorStats]]]:
+    stride: int = 1,
+    action_space: str = "legacy",
+):
     """Worker: accumulate each embodiment's trainable state/action vectors."""
     from lerobot.transforms.core import DeltaActionTransformFn
 
-    path = root / annotation_file
-    specs = SyntheticActionTable.from_parquet(path, embodiments).specs
-    with (root / "meta" / "info.json").open(encoding="utf-8") as stream:
-        source_robot_type = json.load(stream)["robot_type"]
-    schema_prefix = embodiment_schema_prefix(source_robot_type)
-    schemas = load_embodiment_schemas(specs, schema_prefix)
+    source = RetargetActionSource(root, chunk_size, stride=stride, embodiments=embodiments,
+                                  action_space=action_space, action_mode=action_mode, annotation_file=annotation_file)
+    specs, schemas = source.specs, source.schemas
     accumulators = {
         spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
         for spec in specs
     }
 
-    for spec, schema in zip(specs, schemas, strict=True):
-        table = SyntheticActionTable.from_parquet(path, [spec.name])
-        anchors = np.flatnonzero(_build_candidate_masks(table, chunk_size))
-        values = table.values[0]
+    for body, (spec, schema) in enumerate(zip(specs, schemas, strict=True)):
+        anchors = np.flatnonzero(source.candidate_masks & (np.uint64(1) << np.uint64(body)))
         state_stats, action_stats = accumulators[spec.name]
-        view = SimpleNamespace(meta=SimpleNamespace(robot_type=schema.robot_type))
         delta_transform = (
-            DeltaActionTransformFn().hydrate(view) if action_mode == "delta" else None
+            DeltaActionTransformFn(mask=schema.action_mask, mapping=schema.feature_mapping,
+                                   robot_type=schema.robot_type) if action_mode == "delta" else None
         )
 
         for start in range(0, len(anchors), batch_size):
             batch_anchors = anchors[start : start + batch_size]
-            states = values[batch_anchors]
+            windows = [source.read_window(body, int(anchor)) for anchor in batch_anchors]
+            states = np.stack([state for state, _ in windows])
             state_stats.update(states)
             actions = np.empty((len(batch_anchors) * chunk_size, spec.dim), dtype=np.float32)
-            for i, anchor in enumerate(batch_anchors):
+            for i, (_, future) in enumerate(windows):
                 sample = {
                     OBS_STATE: torch.from_numpy(states[i]),
-                    ACTION: torch.from_numpy(values[anchor + 1 : anchor + chunk_size + 1].copy()),
+                    ACTION: torch.from_numpy(future),
                 }
                 if delta_transform is not None:
                     delta_transform(sample)
                 actions[i * chunk_size : (i + 1) * chunk_size] = sample[ACTION].numpy()
             action_stats.update(actions)
 
-    return specs, accumulators
+    training = {spec.name: {**source.training_spec, "action_mask_spec": schema.action_mask_spec}
+                for spec, schema in zip(specs, schemas, strict=True)}
+    return tuple(specs), accumulators, training
 
 
 def compute_embodiment_stats(
@@ -169,17 +162,19 @@ def compute_embodiment_stats(
     batch_size: int = 1024,
     num_workers: int = 1,
     action_mode: str = "delta",
+    stride: int = 1,
+    action_space: str = "legacy",
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], tuple[EmbodimentSpec, ...]]:
     """Aggregate worker-local statistics, parallelized across dataset roots."""
-    if chunk_size < 1 or batch_size < 1 or num_workers < 1:
-        raise ValueError("chunk_size, batch_size, and num_workers must be positive")
+    if chunk_size < 1 or batch_size < 1 or num_workers < 1 or stride < 1:
+        raise ValueError("chunk_size, stride, batch_size, and num_workers must be positive")
     if action_mode not in {"abs", "delta"}:
         raise ValueError("action_mode must be 'abs' or 'delta'")
     roots = [Path(root).resolve() for root in dataset_roots]
     if not roots:
         raise ValueError("dataset_roots is empty")
     jobs = [
-        (root, annotation_file, embodiments, chunk_size, batch_size, action_mode)
+        (root, annotation_file, embodiments, chunk_size, batch_size, action_mode, stride, action_space)
         for root in roots
     ]
     if num_workers == 1:
@@ -189,29 +184,35 @@ def compute_embodiment_stats(
         with ctx.Pool(processes=min(num_workers, len(roots))) as pool:
             results = pool.starmap(_compute_one_root, jobs)
 
-    reference_specs = results[0][0]
-    accumulators = {
-        spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
-        for spec in reference_specs
-    }
-    for root, (specs, worker_stats) in zip(roots, results, strict=True):
-        if [(spec.name, spec.dim) for spec in specs] != [
-            (spec.name, spec.dim) for spec in reference_specs
-        ]:
-            raise ValueError(f"Embodiment schema differs in {root / annotation_file}")
-        for spec in reference_specs:
+    specs_by_name, accumulators, training = {}, {}, {}
+    for root, (specs, worker_stats, worker_training) in zip(roots, results, strict=True):
+        for spec in specs:
+            if spec.name in specs_by_name and (specs_by_name[spec.name].dim != spec.dim
+                                              or training[spec.name] != worker_training[spec.name]):
+                raise ValueError(f"Embodiment schema differs in {root / annotation_file}: {spec.name}")
+            if spec.name not in specs_by_name:
+                specs_by_name[spec.name] = spec
+                training[spec.name] = worker_training[spec.name]
+                accumulators[spec.name] = (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
             state_stats, action_stats = accumulators[spec.name]
             worker_state, worker_action = worker_stats[spec.name]
             state_stats.merge(worker_state)
             action_stats.merge(worker_action)
 
-    return {
+    reference_specs = tuple(spec for name, spec in sorted(specs_by_name.items()) if accumulators[name][0].count)
+    if not reference_specs:
+        raise ValueError("No valid state/action windows for the selected embodiments")
+    stats = {
         spec.name: {
             OBS_STATE: accumulators[spec.name][0].as_dict(),
             ACTION: accumulators[spec.name][1].as_dict(),
         }
         for spec in reference_specs
-    }, reference_specs
+    }
+    if action_space == "unified72":
+        for spec in reference_specs:
+            stats[spec.name]["training"] = training[spec.name]
+    return stats, reference_specs
 
 
 def write_embodiment_stats(
@@ -254,7 +255,7 @@ def parse_args() -> argparse.Namespace:
         "--embodiment",
         action="append",
         dest="embodiments",
-        help="Embodiment to include. Repeat to select several; omit to include every discovered embodiment.",
+        help="Annotation short name or full schema name. Repeat to select several; omit to include all.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -271,6 +272,8 @@ def parse_args() -> argparse.Namespace:
         default="delta",
         help="Action representation whose normalization statistics are computed.",
     )
+    parser.add_argument("--action-space", choices=("legacy", "unified72"), default="legacy")
+    parser.add_argument("--stride", type=int, default=1, help="Future pose stride; match policy.action_frame_stride.")
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument(
         "--num-workers",
@@ -292,6 +295,8 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         action_mode=args.action_mode,
+        stride=args.stride,
+        action_space=args.action_space,
     )
     output_dir = (
         Path(args.output_dir)

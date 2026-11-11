@@ -1,5 +1,8 @@
 # Panda robot (no gripper)
 robot_type: panda
+unified_action_reorder: &unified_panda
+  - [0, 7, 58, 65]
+unified_state_reorder: *unified_panda
 action_mask_spec: [7]
 feature_mapping:
   observation.state:

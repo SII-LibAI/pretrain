@@ -1,5 +1,11 @@
 # fast umi
 robot_type: Hunyuan_eef
+unified_action_reorder: &unified_Hunyuan_eef
+  - [0, 7, 0, 7]
+  - [7, 8, 14, 15]
+  - [8, 15, 7, 14]
+  - [15, 16, 16, 17]
+unified_state_reorder: *unified_Hunyuan_eef
 action_mask_spec: [3,-5,3,-5]
 feature_mapping:
   observation.state:

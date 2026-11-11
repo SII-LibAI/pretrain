@@ -1,5 +1,7 @@
 # WSA1.5 Action Post-training
 
+统一 72 维动作空间、Human/UMI 重定向混合中训练见 [中训练说明](README_WSA1_5_MIDTRAIN.md)。
+
 ## 模型结构
 
 O/R/M/G/A 在同一次 MoT 中逐层并行计算。训练只做一次联合前向；推理的每个采样步同时预测并更新 RGB、Motion、Action，G 读取同一步的 world 表示。没有额外 Goal rollout、detached O/G cache 或 A-only 第二次前向。
@@ -70,7 +72,7 @@ RoboTwin AgileX Aloha 的注册名为 `aloha_robotwin`：每臂 xyz(3)＋quatern
 
 ## Prompt 与日志
 
-固定前缀为用户指定的：`You are a robot control agent,follow the instruction.`，后接 Task；Action 模式再附加 Control Mode 和 Action Mode。`use_subtask=false` 不读取 sidecar 子任务内容；开启时仅追加真实 Subtask/Hand/Scene。有效子任务以其终点监督 G，否则只有 `allow_endframe_3d=true` 才使用 episode 终点。
+固定前缀为用户指定的：`You are a robot control agent,follow the instruction.`，后接 Task；Action 模式再附加 Control Mode 和 Action Mode。两阶段的 `use_subtask=false` 都不使用子任务文本、分段或终点，仅保留原始 Task；开启时追加真实 Subtask/Hand/Scene。有效子任务以其终点监督 G，否则只有 `allow_endframe_3d=true` 才使用 episode 终点。Stage-1 视频适配同样支持该尾帧回退，启动示例见 [世界模型说明](README_WSA1_5.md#robotwin-视频适配加载-stage-1不监督-action)。
 
 前缀变化需要重算对应文本缓存。单独切换历史编码方式不改变 prompt，不需要重算文本 embedding。
 
@@ -163,16 +165,16 @@ export ACTION_MODE=delta
 export EXTERNAL_STATS_PATH=/data/normalization/aloha_delta/stats.json
 
 # 默认整段联合编码；可先 WSA_DRY_RUN=1 检查启动命令。
-PROC_PER_NODE=2 bash launch/wsa_1_5_action_posttrain.sh
+PROC_PER_NODE=2 bash launch/wsa_1_5_posttrain_robotwin_clean.sh
 
 # 切换为逐帧独立编码；使用新的输出目录开启新实验。
 SPARSE_FRAME_ENCODING=independent OUTPUT_DIR=outputs/action_independent \
-  bash launch/wsa_1_5_action_posttrain.sh
+  bash launch/wsa_1_5_posttrain_robotwin_clean.sh
 
 # 配置文件 / 直接 CLI 对应字段：--policy.sparse_frame_encoding=joint|independent
 # 恢复沿用保存的编码模式，不重新应用 launcher 默认值。
 RESUME_CONFIG=/path/to/stage2/checkpoints/last/pretrained_model/train_config.json \
-  bash launch/wsa_1_5_action_posttrain.sh
+  bash launch/wsa_1_5_posttrain_robotwin_clean.sh
 
 python util_scripts/infer_wsa1_5_action.py \
   --checkpoint /path/to/stage2/checkpoints/last/pretrained_model \
@@ -185,6 +187,8 @@ python util_scripts/infer_wsa1_5_action.py \
 推理输入包含当前 RGB/mask、原始历史 RGB/mask、task 列表和按 schema 源 key 保存的 `raw_state`。CLI 负责 prompt 和 state 归一化，并自动使用 checkpoint 中保存的编码模式。`return_world=true` 可返回同次联合采样的 world 输出；默认不解码视频。episode 或任务切换时调用 `reset()`。
 
 Stage-1 初始化要求原参数 key/shape 匹配，只允许缺少新的 Action/LoRA 参数。在线文本编码的 Stage-1 checkpoint 会保存冻结 UMT5；若目标 Stage-2 使用离线文本缓存（`load_text_encoder=false`），加载器仅在源配置声明启用 UMT5 时排除 `text_encoder.*`，并记录排除数量，其余参数仍严格检查。两阶段均在线时照常完整加载 UMT5；源 checkpoint 不含 UMT5 而目标要求在线时，仍拒绝缺失权重。该转换仅用于 Stage-1 → Stage-2 初始化，完整 checkpoint/resume 的严格加载规则不变。Stage-2 resume 沿用完整保存配置及原 optimizer/scheduler/RNG/step 体系。改变编码模式会改变 O 的表示与 token 数，应作为新实验，不在 resume 时无声切换。
+
+Stage-1 → Stage-2 时先加载 `policy.init_checkpoint_path` 指定的世界模型，再从已加载的 Stage-1 RGB 专家对 Action 的 `text_embedding`、`time_embedding`、`time_projection` 和所有 Transformer blocks 做宽度插值，并按 WSA-L 使用 Alpha Scaling；注意力头几何和六组时间调制保持不变。不需要额外提供原始 Wan 权重。`action_encoder`、动作输出 `head` 以及独立的 `proprio_encoder` 没有对应的 RGB 权重，使用新建参数。缺失或不匹配的骨干权重会报错，不回退为随机初始化。未指定 Stage-1 checkpoint、直接从 Wan 开始训练时，Action 从已加载原始 Wan 的 RGB 专家迁移。完整 Stage-2 checkpoint 加载、评测和断点恢复直接使用保存的 Action 权重，不重复插值。
 
 ## 验证边界
 

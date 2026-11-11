@@ -1,5 +1,11 @@
 # A2D dual-arm 7-DOF robot (AgiBotWorld)
 robot_type: a2d
+unified_action_reorder: &unified_a2d
+  - [0, 7, 58, 65]
+  - [14, 15, 14, 15]
+  - [7, 14, 65, 72]
+  - [15, 16, 16, 17]
+unified_state_reorder: *unified_a2d
 action_mask_spec: [14, -2]
 # Reorder action dimensions with flexible src->dst mapping
 # Format: [src_start, src_end, dst_start, dst_end]

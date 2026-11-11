@@ -79,21 +79,27 @@ from lerobot.policies.wsa1_5.dataset_wsa1_5 import (
 from lerobot.policies.wsa1_5.text_embeddings import PROMPT_VERSION, TextEmbeddingCache, encode_text, text_embedding_path
 
 
-def dataset_prompts(root, sidecar_file="meta/sidecar.json", *, enable_action=False, action_mode="delta", use_subtask=False):
+def dataset_prompts(root, sidecar_file="meta/sidecar.json", *, enable_action=False, action_mode="delta", use_subtask=False,
+                    action_space="legacy"):
     if type(enable_action) is not bool:
         raise TypeError("enable_action must be boolean")
     path = Path(root) / sidecar_file
     annotations = {} if enable_action and not use_subtask else load_sidecar_annotations(path)
     render = condition_text
     if enable_action:
+        if (Path(root) / "meta/annotations/action.parquet").is_file():
+            raise ValueError("Retarget action data uses online text encoding; precompute only standard robot datasets")
         if action_mode not in {"abs", "delta"}:
             raise ValueError("Action text precomputation requires action_mode abs or delta")
         from lerobot.dataset_schemas import get_schema
         from lerobot.policies.wsa1_5.dataset_wsa1_5 import action_prompt, control_mode
         info = json.loads((Path(root) / "meta/info.json").read_text(encoding="utf-8"))
-        mode = control_mode(get_schema(info["robot_type"]))
+        schema = get_schema(info["robot_type"]).for_action_space(action_space)
+        mode = control_mode(schema)
+        embodiment = (schema.embodiment_name or schema.robot_type) if action_space == "unified72" else None
         def render(row, subtask=None):
-            return action_prompt(row["task_instruction"], mode, action_mode, annotation=row, subtask=subtask)
+            return action_prompt(row["task_instruction"], mode, action_mode, annotation=row, subtask=subtask,
+                                 embodiment=embodiment)
     episodes = load_episodes(Path(root))
     columns = ["episode_index"] + (["tasks"] if "tasks" in episodes.column_names else [])
     prompts = set()
@@ -126,14 +132,14 @@ def pending_prompts(directory, prompts, max_length, text_dim):
 @torch.no_grad()
 def precompute_dataset(root, encoder, tokenizer, device, *, max_length=512, text_dim=4096,
                        sidecar_file="meta/sidecar.json", embedding_dir="meta/wsa1_5_text_embeddings", batch_size=8,
-                       enable_action=False, action_mode="delta", use_subtask=False, prompts=None):
+                       enable_action=False, action_mode="delta", use_subtask=False, action_space="legacy", prompts=None):
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("Text encoding batch_size must be a positive integer")
     directory = Path(root) / embedding_dir
     directory.mkdir(parents=True, exist_ok=True)
     if prompts is None:
         prompts = dataset_prompts(root, sidecar_file, enable_action=enable_action,
-                                  action_mode=action_mode, use_subtask=use_subtask)
+                                  action_mode=action_mode, use_subtask=use_subtask, action_space=action_space)
     total = len(prompts)
     prompts = pending_prompts(directory, prompts, max_length, text_dim)
     for offset in range(0, len(prompts), batch_size):
@@ -172,6 +178,7 @@ def main():
     parser.add_argument("--embedding-dir", default="meta/wsa1_5_text_embeddings")
     parser.add_argument("--enable-action", action=argparse.BooleanOptionalAction, default=False,
                         help="Build Action training prompts when enabled; match policy.enable_action")
+    parser.add_argument("--action-space", choices=("legacy", "unified72"), default="legacy")
     parser.add_argument("--action-mode", choices=["abs", "delta"], default="delta",
                         help="Absolute/delta representation when Action is enabled; match policy.action_mode")
     parser.add_argument("--use-subtask", action=argparse.BooleanOptionalAction, default=False,
@@ -207,8 +214,11 @@ def main():
     roots = sorted({(args.data_root / repo).resolve() for repo in repos})
     work, offset, skipped = [], 0, 0
     for root in roots:
+        if args.enable_action and (root / "meta/annotations/action.parquet").is_file():
+            print(f"[WSA text] skipping online-only retarget actions: {root}", flush=True)
+            continue
         prompts = dataset_prompts(root, args.sidecar_file, enable_action=args.enable_action,
-                                  action_mode=args.action_mode, use_subtask=args.use_subtask)
+                                  action_mode=args.action_mode, use_subtask=args.use_subtask, action_space=args.action_space)
         assigned = [text for index, text in enumerate(prompts, start=offset) if index % world_size == rank]
         offset += len(prompts)
         pending = pending_prompts(root / args.embedding_dir, assigned, args.max_text_length, 4096)
@@ -241,7 +251,7 @@ def main():
                            max_length=args.max_text_length, sidecar_file=args.sidecar_file,
                            embedding_dir=args.embedding_dir, batch_size=args.batch_size,
                            enable_action=args.enable_action, action_mode=args.action_mode,
-                           use_subtask=args.use_subtask, prompts=prompts)
+                           use_subtask=args.use_subtask, action_space=args.action_space, prompts=prompts)
     print(f"[WSA text rank {rank}/{world_size}] done", flush=True)
 
 

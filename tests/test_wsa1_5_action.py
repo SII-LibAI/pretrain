@@ -127,7 +127,7 @@ def make_action_data(tmp_path, monkeypatch, *, mode="delta", use_subtask=False, 
     path = tmp_path / "action_stats.json"
     path.write_text(json.dumps(stats), encoding="utf-8")
     (tmp_path / "meta/info.json").write_text(json.dumps({"robot_type": "aloha_robotwin"}), encoding="utf-8")
-    cfg = action_config(state_dim=16, action_dim=16, action_chunk_size=5, num_history_frame=4)
+    cfg = action_config(state_dim=16, action_dim=16, action_chunk_size=5, num_history_frame=4, history_frame_stride=2)
     cfg.action_mode = mode
     data_cfg = replace(fixture.config, use_subtask=use_subtask, allow_endframe_3d=allow_endframe,
                        action_mode=mode, use_external_stats=True, external_stats_path=str(path))
@@ -549,7 +549,7 @@ def test_parallel_five_group_mot_has_no_reverse_dependency():
 
 
 def test_online_queue_keeps_history_at_every_control_tick(monkeypatch):
-    policy = action_policy()
+    policy = action_policy(history_frame_stride=2)
     batch = action_batch(policy.config)
     plans = []
     def plan(prepared, **kwargs):
@@ -619,106 +619,6 @@ def test_factory_rejects_completely_actionless_sources(tmp_path):
         motion_height=32, motion_width=32, future_frames=4))
     with pytest.raises(ValueError, match="none of the selected"):
         make_dataset(cfg)
-
-
-def test_action_launcher_dry_run_and_resume(tmp_path):
-    import os
-    import shlex
-    import subprocess
-    from pathlib import Path
-    from test_wsa1_5_launch import add_dataset
-    bash = Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Git/bin/bash.exe"
-    if not bash.is_file():
-        import shutil
-        found = shutil.which("bash")
-        if not found:
-            pytest.skip("Bash unavailable")
-        bash = Path(found)
-    collection = tmp_path / "collection with spaces"
-    repo_ids = [f"{task}/aloha-agilex_clean_50" for task in ["task_a", "task_b"]]
-    for repo in [*repo_ids, "task_a/aloha-agilex_randomized_500", "task_c/aloha-agilex_clean_50"]:
-        add_dataset(collection / repo)
-    (collection / "task_c/aloha-agilex_clean_50/data").rmdir()
-    env = {**os.environ, "WSA_DRY_RUN": "1", "DATA_ROOT": collection.as_posix(), "DATASET_REPO_ID": " ".join(repo_ids),
-           "CONDA_PREFIX": "/tmp/wsa15-conda",
-           "INIT_CHECKPOINT_PATH": "stage1/pretrained_model", "PET_NNODES": "2", "PET_NPROC_PER_NODE": "2",
-           "PET_NODE_RANK": "1", "PET_MASTER_ADDR": "10.0.0.1", "PET_MASTER_PORT": "29501"}
-    env.pop("RESUME_CONFIG", None)
-    env.pop("SPARSE_FRAME_ENCODING", None)
-    for name in ["IMAGE_AUGMENT", "OBJECT_PASTE", "IMAGE_AUGMENTATION_CONFIG", "FUTURE_FRAMES",
-                 "ACTION_HIDDEN_DIM", "ACTION_FFN_DIM", "RGB_LORA_RANK", "RGB_LORA_ALPHA", "RGB_LORA_DROPOUT",
-                 "RGB_LR", "MOTION_LR", "GOAL_LR", "HEADS_LR", "ACTION_LR",
-                 "SCHEDULER_WARMUP_STEPS", "SCHEDULER_DECAY_STEPS",
-                 "BATCH_SIZE", "NUM_WORKERS", "STEPS", "LOG_FREQ", "SAVE_FREQ", "EVAL_FREQ"]:
-        env.pop(name, None)
-    command = [str(bash), "launch/wsa_1_5_action_posttrain.sh"]
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True, check=True)
-    args = shlex.split(result.stdout)
-    assert f"--dataset.repo_id={' '.join(repo_ids)}" in args and f"--dataset.root={collection.as_posix()}" in args
-    assert "--num_processes=4" in args and "--machine_rank=1" in args
-    assert "--dataset.use_external_stats=true" in args and "--dataset.action_mode=delta" in args
-    assert "--policy.sparse_frame_encoding=joint" in args
-    assert "--dataset.image_augment=false" in args and "--dataset.object_paste=false" in args
-    assert not any(arg.startswith("--config_path=") for arg in args)
-    def parse_training(command_args):
-        training_args = command_args[command_args.index("src/lerobot/scripts/lerobot_train.py") + 1:]
-        with draccus.config_type("json"):
-            return draccus.parse(TrainPipelineConfig, args=[*training_args, "--policy.device=cpu"])
-
-    config = parse_training(args)
-    assert config.policy.enable_action and isinstance(config.dataset, WSA1_5DatasetConfig)
-    config.validate()
-    assert config.policy.future_frames == config.dataset.future_frames == 8
-    assert config.dataset.frame_stride == config.policy.history_frame_stride == 4
-    assert config.policy.rgb_finetune_mode == "full" and not config.policy.gradient_checkpointing
-    assert [config.policy.lambda_rgb, config.policy.lambda_motion, config.policy.lambda_3d] == [0.1] * 3
-    assert (config.policy.action_hidden_dim, config.policy.action_ffn_dim) == (1024, 4096)
-    assert (config.policy.rgb_lora_rank, config.policy.rgb_lora_alpha, config.policy.rgb_lora_dropout) == (16, 32, 0)
-    assert [config.policy.rgb_lr, config.policy.motion_lr, config.policy.goal_lr,
-            config.policy.heads_lr, config.policy.action_lr] == [1e-5, 5e-5, 5e-5, 1e-4, 1e-4]
-    assert (config.policy.scheduler_warmup_steps, config.policy.scheduler_decay_steps) == (2000, 100000)
-    assert (config.batch_size, config.num_workers, config.steps) == (4, 8, 100000)
-    assert (config.log_freq, config.save_freq, config.eval_freq) == (10, 10000, 20)
-    assert not any("action_goal_steps" in arg or "action_stats_path" in arg for arg in args)
-    env.pop("DATASET_REPO_ID")
-    env["DATA_ROOT"] = collection.as_posix() + "/"
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True, check=True)
-    discovered = next(arg.split("=", 1)[1] for arg in shlex.split(result.stdout) if arg.startswith("--dataset.repo_id="))
-    assert set(discovered.split()) == set(repo_ids)
-    env["DATASET_REPO_ID"] = repo_ids[0]
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True, check=True)
-    assert f"--dataset.repo_id={repo_ids[0]}" in shlex.split(result.stdout)
-    env["SPARSE_FRAME_ENCODING"] = "independent"
-    env.update(IMAGE_AUGMENT="true", OBJECT_PASTE="true", IMAGE_AUGMENTATION_CONFIG="custom recipe.yaml")
-    env.update(FUTURE_FRAMES="16", ACTION_HIDDEN_DIM="768", ACTION_FFN_DIM="3072", ACTION_SAMPLER_STEPS="5",
-               RGB_LR="2e-5", SCHEDULER_WARMUP_STEPS="10", SCHEDULER_DECAY_STEPS="200", SAVE_FREQ="50", LOG_FREQ="5")
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True, check=True)
-    args = shlex.split(result.stdout)
-    assert "--policy.sparse_frame_encoding=independent" in args
-    assert "--dataset.image_augment=true" in args and "--dataset.object_paste=true" in args
-    assert "--dataset.image_augmentation_config=custom recipe.yaml" in args
-    config = parse_training(args)
-    assert config.policy.future_frames == config.dataset.future_frames == 16
-    assert (config.policy.action_hidden_dim, config.policy.action_ffn_dim, config.policy.action_sampler_steps) == (768, 3072, 5)
-    assert config.policy.rgb_lr == 2e-5
-    assert (config.policy.scheduler_warmup_steps, config.policy.scheduler_decay_steps) == (10, 200)
-    assert (config.save_freq, config.log_freq) == (50, 5)
-    env["RESUME_CONFIG"] = "saved config/train_config.json"
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True, check=True)
-    args = shlex.split(result.stdout)
-    assert "--config_path=saved config/train_config.json" in args and "--resume=true" in args
-    assert not any(arg.startswith("--policy.") or arg.startswith("--dataset.") for arg in args)
-    env.pop("RESUME_CONFIG")
-    env["DATASET_REPO_ID"] = "task_a/aloha-agilex_randomized_500"
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True)
-    assert result.returncode != 0 and "Expected a complete RoboTwin clean dataset" in result.stderr
-    env["DATASET_REPO_ID"] = "task_c/aloha-agilex_clean_50"
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True)
-    assert result.returncode != 0 and "Expected a complete RoboTwin clean dataset" in result.stderr
-    env.pop("DATASET_REPO_ID")
-    env["DATA_ROOT"] = (collection / "task_a/aloha-agilex_randomized_500").as_posix()
-    result = subprocess.run(command, env=env, text=True, encoding="utf-8", capture_output=True)
-    assert result.returncode != 0 and "No complete aloha-agilex_clean_50 datasets" in result.stderr
 
 
 @pytest.mark.parametrize("mode,count,latent_frames,vae_calls", [

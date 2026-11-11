@@ -10,6 +10,7 @@ import torch
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.retarget_actions import action_offsets
 from lerobot.dataset_schemas import get_schema
 from lerobot.utils.constants import OBS_STATE, ACTION, HF_LEROBOT_HOME
 from lerobot.datasets.utils import write_json
@@ -31,7 +32,7 @@ def parse_args():
         "--chunk_size",
         type=int,
         required=True,
-        help="Chunk size used for delta action computation (episodes shorter than chunk_size are skipped).",
+        help="Training action chunk length; valid targets at episode boundaries are retained.",
     )
     p.add_argument(
         "--repo_ids",
@@ -53,6 +54,8 @@ def parse_args():
         help="Optional output root directory. If not set, uses HF_LEROBOT_HOME/stats/...",
     )
 
+    p.add_argument("--stride", type=int, default=1, help="Match policy.action_frame_stride (default: 1).")
+    p.add_argument("--output_file", type=Path, default=None, help="Write the exact stats.json path used by training.")
     return p.parse_args()
 
 
@@ -166,11 +169,9 @@ class RunningStats:
         }
 
 
-def _compute_one_repo(repo_id: str, action_mode: str, chunk_size: int) -> dict:
+def _compute_one_repo(repo_id: str, action_mode: str, chunk_size: int, stride: int = 1) -> dict:
     """Worker: compute stats for one repo, return serializable payload."""
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-
+    offsets = torch.from_numpy(action_offsets(chunk_size, stride))
     dataset = LeRobotDataset(repo_id)
     robot_type = dataset.meta.robot_type
 
@@ -198,36 +199,35 @@ def _compute_one_repo(repo_id: str, action_mode: str, chunk_size: int) -> dict:
         ep_len = int(to_idx - from_idx)
         total_frames += ep_len
 
-        if ep_len < chunk_size:
+        if ep_len == 0:
             skipped_episodes += 1
             continue
 
         curr_episode = dataset.hf_dataset.select(np.arange(from_idx, to_idx))
 
-        # Non-action stats always update; action stats depend on mode
+        # Current states occur once per anchor; actions use precisely the masked WSA windows.
         for key in keys:
-            if action_mode == "abs" or key not in mapping[ACTION]:
+            if key not in mapping[ACTION]:
                 val = torch.stack(curr_episode[key][:])
                 stats[key].update(val)
 
+        action = [torch.stack(curr_episode[k][:]) for k in mapping[ACTION]]
+        action = torch.cat([a if a.ndim > 1 else a[:, None] for a in action], dim=-1)
+        requested = torch.arange(ep_len)[:, None] + offsets[None]
+        valid = requested < ep_len
+        action_chunk = action[requested.clamp_max(ep_len - 1)]
         if action_mode == "delta":
-            action = [torch.stack(curr_episode[k][:]) for k in mapping[ACTION]]
-            action = [a if a.ndim > 1 else a[:, None] for a in action]
-            action = torch.cat(action, dim=-1)
-
             state = [torch.stack(curr_episode[k][:]) for k in mapping[OBS_STATE]]
             state = [s if s.ndim > 1 else s[:, None] for s in state]
             state = torch.cat(state, dim=-1)
 
-            truncated_state = state[0 : (ep_len - chunk_size + 1)]
-            action_chunk = action.unfold(dimension=0, size=chunk_size, step=1).permute(0, 2, 1)
-            delta_action = action_chunk - torch.where(mask, truncated_state, 0)[:, None]
-
-            sid, eid = 0, 0
-            for action_key in mapping[ACTION]:
-                eid += dataset.meta.features[action_key]["shape"][0]
-                stats[action_key].update(delta_action[..., sid:eid])
-                sid = eid
+            action_chunk = action_chunk - torch.where(mask, state, 0)[:, None]
+        targets = action_chunk[valid]
+        sid = 0
+        for action_key in mapping[ACTION]:
+            eid = sid + dataset.meta.features[action_key]["shape"][0]
+            stats[action_key].update(targets[:, sid:eid])
+            sid = eid
 
     payload = {k: stats[k].to_payload() for k in keys}
 
@@ -250,19 +250,6 @@ def _make_group_name(repo_ids: list[str]) -> str:
     return f"agg_{len(repo_ids)}repos_{h}"
 
 
-def _normalize_visual_stats(visual_stats: dict) -> dict:
-    """Convert numpy/torch entries to lists."""
-    out = {}
-    for k, v in visual_stats.items():
-        if isinstance(v, np.ndarray):
-            out[k] = v.tolist()
-        elif isinstance(v, torch.Tensor):
-            out[k] = v.detach().cpu().numpy().tolist()
-        else:
-            out[k] = v
-    return out
-
-
 def compute_norm_stats_multi(cfg):
     repo_ids = cfg.repo_ids
     action_mode = cfg.action_mode
@@ -279,7 +266,7 @@ def compute_norm_stats_multi(cfg):
             tqdm.tqdm(
                 pool.starmap(
                     _compute_one_repo,
-                    [(rid, action_mode, chunk_size) for rid in repo_ids],
+                    [(rid, action_mode, chunk_size, cfg.stride) for rid in repo_ids],
                 ),
                 total=len(repo_ids),
                 desc="Computing per-repo stats",
@@ -339,11 +326,6 @@ def compute_norm_stats_multi(cfg):
 
     output_dict = {k: global_stats[k].get_statistics() for k in keys0}
 
-    # # Visual stats: take from the first repo for simplicity
-    # first_ds = LeRobotDataset(repo_ids[0])
-    # for k in first_ds.meta.video_keys + first_ds.meta.image_keys:
-    #     output_dict[k] = _normalize_visual_stats(first_ds.meta.stats[k])
-
     # Output path
     group_name = _make_group_name(repo_ids)
     if cfg.output_dir:
@@ -351,17 +333,19 @@ def compute_norm_stats_multi(cfg):
     else:
         out_root = HF_LEROBOT_HOME / "stats"
         output_dir = out_root / robot_type / action_mode / group_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dict, output_dir / "stats.json")
+    output_file = cfg.output_file or output_dir / "stats.json"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output_dict, output_file)
 
     print("---------- done ----------")
     print(f"robot_type: {robot_type}")
     print(f"action_mode: {action_mode}")
     print(f"chunk_size: {chunk_size}")
     print(f"group_name: {group_name}")
-    print(f"output: {output_dir / 'stats.json'}")
+    print(f"stride: {cfg.stride}")
+    print(f"output: {output_file}")
     print(f"total_frames (sum of episode lengths): {total_frames}")
-    print(f"total_episodes: {total_episodes} (skipped: {skipped_episodes} episodes with len < chunk_size)")
+    print(f"total_episodes: {total_episodes} (skipped: {skipped_episodes} empty episodes)")
 
 
 if __name__ == "__main__":

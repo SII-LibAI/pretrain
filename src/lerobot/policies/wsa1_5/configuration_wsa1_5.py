@@ -73,6 +73,7 @@ class WSA1_5Config(PreTrainedConfig):
     scheduler_decay_steps: int = 600000
     scheduler_decay_lr_ratio: float = 0.1
     enable_action: bool = False
+    action_space: str = "legacy"  # unified72: EEF14, grippers4, hands40, arm joints14.
     state_dim: int | None = None
     action_dim: int | None = None
     action_hidden_dim: int = 1024
@@ -99,6 +100,10 @@ class WSA1_5Config(PreTrainedConfig):
         super().__post_init__()
         if type(self.enable_action) is not bool:
             raise TypeError("enable_action must be boolean")
+        if self.action_space not in {"legacy", "unified72"}:
+            raise ValueError("action_space must be legacy or unified72")
+        if self.action_space == "unified72" and (not self.enable_action or self.state_dim != 72 or self.action_dim != 72):
+            raise ValueError("unified72 requires enable_action=true and state_dim=action_dim=72")
         if self.sparse_frame_encoding not in {"joint", "independent"}:
             raise ValueError("sparse_frame_encoding must be joint or independent")
         if self.enable_action:
@@ -252,14 +257,21 @@ class WSA1_5DatasetConfig(DatasetConfig):
     motion_log_every: int = 10000
     video_decode_threads: int = 1
     prefetch_factor: int = 2
-    use_subtask: bool = False  # Controls prompt text in both stages; Stage-1 retains sidecar 3D labels.
-    allow_endframe_3d: bool = False
+    use_subtask: bool = False  # Controls subtask text, segments and endpoints in both stages.
+    allow_endframe_3d: bool = False  # Both stages may use the episode endpoint without a valid subtask.
+    embodiments: list[str] = field(default_factory=list)  # Empty selects every available IK embodiment.
+    retarget_stats_dir: str | None = None
+    annotation_row_group_cache_size: int = 2
     image_augment: bool = False
     object_paste: bool = False
     image_augmentation_config: str = "configs/augmentation/robotwin_conservative.yaml"
 
     def __post_init__(self):
         super().__post_init__()
+        if len(set(self.embodiments)) != len(self.embodiments):
+            raise ValueError("embodiments contains duplicate names")
+        if self.annotation_row_group_cache_size < 0:
+            raise ValueError("annotation_row_group_cache_size must be non-negative")
         if type(self.use_subtask) is not bool or type(self.allow_endframe_3d) is not bool:
             raise TypeError("use_subtask and allow_endframe_3d must be boolean")
         if type(self.image_augment) is not bool or type(self.object_paste) is not bool:

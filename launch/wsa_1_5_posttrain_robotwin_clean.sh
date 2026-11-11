@@ -16,8 +16,8 @@ export HF_LEROBOT_HOME="$PWD/data"
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    DATA_ROOT=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/RoboTwin
-    INIT_CHECKPOINT_PATH=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5/pretrain-h200-gf-bs64/checkpoints/520000/pretrained_model
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/RoboTwin}"
+    INIT_CHECKPOINT_PATH="${INIT_CHECKPOINT_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5/pretrain-h200-gf-bs64/checkpoints/520000/pretrained_model}"
     DATASET_REPO_ID="${DATASET_REPO_ID:-}"
     # 只发现 Clean 数据集
     DATASET_REPO_ID="$(
@@ -43,7 +43,7 @@ else
     TRAIN_ARGS=(
         --policy.type=WSA_1_5
         --policy.push_to_hub=false
-        --policy.enable_action=true
+        --policy.enable_action="${ENABLE_ACTION:-true}"
         --policy.init_checkpoint_path="$INIT_CHECKPOINT_PATH"
         --policy.future_frames="${FUTURE_FRAMES:-8}"
         --policy.enable_rgb="${ENABLE_RGB:-true}"
@@ -92,7 +92,7 @@ else
         --dataset.motion_width="${MOTION_WIDTH:-160}"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"
         --dataset.action_mode="${ACTION_MODE:-delta}"
-        --dataset.use_external_stats=true
+        --dataset.use_external_stats="${ENABLE_ACTION:-true}"
         --dataset.use_subtask="${USE_SUBTASK:-false}"
         --dataset.allow_endframe_3d="${ALLOW_ENDFRAME_3D:-true}"
         --dataset.image_augment="${IMAGE_AUGMENT:-false}"

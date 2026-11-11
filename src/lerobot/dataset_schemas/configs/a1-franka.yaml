@@ -1,5 +1,9 @@
 # Franka Emika Panda robot (A1 old format)
 robot_type: franka
+unified_action_reorder: &unified_franka
+  - [0, 7, 58, 65]
+  - [7, 8, 14, 15]
+unified_state_reorder: *unified_franka
 action_mask_spec: [7, -1]
 feature_mapping:
   observation.state:

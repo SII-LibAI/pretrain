@@ -1,5 +1,11 @@
 # AgileX 3RGB dual-arm robot (RoboMind)
 robot_type: agilex_3rgb
+unified_action_reorder: &unified_agilex_3rgb
+  - [0, 6, 58, 64]
+  - [6, 7, 14, 15]
+  - [7, 13, 65, 71]
+  - [13, 14, 16, 17]
+unified_state_reorder: *unified_agilex_3rgb
 action_mask_spec: [6, -1, 6, -1]
 # Reorder action dimensions with flexible src->dst mapping
 # Format: [src_start, src_end, dst_start, dst_end]

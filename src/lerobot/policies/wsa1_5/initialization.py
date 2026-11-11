@@ -65,18 +65,8 @@ def load_stage1_policy(module, directory):
     return report
 
 
-def load_world_policy(module, directory):
-    """Initialize Stage-1 from saved world weights, merging any RGB LoRA first."""
-    import json
-
-    directory = Path(directory)
-    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
-    state = read_checkpoint(directory / "model.safetensors")
-    omitted_action = {key for key in state if key.startswith(("action_expert.", "proprio_encoder."))} if config.get("enable_action", False) else set()
-    for key in omitted_action:
-        del state[key]
-
-    merged = 0
+def _merge_rgb_lora(module, config, state):
+    """Fold source adapters before fresh weight-only initialization."""
     if config.get("enable_action", False) and config.get("rgb_finetune_mode") == "lora":
         rank, alpha = config["rgb_lora_rank"], config["rgb_lora_alpha"]
         if type(rank) is not int or rank <= 0 or type(alpha) is not int or alpha <= 0:
@@ -100,12 +90,17 @@ def load_world_policy(module, directory):
                 raise ValueError(f"Non-finite source RGB LoRA weights: {prefix}")
             state[keys[0]] = (weight.float() + (b.float() @ a.float()) * (alpha / rank)).to(weight.dtype)
             del state[keys[1]], state[keys[2]]
-        merged = len(prefixes)
+        return len(prefixes)
+    return 0
 
+
+def _prepare_frozen_text(module, config, state):
     text_keys = {key for key in state if key.startswith("text_encoder.")}
     restored_text = 0
+    omitted_text = 0
     if config.get("load_text_encoder", False):
         if not module.config.load_text_encoder and module.text_encoder is None:
+            omitted_text = len(text_keys)
             for key in text_keys:
                 del state[key]
     elif text_keys:
@@ -117,6 +112,46 @@ def load_world_policy(module, directory):
         text_state = read_checkpoint(module.config.text_encoder_path)
         state.update({f"text_encoder.{key}": value for key, value in text_state.items()})
         restored_text = len(text_state)
+    return omitted_text, restored_text
+
+
+def load_action_initialization(module, directory):
+    """Start from Stage-1 or a matching mid-training policy, with fresh optimizer state."""
+    import json
+
+    directory = Path(directory)
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    if not config.get("enable_action", False):
+        load_stage1_policy(module, directory)
+        return False
+    if config.get("action_space", "legacy") != module.config.action_space:
+        raise ValueError("Action checkpoint layout differs; initialize unified72 from a Stage-1 world checkpoint")
+    state = read_checkpoint(directory / "model.safetensors")
+    merged = _merge_rgb_lora(module, config, state)
+    omitted, restored = _prepare_frozen_text(module, config, state)
+    expected = module.state_dict()
+    missing, unexpected = expected.keys() - state.keys(), state.keys() - expected.keys()
+    adapters = {key for key in expected if ".lora_a" in key or ".lora_b" in key}
+    if missing != adapters or unexpected:
+        raise ValueError(f"Action initialization mismatch: missing={sorted(missing - adapters)}, unexpected={sorted(unexpected)}")
+    load_report(module, state, name="Action checkpoint -> post-training", strict=False)
+    logging.info("[WSA init] restored trained Action/Proprio; merged_rgb_lora=%d omitted_frozen_umt5=%d "
+                 "restored_frozen_umt5=%d; optimizer/scheduler/RNG/step start fresh", merged, omitted, restored)
+    return True
+
+
+def load_world_policy(module, directory):
+    """Initialize Stage-1 from saved world weights, merging any RGB LoRA first."""
+    import json
+
+    directory = Path(directory)
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    state = read_checkpoint(directory / "model.safetensors")
+    omitted_action = {key for key in state if key.startswith(("action_expert.", "proprio_encoder."))} if config.get("enable_action", False) else set()
+    for key in omitted_action:
+        del state[key]
+    merged = _merge_rgb_lora(module, config, state)
+    _, restored_text = _prepare_frozen_text(module, config, state)
 
     report = load_report(module, state, name="Checkpoint -> Stage-1 world initialization", strict=True)
     logging.info("[WSA init] loaded=%d omitted_action=%d merged_rgb_lora=%d restored_frozen_umt5=%d; "
@@ -207,6 +242,20 @@ def load_report(module, state, *, name, strict=True):
     if strict and (report.missing_keys or report.unexpected_keys):
         raise RuntimeError(f"Incomplete {name} checkpoint: missing={report.missing_keys}, unexpected={report.unexpected_keys}")
     return report
+
+
+def initialize_action_from_rgb(action_expert, source):
+    """Transfer the loaded RGB/Wan backbone; only action input/output layers are new."""
+    state = action_expert.state_dict()
+    new_layers = ("action_encoder.", "head.")
+    backbone = {key: value for key, value in state.items() if not key.startswith(new_layers)}
+    converted, _ = interpolate_wan_state(source, backbone, apply_alpha_scaling=True)
+    missing = backbone.keys() - converted.keys()
+    if missing:
+        raise RuntimeError(f"Incomplete Action RGB backbone: missing={sorted(missing)}")
+    load_report(action_expert, {**state, **converted}, name="Action <- RGB backbone", strict=True)
+    logging.info("[WSA init] Action <- RGB backbone=%d tensors (width interpolation + Alpha Scaling); "
+                 "new layers=%s", len(converted), new_layers)
 
 
 class LoRALinear(nn.Linear):

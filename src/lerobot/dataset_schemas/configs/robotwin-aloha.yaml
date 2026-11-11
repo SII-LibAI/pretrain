@@ -1,5 +1,11 @@
 # AgileX ALOHA RobotWin dual-arm robot (uses end-effector pose)
 robot_type: aloha_robotwin
+unified_action_reorder: &unified_aloha_robotwin
+  - [0, 7, 0, 7]
+  - [7, 8, 14, 15]
+  - [8, 15, 7, 14]
+  - [15, 16, 16, 17]
+unified_state_reorder: *unified_aloha_robotwin
 # action_mask_spec: [6, 3, -4, -1, 6, 3, -4, -1]
 action_mask_spec: [3, -4, -1, 3, -4, -1]
 feature_mapping:

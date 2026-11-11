@@ -15,13 +15,13 @@ Design principles:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 
 from lerobot.transforms.utils import make_bool_mask
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 if TYPE_CHECKING:
     from .registry import SchemaRegistry
@@ -63,6 +63,9 @@ class DatasetSchema:
     state_dim: Optional[int] = None
     action_dim: Optional[int] = None
     action_layout: list[dict[str, Any]] = field(default_factory=list)
+    unified_action_reorder: Optional[list[list[int]]] = None
+    unified_state_reorder: Optional[list[list[int]]] = None
+    embodiment_name: str = ""
     description: str = ""
     base_schema: Optional[str] = None  # For configuration inheritance
     
@@ -84,6 +87,17 @@ class DatasetSchema:
     def get_action_keys(self) -> list[str]:
         """Get action key list"""
         return self.feature_mapping.get(ACTION, [ACTION])
+
+    def for_action_space(self, action_space: str) -> DatasetSchema:
+        """Select the explicit 72D mapping without changing legacy schema consumers."""
+        if action_space == "legacy":
+            return self
+        if action_space != "unified72":
+            raise ValueError(f"Unknown action space: {action_space}")
+        if self.unified_action_reorder is None or self.unified_state_reorder is None:
+            raise ValueError(f"Schema {self.robot_type!r} has no unified72 state/action mapping")
+        return replace(self, action_reorder=self.unified_action_reorder,
+                       state_reorder=self.unified_state_reorder)
     
     def resolve(self, registry: SchemaRegistry = None) -> DatasetSchema:
         """
@@ -134,6 +148,9 @@ class DatasetSchema:
             state_dim=self.state_dim or parent.state_dim,
             action_dim=self.action_dim or parent.action_dim,
             action_layout=self.action_layout or parent.action_layout,
+            unified_action_reorder=self.unified_action_reorder or parent.unified_action_reorder,
+            unified_state_reorder=self.unified_state_reorder or parent.unified_state_reorder,
+            embodiment_name=self.embodiment_name or parent.embodiment_name,
             description=self.description or parent.description,
             base_schema=None,  # Already resolved, no longer needed
         )
@@ -176,6 +193,9 @@ class DatasetSchema:
             state_dim=config.get("state_dim"),
             action_dim=config.get("action_dim"),
             action_layout=config.get("action_layout", []),
+            unified_action_reorder=config.get("unified_action_reorder"),
+            unified_state_reorder=config.get("unified_state_reorder"),
+            embodiment_name=config.get("embodiment_name", ""),
             description=config.get("description", ""),
             base_schema=config.get("base_schema"),
         )
@@ -203,6 +223,9 @@ class DatasetSchema:
             result["action_dim"] = self.action_dim
         if self.action_layout:
             result["action_layout"] = self.action_layout
+        for name in ("unified_action_reorder", "unified_state_reorder", "embodiment_name"):
+            if getattr(self, name):
+                result[name] = getattr(self, name)
         if self.description:
             result["description"] = self.description
         if self.base_schema:

@@ -71,6 +71,70 @@ def parse_policy(arguments):
     ]])
 
 
+@pytest.mark.parametrize("enable_action", [None, "true", "false"])
+def test_robotwin_launcher_selects_action_or_video_adaptation(tmp_path, bash, enable_action):
+    root = tmp_path / "RoboTwin"
+    clean = root / "task/aloha-agilex_clean_50"
+    add_dataset(clean)
+    add_dataset(root / "task/aloha-agilex_randomized_500")
+    env = {**os.environ, "WSA_DRY_RUN": "1", "CONDA_PREFIX": "/tmp/wsa15-conda",
+           "DATA_ROOT": root.as_posix(), "INIT_CHECKPOINT_PATH": (tmp_path / "stage1").as_posix(),
+           "USE_SUBTASK": "false", "ALLOW_ENDFRAME_3D": "true", "LOAD_TEXT_ENCODER": "false",
+           "OUTPUT_DIR": (tmp_path / "output").as_posix(),
+           "PET_NNODES": "1", "PET_NPROC_PER_NODE": "1", "PET_NODE_RANK": "0"}
+    for key in ("RESUME_CONFIG", "ENABLE_ACTION"):
+        env.pop(key, None)
+    if enable_action is not None:
+        env["ENABLE_ACTION"] = enable_action
+    script = "launch/wsa_1_5_posttrain_robotwin_clean.sh"
+    result = subprocess.run([bash, script], cwd=PROJECT, env=env, capture_output=True,
+                            text=True, encoding="utf-8", check=True)
+    command = shlex.split(result.stdout.splitlines()[-1])
+    arguments = command[command.index("src/lerobot/scripts/lerobot_train.py") + 1:]
+    config = draccus.parse(TrainPipelineConfig, args=["--policy.device=cpu", *arguments])
+    expected_action = enable_action != "false"
+    assert config.policy.enable_action == expected_action
+    assert config.dataset.use_external_stats == expected_action
+    assert not config.dataset.use_subtask and config.dataset.allow_endframe_3d
+    assert config.policy.init_checkpoint_path == env["INIT_CHECKPOINT_PATH"]
+    assert config.dataset.repo_id == clean.as_posix() and not config.resume
+    assert config.policy.future_frames == config.dataset.future_frames
+    assert config.policy.use_3d_supervision and config.policy.lambda_rgb > 0
+    if not expected_action:
+        assert "action" not in config.policy.get_scheduler_preset().group_schedules
+    env["RESUME_CONFIG"] = "/tmp/saved/train_config.json"
+    result = subprocess.run([bash, script], cwd=PROJECT, env=env, capture_output=True,
+                            text=True, encoding="utf-8", check=True)
+    command = shlex.split(result.stdout.splitlines()[-1])
+    assert "--resume=true" in command and not any(arg.startswith("--policy.") for arg in command)
+
+
+def test_midtrain_launcher_online_unified_settings_and_resume(tmp_path, bash):
+    env = {**os.environ, "WSA_DRY_RUN": "1", "CONDA_PREFIX": "/tmp/wsa15-conda",
+           "INIT_CHECKPOINT_PATH": "/tmp/stage1", "RETARGET_STATS_DIR": "/tmp/stats",
+           "DATASET_REPO_ID": "/tmp/native /tmp/human /tmp/umi", "EMBODIMENTS": '["piper","ur7e_wuji"]',
+           "ACTION_MODE": "abs", "ACTION_CHUNK_SIZE": "16", "ACTION_FRAME_STRIDE": "2",
+           "OUTPUT_DIR": (tmp_path / "midtrain").as_posix(),
+           "PET_NNODES": "1", "PET_NPROC_PER_NODE": "1", "PET_NODE_RANK": "0"}
+    env.pop("RESUME_CONFIG", None)
+    def run():
+        result = subprocess.run([bash, "launch/wsa_1_5_midtrain.sh"], cwd=PROJECT, env=env,
+                                capture_output=True, text=True, encoding="utf-8", check=True)
+        command = shlex.split(result.stdout)
+        return command[command.index("src/lerobot/scripts/lerobot_train.py") + 1:]
+    arguments = run()
+    config = draccus.parse(TrainPipelineConfig, args=["--policy.device=cpu", *arguments])
+    assert config.policy.enable_action and config.policy.action_space == "unified72"
+    assert config.policy.action_dim == config.policy.state_dim == 72
+    assert config.policy.load_text_encoder and config.dataset.retarget_stats_dir == "/tmp/stats"
+    assert config.dataset.embodiments == ["piper", "ur7e_wuji"]
+    assert config.policy.action_mode == config.dataset.action_mode == "abs"
+    assert config.policy.action_chunk_size == 16 and config.policy.action_frame_stride == 2
+    assert config.policy.future_frames == config.dataset.future_frames
+    env["RESUME_CONFIG"] = "/tmp/train_config.json"
+    assert run() == ["--config_path=/tmp/train_config.json", "--resume=true"]
+
+
 @pytest.mark.parametrize("image_augment,object_paste", [("false", "false"), ("true", "false"),
                                                        ("false", "true"), ("true", "true")])
 def test_launcher_passes_independent_rgb_augmentation_switches(launch, image_augment, object_paste):

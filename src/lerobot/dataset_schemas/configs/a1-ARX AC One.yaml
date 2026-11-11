@@ -1,5 +1,11 @@
 # ARX AC One dual-arm robot (A1 new format)
 robot_type: "ARX AC One"
+unified_action_reorder: &unified__ARX_AC_One_
+  - [0, 6, 58, 64]
+  - [6, 7, 14, 15]
+  - [7, 13, 65, 71]
+  - [13, 14, 16, 17]
+unified_state_reorder: *unified__ARX_AC_One_
 action_mask_spec: [6, -1, 6, -1]
 # Reorder action dimensions with flexible src->dst mapping
 # Format: [src_start, src_end, dst_start, dst_end]

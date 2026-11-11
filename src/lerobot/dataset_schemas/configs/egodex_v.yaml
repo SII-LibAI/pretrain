@@ -37,6 +37,13 @@
   description: "Absolute dual-hand human EEF pose and grasp"
 
 - robot_type: egodex_synthetic_piper
+  unified_action_reorder: &unified_egodex_synthetic_piper
+    - [8, 14, 58, 64]
+    - [14, 16, 14, 16]
+    - [0, 6, 65, 71]
+    - [6, 8, 16, 18]
+  unified_state_reorder: *unified_egodex_synthetic_piper
+  embodiment_name: piper
   state_dim: 16
   action_dim: 16
   action_mode: joint
@@ -60,6 +67,29 @@
   description: "Dual Piper arm with grippers"
   
 - robot_type: egodex_synthetic_piper_inspire
+  unified_action_reorder: &unified_egodex_synthetic_piper_inspire
+    - [20, 26, 58, 64]
+    - [0, 6, 65, 71]
+    - [36, 40, 18, 22]
+    - [28, 29, 22, 23]
+    - [29, 30, 24, 25]
+    - [30, 31, 26, 27]
+    - [31, 32, 28, 29]
+    - [34, 35, 30, 31]
+    - [35, 36, 32, 33]
+    - [32, 33, 34, 35]
+    - [33, 34, 36, 37]
+    - [16, 20, 38, 42]
+    - [8, 9, 42, 43]
+    - [9, 10, 44, 45]
+    - [10, 11, 46, 47]
+    - [11, 12, 48, 49]
+    - [14, 15, 50, 51]
+    - [15, 16, 52, 53]
+    - [12, 13, 54, 55]
+    - [13, 14, 56, 57]
+  unified_state_reorder: *unified_egodex_synthetic_piper_inspire
+  embodiment_name: piper_inspire
   state_dim: 40
   action_dim: 40
   action_mode: joint
@@ -72,9 +102,11 @@
   state_reorder: *piper_inspire_reorder
   action_layout:
     - {name: left_arm, size: 6}
-    - {name: left_hand, size: 14}
+    - {name: left_original_gripper, size: 2}
+    - {name: left_hand, size: 12}
     - {name: right_arm, size: 6}
-    - {name: right_hand, size: 14}
+    - {name: right_original_gripper, size: 2}
+    - {name: right_hand, size: 12}
   feature_mapping:
     observation.state: [observation.state]
     action: [action]
@@ -83,6 +115,13 @@
   description: "Dual Piper arm with Inspire hands"
 
 - robot_type: egodex_synthetic_franka
+  unified_action_reorder: &unified_egodex_synthetic_franka
+    - [9, 16, 58, 65]
+    - [16, 18, 14, 16]
+    - [0, 7, 65, 72]
+    - [7, 9, 16, 18]
+  unified_state_reorder: *unified_egodex_synthetic_franka
+  embodiment_name: franka
   state_dim: 18
   action_dim: 18
   action_mode: joint
@@ -106,6 +145,13 @@
   description: "Dual Franka arm with parallel grippers"
 
 - robot_type: egodex_synthetic_arx_l5
+  unified_action_reorder: &unified_egodex_synthetic_arx_l5
+    - [8, 14, 58, 64]
+    - [14, 16, 14, 16]
+    - [0, 6, 65, 71]
+    - [6, 8, 16, 18]
+  unified_state_reorder: *unified_egodex_synthetic_arx_l5
+  embodiment_name: arx_l5
   state_dim: 16
   action_dim: 16
   action_mode: joint
@@ -129,6 +175,11 @@
   description: "Dual ARX L5 arm with grippers"
 
 - robot_type: egodex_synthetic_xarm7
+  unified_action_reorder: &unified_egodex_synthetic_xarm7
+    - [7, 14, 58, 65]
+    - [0, 7, 65, 72]
+  unified_state_reorder: *unified_egodex_synthetic_xarm7
+  embodiment_name: xarm7
   state_dim: 14
   action_dim: 14
   action_mode: joint
@@ -149,6 +200,11 @@
   description: "Dual xArm7 in compact left-first layout"
 
 - robot_type: egodex_synthetic_rm75
+  unified_action_reorder: &unified_egodex_synthetic_rm75
+    - [7, 14, 58, 65]
+    - [0, 7, 65, 72]
+  unified_state_reorder: *unified_egodex_synthetic_rm75
+  embodiment_name: rm75
   state_dim: 14
   action_dim: 14
   action_mode: joint
@@ -169,6 +225,11 @@
   description: "Dual RM75 in compact left-first layout"
 
 - robot_type: egodex_synthetic_ur7e
+  unified_action_reorder: &unified_egodex_synthetic_ur7e
+    - [6, 12, 58, 64]
+    - [0, 6, 65, 71]
+  unified_state_reorder: *unified_egodex_synthetic_ur7e
+  embodiment_name: ur7e
   state_dim: 12
   action_dim: 12
   action_mode: joint
@@ -189,6 +250,13 @@
   description: "Dual UR7e in compact left-first layout"
 
 - robot_type: egodex_synthetic_ur7e_wuji
+  unified_action_reorder: &unified_egodex_synthetic_ur7e_wuji
+    - [26, 32, 58, 64]
+    - [32, 52, 18, 38]
+    - [0, 6, 65, 71]
+    - [6, 26, 38, 58]
+  unified_state_reorder: *unified_egodex_synthetic_ur7e_wuji
+  embodiment_name: ur7e_wuji
   state_dim: 52
   action_dim: 52
   action_mode: joint
