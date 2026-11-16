@@ -67,33 +67,28 @@
   description: "Dual Piper arm with grippers"
   
 - robot_type: egodex_synthetic_piper_inspire
+  # Only active hand joints: thumb pitch/yaw, then index/middle/ring/pinky flexion.
   unified_action_reorder: &unified_egodex_synthetic_piper_inspire
     - [20, 26, 58, 64]
     - [0, 6, 65, 71]
-    - [36, 40, 18, 22]
+    - [37, 38, 18, 19]
+    - [36, 37, 19, 20]
     - [28, 29, 22, 23]
-    - [29, 30, 24, 25]
     - [30, 31, 26, 27]
-    - [31, 32, 28, 29]
     - [34, 35, 30, 31]
-    - [35, 36, 32, 33]
     - [32, 33, 34, 35]
-    - [33, 34, 36, 37]
-    - [16, 20, 38, 42]
+    - [17, 18, 38, 39]
+    - [16, 17, 39, 40]
     - [8, 9, 42, 43]
-    - [9, 10, 44, 45]
     - [10, 11, 46, 47]
-    - [11, 12, 48, 49]
     - [14, 15, 50, 51]
-    - [15, 16, 52, 53]
     - [12, 13, 54, 55]
-    - [13, 14, 56, 57]
   unified_state_reorder: *unified_egodex_synthetic_piper_inspire
   embodiment_name: piper_inspire
   state_dim: 40
   action_dim: 40
   action_mode: joint
-  action_mask_spec: [6, -14, 6, -14]
+  action_mask_spec: [6, -2, 12, 6, -2, 12]
   action_reorder: &piper_inspire_reorder
     - [20, 26, 0, 6]
     - [26, 40, 6, 20]
@@ -260,7 +255,7 @@
   state_dim: 52
   action_dim: 52
   action_mode: joint
-  action_mask_spec: [6, -20, 6, -20]
+  action_mask_spec: [52]
   action_reorder: &ur7e_wuji_reorder
     - [26, 32, 0, 6]
     - [32, 52, 6, 26]

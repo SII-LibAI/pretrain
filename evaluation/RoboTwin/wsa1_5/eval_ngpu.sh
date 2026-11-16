@@ -18,7 +18,6 @@ if [[ ! "${JOBS_PER_GPU}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: JOBS_PER_GPU must be a positive integer; got ${JOBS_PER_GPU}" >&2
     exit 2
 fi
-export ACTION_SAMPLER_STEPS=20
 
 # ============================================================
 # Project paths

@@ -140,6 +140,26 @@ def test_stats_union_handles_source_without_dexterous_columns(tmp_path):
     assert set(selected) == {"egodex_synthetic_piper"}
 
 
+@pytest.mark.parametrize("robot_type", ["fastumi_single", "fastumi_dual", "Hunyuan_eef",
+                                       "genrobot_das_bimanual", "egopro", "egostand"])
+def test_new_source_retarget_codec_and_prompt(tmp_path, monkeypatch, robot_type):
+    dataset = retarget_dataset(tmp_path, monkeypatch, bodies=("piper",), robot_type=robot_type)
+    name = f"{robot_type}_synthetic_piper"
+    sample = dataset[0]
+    assert sample["embodiment"] == name
+    assert f"Robot Embodiment: {name}" in sample["condition_text"]
+    state, future = dataset.retarget_source.read_window(0, 0)
+    assert state.shape == (30,) and future.shape == (4, 30)  # dual-arm IK16 + EEF14
+    codec = dataset.retarget_codecs[0]
+    physical = codec.decode(sample["targets"]["action"], {"observation.state": state})
+    expected = torch.zeros(4, 72)
+    for lo, hi, first, last in codec.schema.action_reorder:
+        expected[:, first:last] = torch.from_numpy(future[:, lo:hi])
+    torch.testing.assert_close(physical, expected, atol=2e-5, rtol=1e-5)
+    mask = sample["targets"]["action_valid_mask"]
+    assert mask[0].sum() == 30 and not mask[:, 18:58].any()
+
+
 @pytest.mark.parametrize("workers", [1, 2])
 def test_stats_merge_only_matching_full_schema_names(tmp_path, workers):
     roots = [tmp_path / name for name in ("egodex_a", "egodex_b", "egoverse")]

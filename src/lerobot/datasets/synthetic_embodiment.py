@@ -36,6 +36,12 @@ HUMAN_EEF_VALID_KEYS = ("human_eef.right.valid", "human_eef.left.valid")
 EMBODIMENT_SCHEMA_PREFIXES = {
     "egodex_v": "egodex_synthetic_",
     "egoverse_human_bimanual": "egoverse_synthetic_",
+    "egopro": "egopro_synthetic_",
+    "egostand": "egostand_synthetic_",
+    "fastumi_single": "fastumi_single_synthetic_",
+    "fastumi_dual": "fastumi_dual_synthetic_",
+    "Hunyuan_eef": "Hunyuan_eef_synthetic_",
+    "genrobot_das_bimanual": "genrobot_das_bimanual_synthetic_",
 }
 
 
