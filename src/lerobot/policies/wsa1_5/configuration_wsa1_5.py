@@ -243,7 +243,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     ])
     # Optional source keys in precisely the same order; empty entries mean absent.
     view_keys: list[str] = field(default_factory=list)
-    future_frames: int = 32
+    future_frames: int = 8
     frame_stride: int = 4
     rgb_height: int = 384
     rgb_width: int = 320
@@ -254,7 +254,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     text_embedding_dir: str = "meta/wsa1_5_text_embeddings"
     use_imagenet_stats: bool = False  # Normalization is explicit in the adapter.
     use_external_stats: bool = False
-    motion_log_every: int = 10000
+    motion_log_every: int = 1000000
     video_decode_threads: int = 1
     prefetch_factor: int = 2
     use_subtask: bool = False  # Controls subtask text, segments and endpoints in both stages.

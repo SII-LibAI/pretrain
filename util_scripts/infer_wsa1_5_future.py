@@ -1,6 +1,14 @@
+"""
+python util_scripts/infer_wsa1_5_future.py \
+    --checkpoint /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_smoketest/2026_11_13_11_13_44/checkpoints/005000/pretrained_model  \
+    --dataset-root /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/smoke_test/table_001 \
+    --output /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/future/wsa15/egodex/02 \
+    --device cuda \
+    --seed 42 \
+    --omega-checkpoint /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/vggt-omega/vggt_omega_1b_256_text.pt
+"""
 """从 LeRobot V3 抽取当前观测和文本，按 checkpoint 配置预测未来 RGB。"""
 import argparse
-import json
 from pathlib import Path
 import sys
 import subprocess
@@ -63,30 +71,208 @@ def load_observation(args, config):
     source = {"dataset_root": str(root), "episode_index": episode, "frame_index": frame,
               "start_timestamp": float(dataset.timestamps[index]), "frame_stride": data.frame_stride,
               "future_frame_offsets": [i * data.frame_stride for i in range(1, config.future_frames + 1)],
-              "view_keys": dataset.view_keys}
-    return canvas * 2 - 1, valid, segment.text, source, root / data.text_embedding_dir
+              "view_keys": dataset.view_keys,
+              "goal_reference_frame_index": (int(dataset.frame_indices[segment.last]) if segment.metadata_valid else
+                                               len(dataset.timestamps) - 1 if data.allow_endframe_3d else None)}
+    from lerobot.policies.wsa1_5.teacher import preprocess_omega_views
+
+    reference = (dataset, index, preprocess_omega_views([view[0] for view in views])[None])
+    return canvas * 2 - 1, valid, segment.text, source, root / data.text_embedding_dir, reference
 
 
-def save_prediction(output, observed, prediction, config, prompt, seed, source):
+def load_action_condition(reference, config):
+    """Match Action training conditions using only current state and past RGB."""
+    from lerobot.policies.wsa1_5.dataset_wsa1_5 import compose_rgb_views
+    from lerobot.policies.wsa1_5.utils.temporal import history_indices
+
+    dataset, index, _ = reference
+    codec = dataset.action_codec
+    if not codec.has_state:
+        raise ValueError("Action checkpoint 的视频推理需要当前 state")
+    table = dataset.base.hf_dataset.select_columns(codec.state_keys).with_format("arrow")[index:index + 1]
+    inputs = codec.encode({key: table[key][0].as_py() for key in codec.state_keys})
+    if config.num_history_frame:
+        episode = int(dataset.episode_indices[index])
+        first = dataset.meta.episodes[episode]["dataset_from_index"]
+        indices, time_valid = history_indices(index - first, config.num_history_frame, config.history_frame_stride)
+        timestamps = dataset.timestamps[first + indices[:-1]]
+        views, flags = zip(*(dataset._decode(key, timestamps, episode) for key in dataset.view_keys), strict=True)
+        rgb, valid = compose_rgb_views(views, flags, config.rgb_height, config.rgb_width)
+        inputs.update(history_rgb=rgb * 2 - 1, history_valid=valid & time_valid[:-1, None, None, None])
+    return {key: value[None] for key, value in inputs.items()}
+
+
+def load_future_gt(reference, episode):
+    import torch.nn.functional as F
+    from lerobot.policies.wsa1_5.dataset_wsa1_5 import LeRobotDataset, compose_rgb_views
+
+    dataset, index, _ = reference
+    queries, padding = LeRobotDataset._get_query_indices(dataset, index, episode)
+    key = dataset.config.motion_key
+    indices = queries[key]
+    timestamps = dataset.timestamps[indices]
+    views, flags = zip(*(dataset._decode(view, timestamps, episode) for view in dataset.view_keys), strict=True)
+    rgb, valid = compose_rgb_views(views, flags, dataset.config.rgb_height, dataset.config.rgb_width)
+    time_valid = ~padding[f"{key}_is_pad"]
+    valid &= time_valid[:, None, None, None]
+    motion, motion_valid = dataset._decode(key, timestamps, episode)
+    motion = F.interpolate(motion, size=(dataset.config.motion_height, dataset.config.motion_width),
+                           mode="bilinear", align_corners=False)
+    motion_valid &= time_valid
+    return rgb.masked_fill(~valid, 0), valid, time_valid, motion.masked_fill(~motion_valid[:, None, None, None], 0), motion_valid
+
+
+def load_goal_gt(reference, source, omega_path, device, dtype):
+    import torch
+    from lerobot.policies.wsa1_5.teacher import OmegaTeacher, preprocess_omega_views
+
+    frame = source["goal_reference_frame_index"]
+    if frame is None:
+        return None  # No target annotation: never substitute an arbitrary future frame.
+    dataset, _, _ = reference
+    views, flags = zip(*(dataset._decode(key, [dataset.timestamps[frame]], source["episode_index"])
+                         for key in dataset.view_keys), strict=True)
+    valid = torch.tensor([[bool(flag[0]) for flag in flags]])
+    if not valid.any():
+        return None
+    teacher = OmegaTeacher(str(omega_path), dtype=dtype)
+    features, mask = teacher.features([[view[0] for view in views]], valid, torch.device(device))
+    images = preprocess_omega_views([view[0] for view in views])[None]
+    # Reuse the exact same decoder for target and predicted G features.
+    decoder = teacher.model.dense_head.float().eval().requires_grad_(False)
+    return decoder, {"goal_3d_layer_features": features, "goal_3d_valid": mask}, images
+
+
+def load_depth_decoder(path, device):
+    import torch
+    from vggt_omega.models.heads import DenseHead
+    from lerobot.policies.wsa1_5.initialization import load_report, read_checkpoint
+    from lerobot.policies.wsa1_5.modeling_wsa1_5 import construction_dtype
+
+    state = read_checkpoint(path)
+    weights = {key.removeprefix("dense_head."): value for key, value in state.items()
+               if key.startswith("dense_head.")}
+    del state
+    if not weights:
+        raise ValueError("Omega checkpoint 不包含 dense_head 权重")
+    with construction_dtype(torch.float32):
+        decoder = DenseHead(dim_in=2048, patch_size=16)
+    load_report(decoder, weights, name="VGGT-Omega DenseHead", strict=True)
+    return decoder.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
+
+
+def decode_goal_depth(decoder, prediction, images, device):
+    import torch
+
+    layers = tuple(decoder.intermediate_layer_idx)
+    if layers != (4, 11, 17, 23):
+        raise ValueError(f"Omega decoder 层索引不匹配：{layers}")
+    features = prediction["goal_3d_layer_features"]
+    tokens = [None] * (max(layers) + 1)  # DenseHead only consumes its four cached layers.
+    for layer in layers:
+        value = features[layer]
+        if value.shape != (1, 3, 273, 2048) or not torch.isfinite(value).all():
+            raise ValueError(f"非法预测 G 特征：layer={layer}")
+        tokens[layer] = value.to(device=device, dtype=torch.float32)
+    valid = prediction["goal_3d_valid"]
+    if valid.dtype != torch.bool or valid.shape != (1, 3, 273):
+        raise ValueError("3D token validity 必须是 bool [1,3,273]")
+    if not torch.equal(valid, valid[..., :1].expand_as(valid)) or not valid.any():
+        raise ValueError("3D token validity 必须按完整视角标记，且至少一个视角有效")
+    with torch.inference_mode(), torch.autocast(device_type=torch.device(device).type, enabled=False):
+        depth, confidence = decoder(tokens, images=images.to(device=device, dtype=torch.float32), patch_token_start=17)
+    if depth.shape != (1, 3, 256, 256, 1) or confidence.shape != (1, 3, 256, 256):
+        raise ValueError("Omega decoder 输出尺寸错误")
+    if not torch.isfinite(depth).all() or not torch.isfinite(confidence).all() or (depth <= 0).any():
+        raise FloatingPointError("Omega decoder 输出非有限或非正深度")
+    mask = valid[0, :, 0].cpu()
+    return (depth[0, ..., 0].float().cpu().masked_fill(~mask[:, None, None], 0),
+            confidence[0].float().cpu().masked_fill(~mask[:, None, None], 0), mask)
+
+
+def image_pair(gt, predicted, left_label, right_label, size):
+    from PIL import Image, ImageDraw
+
+    width, height = size
+    pair = Image.new("RGB", (width * 2, height + 24))
+    if gt is not None:
+        pair.paste(gt, (0, 24))
+    if predicted is not None:
+        pair.paste(predicted, (width, 24))
+    draw = ImageDraw.Draw(pair)
+    draw.text((4, 4), left_label, fill="white")
+    draw.text((width + 4, 4), right_label, fill="white")
+    return pair
+
+
+def save_depth(output, predicted, target, goal_frame):
+    import numpy as np
+    from PIL import Image
+    from matplotlib import colormaps
+
+    datasets = [predicted] + ([target] if target is not None else [])
+    values = np.concatenate([depth[valid].numpy().reshape(-1) for depth, _, valid in datasets])
+    low, high = map(float, np.percentile(values, [2, 98]))
+    overview = Image.new("RGB", (512, 3 * 280))
+    for view in range(3):
+        images = []
+        for result in (target, predicted):
+            if result is None or not result[2][view]:
+                images.append(None)
+                continue
+            depth = result[0][view].numpy()
+            scaled = np.clip((depth - low) / (high - low), 0, 1) if high > low else np.zeros_like(depth)
+            images.append(Image.fromarray((colormaps["turbo"](scaled)[..., :3] * 255).round().astype(np.uint8)))
+        left = f"GT (Omega) view {view}, frame {goal_frame}" if images[0] is not None else f"GT view {view}: unavailable"
+        right = f"Predicted G view {view}" if images[1] is not None else f"Predicted view {view}: invalid"
+        overview.paste(image_pair(*images, left, right, (256, 256)), (0, view * 280))
+    overview.save(output / "goal_3d.png")
+    return {"color_min": low, "color_max": high, "gt_available": target is not None,
+            "gt_source": "Omega pseudo-ground-truth on the annotated goal image"}
+
+
+def save_prediction(output, observed, prediction, config, source, gt):
     from PIL import Image
     import torch
+
+    def pixels(value):
+        if not torch.isfinite(value).all() or (value < 0).any() or (value > 1).any():
+            raise ValueError("Visualization pixels must be finite and in [0,1]")
+        return (value.detach().cpu().float() * 255).round().to(torch.uint8).permute(0, 2, 3, 1).numpy()
 
     future = prediction["future_rgb"]
     expected = (1, config.future_frames, 3, config.rgb_height, config.rgb_width)
     if future is None or tuple(future.shape) != expected:
         raise ValueError(f"Expected future RGB shape {expected}")
-    if not torch.isfinite(future).all() or (future < 0).any() or (future > 1).any():
-        raise ValueError("Predicted RGB must be finite and in [0,1]")
-    frames = torch.cat([(observed.cpu().float() + 1) / 2, future[0].cpu().float()])
-    pixels = (frames * 255).round().to(torch.uint8).permute(0, 2, 3, 1).numpy()
-    for index, image in enumerate(pixels):
-        name = "current.png" if index == 0 else f"future_{index:03d}.png"
-        Image.fromarray(image).save(output / name)
-    (output / "prediction.json").write_text(json.dumps({
-        "prompt": prompt, "seed": seed, "future_frames": config.future_frames,
-        "sampler_steps": config.sampler_steps, "rgb_height": config.rgb_height,
-        "rgb_width": config.rgb_width, **source,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rgb_pred = pixels(future[0])
+    Image.fromarray(pixels((observed.cpu().float() + 1) / 2)[0]).save(output / "current.png")
+    gt_rgb, rgb_valid, time_valid, gt_motion, motion_valid = gt
+    rgb_gt, motion_gt = pixels(gt_rgb), pixels(gt_motion)
+    motion = prediction.get("future_motion")
+    if config.enable_motion and motion is None:
+        raise ValueError("Motion 分支已启用，但模型没有返回 future_motion")
+    motion_pred = None
+    if motion is not None:
+        expected_motion = (1, config.future_frames, 3, config.motion_height, config.motion_width)
+        if tuple(motion.shape) != expected_motion:
+            raise ValueError(f"Expected future motion shape {expected_motion}")
+        motion_pred = pixels(motion[0])
+    width = max(config.rgb_width, config.motion_width) * 2
+    for index, offset in enumerate(source["future_frame_offsets"]):
+        status = "padding - invalid" if not time_valid[index] else (
+            "valid" if rgb_valid[index].all() else "partial views")
+        rgb_pair = image_pair(Image.fromarray(rgb_gt[index]), Image.fromarray(rgb_pred[index]),
+                              f"RGB GT +{offset}: {status}", f"RGB prediction +{offset}",
+                              (config.rgb_width, config.rgb_height))
+        motion_pair = image_pair(Image.fromarray(motion_gt[index]) if motion_valid[index] else None,
+                                 Image.fromarray(motion_pred[index]) if motion_pred is not None else None,
+                                 f"Motion GT +{offset}" if motion_valid[index] else f"Motion GT +{offset}: invalid",
+                                 f"Motion prediction +{offset}" if motion_pred is not None else "Motion prediction: disabled",
+                                 (config.motion_width, config.motion_height))
+        combined = Image.new("RGB", (width, rgb_pair.height + motion_pair.height))
+        combined.paste(rgb_pair, ((width - rgb_pair.width) // 2, 0))
+        combined.paste(motion_pair, ((width - motion_pair.width) // 2, rgb_pair.height))
+        combined.save(output / f"future_{index + 1:03d}.png")
 
 
 def main():
@@ -98,6 +284,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="空输出目录")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--omega-checkpoint", type=Path, help="256 Text-Alignment Omega 权重；默认使用模型配置中的路径")
     text = parser.add_mutually_exclusive_group()
     text.add_argument("--text-cache", type=Path, help="已有的文本 embedding 缓存目录")
     text.add_argument("--text-encoder-path", type=Path, help="离线文本 checkpoint 的外部 UMT5 权重")
@@ -123,8 +310,13 @@ def main():
     config = PreTrainedConfig.from_pretrained(args.checkpoint)
     if not isinstance(config, WSA1_5Config) or not config.enable_rgb:
         raise ValueError("需要启用 RGB 分支的 WSA1.5 checkpoint")
+    if not config.enable_3d_queries:
+        raise ValueError("深度解码需要 checkpoint 启用 G/3D queries")
+    omega_path = args.omega_checkpoint or config.omega_checkpoint_path
+    if not omega_path or not Path(omega_path).is_file():
+        parser.error("请用 --omega-checkpoint 提供 VGGT-Omega-1B-256-Text-Alignment 权重")
     config.device = args.device
-    observed, valid, prompt, source, default_cache = load_observation(args, config)
+    observed, valid, prompt, source, default_cache, reference = load_observation(args, config)
     condition = {}
     if args.text_cache or (not config.load_text_encoder and not args.text_encoder_path):
         context, text_valid = TextEmbeddingCache(args.text_cache or default_cache, config.max_text_length,
@@ -143,15 +335,36 @@ def main():
                                           config.max_text_length, config.text_dim)
         condition = {"text_embedding": context.to(args.device), "text_valid": text_valid.to(args.device)}
         del encoder, tokenizer
+    if config.enable_action:
+        # This video-only command uses RGB's step count for the joint rollout.
+        config.action_sampler_steps = config.sampler_steps
     policy = WSA1_5_Policy.from_pretrained(args.checkpoint, config=config).eval()
     print(f"样本：{source['dataset_root']} episode={source['episode_index']} frame={source['frame_index']}", flush=True)
     print(f"预测未来 {config.future_frames} 帧，尺寸 {config.rgb_height}x{config.rgb_width}，"
           f"采样步数 {config.sampler_steps}", flush=True)
-    prediction = policy.predict_future(observed.to(args.device), [prompt], seed=args.seed,
-                                        observed_valid=valid.to(args.device), **condition)
+    source.update(checkpoint=str(args.checkpoint.resolve()), enable_action=config.enable_action)
+    if config.enable_action:
+        batch = {"observed_rgb": observed.to(args.device), "observed_valid": valid.to(args.device),
+                 "condition_text": [prompt], **condition,
+                 **{key: value.to(args.device) for key, value in load_action_condition(reference, config).items()}}
+        prediction = policy.predict_action_chunk(batch, seed=args.seed, return_normalized=True,
+                                                  return_world=True)
+    else:
+        prediction = policy.predict_future(observed.to(args.device), [prompt], seed=args.seed,
+                                            observed_valid=valid.to(args.device), **condition)
     args.output.mkdir(parents=True, exist_ok=True)
-    save_prediction(args.output, observed, prediction, config, prompt, args.seed, source)
-    print(f"已保存 current.png、{config.future_frames} 张 future_*.png 和 prediction.json：{args.output}")
+    # Load GT only after generation; it cannot enter the model's conditioning path.
+    gt = load_future_gt(reference, source["episode_index"])
+    target = load_goal_gt(reference, source, omega_path, args.device, getattr(torch, config.dtype))
+    decoder = target[0] if target is not None else load_depth_decoder(omega_path, args.device)
+    gt_depth = decode_goal_depth(*target, args.device) if target is not None else None
+    pred_depth = decode_goal_depth(decoder, prediction, reference[2], args.device)
+    source["depth"] = save_depth(args.output, pred_depth, gt_depth, source["goal_reference_frame_index"])
+    source["future_frame_valid"] = gt[2].tolist()
+    save_prediction(args.output, observed, prediction, config, source, gt)
+    print(f"已保存当前图、逐时刻 RGB/motion 对比及目标 3D 深度对比：{args.output}")
+    return {"prompt": prompt, "seed": args.seed, "future_frames": config.future_frames,
+            "sampler_steps": config.sampler_steps, **source}
 
 
 if __name__ == "__main__":

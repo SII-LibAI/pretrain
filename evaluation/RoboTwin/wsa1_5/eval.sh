@@ -52,7 +52,7 @@ COMMAND=(python -u "${SCRIPT_DIR}/inference.py"
   --action-mode "$ACTION_MODE" --infer-horizon "$INFER_HORIZON"
   --num-episodes "$NUM_EPISODES" --dtype "$DTYPE"
   --robot-type "${ROBOT_TYPE:-aloha}" --device "${DEVICE:-cuda}"
-  --text-device "${TEXT_DEVICE:-cpu}" --instruction-type "${INSTRUCTION_TYPE:-unseen}"
+  --text-device "${TEXT_DEVICE:-cuda}" --instruction-type "${INSTRUCTION_TYPE:-unseen}"
   --seed "${SEED:-42}" --fps "${FPS:-30}" --log-level "${LOG_LEVEL:-INFO}")
 STATS_PATH="${STATS_PATH:-${EXTERNAL_STATS_PATH:-}}"
 [[ -z "${ACTION_SAMPLER_STEPS:-}" ]] || COMMAND+=(--action-sampler-steps "$ACTION_SAMPLER_STEPS")

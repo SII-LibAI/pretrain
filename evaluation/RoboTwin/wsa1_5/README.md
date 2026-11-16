@@ -64,7 +64,8 @@ checkpoint 必须使用 `action_frame_stride=1`。
 ```bash
 GPUS=0,1 \
 TASK_CONFIG=demo_clean \
-OUTPUT_ROOT="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/evaluation/RoboTwin/output/eval_10000_demo_clean" \
+PRETRAINED_CKPT=/inspire/hdd/global_user/zhangjianing-253108140206/pretrain/outputs/wsa1_5_robotwin_scratch/2026_11_11_03_00_15/checkpoints/015000/pretrained_model \
+OUTPUT_ROOT="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/evaluation/RoboTwin/output/eval_scratch" \
 TEXT_ENCODER_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth" \
 TOKENIZER_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B/google/umt5-xxl" \
 bash evaluation/RoboTwin/wsa1_5/eval_ngpu.sh

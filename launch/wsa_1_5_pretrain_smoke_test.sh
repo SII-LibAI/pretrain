@@ -13,11 +13,11 @@ export CUDAToolkit_ROOT="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export HF_LEROBOT_HOME="$PWD/data"
-
+RESUME_CONFIG=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_smoketest/2026_11_13_11_13_44/checkpoints/002500/pretrained_model/train_config.json
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego}"
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/smoke_test}"
     DATASET_REPO_ID="${DATASET_REPO_ID:-}"
     DATASET_REPO_ID="$(
     {
@@ -35,7 +35,7 @@ else
         exit 1
     fi
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B}"
-    INIT_CHECKPOINT_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_robotwin/2026_10_31_08_40_08/checkpoints/005000/pretrained_model"
+    INIT_CHECKPOINT_PATH=null
     TRAIN_ARGS=(
         --policy.type=WSA_1_5
         --policy.init_checkpoint_path="$INIT_CHECKPOINT_PATH"
@@ -49,22 +49,24 @@ else
         --policy.future_frames="${FUTURE_FRAMES:-8}"
         --policy.lambda_rgb="${LAMBDA_RGB:-1.0}"
         --policy.enable_action=false
-        --policy.lambda_motion="${LAMBDA_MOTION:-0.5}"
-        --policy.lambda_3d="${LAMBDA_3D:-0.5}"
+        --policy.lambda_motion="${LAMBDA_MOTION:-1.0}"
+        --policy.lambda_3d="${LAMBDA_3D:-1.0}"
         --policy.feature_mse_weight="${FEATURE_MSE_WEIGHT:-1.0}"
         --policy.feature_cosine_weight="${FEATURE_COSINE_WEIGHT:-1.0}"
         --policy.dtype=bfloat16
         --dataset.future_frames="${FUTURE_FRAMES:-8}"
         --dataset.frame_stride="${FRAME_STRIDE:-4}"
         --policy.load_text_encoder=true
-        --policy.gradient_checkpointing=false
+        --policy.gradient_checkpointing=true
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
-        --policy.rgb_lr="${RGB_LR:-5e-5}"
-        --policy.motion_lr="${MOTION_LR:-5e-5}"
-        --policy.goal_lr="${GOAL_LR:-5e-5}"
-        --policy.heads_lr="${HEADS_LR:-5e-5}"
-        --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS:-2000}"
-        --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-100000}"
+        --policy.rgb_lr="${RGB_LR:-1e-4}"
+        --policy.motion_lr="${MOTION_LR:-1e-4}"
+        --policy.goal_lr="${GOAL_LR:-1e-4}"
+        --policy.heads_lr="${HEADS_LR:-1e-4}"
+        --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS:-250}"
+        --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-5000}"
+        --policy.optimizer_weight_decay="${WEIGHT_DECAY:-0.01}"
+        --policy.scheduler_decay_lr_ratio="${SCHEDULER_DECAY_LR_RATIO:-0.1}"
         --dataset.type=wsa1_5
         --dataset.root="$DATA_ROOT"
         --dataset.repo_id="$DATASET_REPO_ID"
@@ -72,14 +74,14 @@ else
         --dataset.video_decode_threads="${VIDEO_DECODE_THREADS:-1}"
         --dataset.prefetch_factor="${PREFETCH_FACTOR:-2}"
         --dataset.use_subtask="${USE_SUBTASK:-true}"
-        --dataset.dist_loading="${DIST_LOADING:-true}"
-        --output_dir="${OUTPUT_DIR:-outputs/wsa1_5_52plus/$(date +%Y_%m_%d_%H_%M_%S)}"
-        --batch_size="${BATCH_SIZE:-8}"
+        --dataset.dist_loading="${DIST_LOADING:-false}"
+        --output_dir="${OUTPUT_DIR:-outputs/wsa1_5_smoketest/$(date +%Y_%m_%d_%H_%M_%S)}"
+        --batch_size="${BATCH_SIZE:-64}"
         --num_workers="${NUM_WORKERS:-12}"
-        --steps="${STEPS:-100000}"
-        --save_freq="${SAVE_FREQ:-20000}"
+        --steps="${STEPS:-5000}"
+        --save_freq="${SAVE_FREQ:-2500}"
         --log_freq="${LOG_FREQ:-10}"
-        --eval_freq="${EVAL_FREQ:-5000}"
+        --eval_freq="${EVAL_FREQ:-500}"
         --wandb.enable="${WANDB_ENABLE:-true}"
         --wandb.mode="${WANDB_MODE:-offline}"
     )
@@ -90,7 +92,7 @@ fi
 # NODE_COUNT="${NODE_COUNT:-2}"
 # NUM_PROCESSES=$((PROC_PER_NODE * NODE_COUNT))
 
-# ===== 平台多机环境 =====
+# ===== 平台多机环境 =====  
 
 NODE_COUNT="${PET_NNODES:-1}"
 NODE_RANK="${PET_NODE_RANK:-0}"

@@ -37,6 +37,8 @@ class OmegaTeacher:
         self.dtype = dtype
         self.model = None
 
+    # Persistent weights need version counters when the depth head is reused by convolution backends.
+    @torch.inference_mode(False)
     def _load(self, device):
         if self.model is None:
             if not self.checkpoint_path:
