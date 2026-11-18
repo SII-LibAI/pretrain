@@ -33,7 +33,7 @@
     observation.images.front: observation.images.image0
   description: "Absolute dual-hand human EEF pose and grasp"
 
-- robot_type: egoverse_synthetic_piper_inspire
+- robot_type: egoverse_synthetic_dexhand_piper_inspire
   unified_action_reorder: &unified_egoverse_synthetic_piper_inspire
     - [20, 26, 58, 64]
     - [0, 6, 65, 71]
@@ -56,7 +56,7 @@
     - [12, 13, 54, 55]
     - [13, 14, 56, 57]
   unified_state_reorder: *unified_egoverse_synthetic_piper_inspire
-  embodiment_name: piper_inspire
+  embodiment_name: dexhand_piper_inspire
   state_dim: 40
   action_dim: 40
   action_mode: joint
@@ -246,14 +246,14 @@
     observation.images.front: observation.images.image0
   description: "Dual UR7e in compact left-first layout"
 
-- robot_type: egoverse_synthetic_ur7e_wuji
+- robot_type: egoverse_synthetic_dexhand_ur7e_wuji
   unified_action_reorder: &unified_egoverse_synthetic_ur7e_wuji
     - [26, 32, 58, 64]
     - [32, 52, 18, 38]
     - [0, 6, 65, 71]
     - [6, 26, 38, 58]
   unified_state_reorder: *unified_egoverse_synthetic_ur7e_wuji
-  embodiment_name: ur7e_wuji
+  embodiment_name: dexhand_ur7e_wuji
   state_dim: 52
   action_dim: 52
   action_mode: joint

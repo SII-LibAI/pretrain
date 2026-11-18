@@ -13,7 +13,6 @@ export CUDAToolkit_ROOT="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export HF_LEROBOT_HOME="$PWD/data"
-RESUME_CONFIG=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_smoketest/2026_11_13_11_13_44/checkpoints/002500/pretrained_model/train_config.json
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
@@ -74,13 +73,13 @@ else
         --dataset.video_decode_threads="${VIDEO_DECODE_THREADS:-1}"
         --dataset.prefetch_factor="${PREFETCH_FACTOR:-2}"
         --dataset.use_subtask="${USE_SUBTASK:-true}"
-        --dataset.dist_loading="${DIST_LOADING:-false}"
+        --dataset.dist_loading="${DIST_LOADING:-true}"
         --output_dir="${OUTPUT_DIR:-outputs/wsa1_5_smoketest/$(date +%Y_%m_%d_%H_%M_%S)}"
         --batch_size="${BATCH_SIZE:-64}"
         --num_workers="${NUM_WORKERS:-12}"
         --steps="${STEPS:-5000}"
         --save_freq="${SAVE_FREQ:-2500}"
-        --log_freq="${LOG_FREQ:-10}"
+        --log_freq="${LOG_FREQ:-5}"
         --eval_freq="${EVAL_FREQ:-500}"
         --wandb.enable="${WANDB_ENABLE:-true}"
         --wandb.mode="${WANDB_MODE:-offline}"

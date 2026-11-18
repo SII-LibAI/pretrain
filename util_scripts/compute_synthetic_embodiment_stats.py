@@ -13,8 +13,16 @@ from typing import Any
 import numpy as np
 import torch
 """
-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/repos/human.txt
-python util_scripts/compute_synthetic_embodiment_stats.py   --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/repos/human.txt    --output-dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/stats/norm_stats32_unified   --action-space unified72   --action-mode delta   --chunk-size 32   --num-workers 50
+cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
+python util_scripts/compute_synthetic_embodiment_stats.py \
+    --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/lerobot_annotation_engine/outputs/repo_dir/egoverse/sum.txt \
+    --output-dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/stats/norm_stats32_unified \
+    --action-space unified72 \
+    --action-mode delta \
+    --chunk-size 32 \
+    --num-workers 30 \
+    --embodiment dexhand_piper_inspire \
+    
 """
 from lerobot.datasets.synthetic_embodiment import DEFAULT_ANNOTATION_FILE, EmbodimentSpec
 from lerobot.datasets.retarget_actions import RetargetActionSource
