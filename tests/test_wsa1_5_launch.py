@@ -21,6 +21,22 @@ from lerobot.policies.wsa1_5.configuration_wsa1_5 import WSA1_5Config, WSA1_5Dat
 PROJECT = Path(__file__).resolve().parents[1]
 
 
+def launch_arguments(stdout, bash):
+    command = shlex.split(stdout.splitlines()[-1])
+    arguments = command[command.index("src/lerobot/scripts/lerobot_train.py") + 1:]
+    expanded = []
+    for argument in arguments:
+        if argument.startswith("--yaml_path="):
+            path = argument.split("=", 1)[1]
+            if sys.platform == "win32":
+                path = subprocess.check_output([bash, "-c", 'cygpath -w "$1"', "bash", path], text=True).strip()
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            expanded.append(f"--dataset.repo_id={payload['dataset']['repo_id']}")
+        else:
+            expanded.append(argument)
+    return expanded
+
+
 def add_dataset(root):
     (root / "meta").mkdir(parents=True, exist_ok=True)
     (root / "meta/info.json").write_text(json.dumps({"total_frames": 40, "total_episodes": 1}), encoding="utf-8")
@@ -55,10 +71,12 @@ def launch(monkeypatch, tmp_path, bash):
 
     def run(extra_args=(), **overrides):
         env = {**os.environ, "WSA_DRY_RUN": "1", "CONDA_PREFIX": "/tmp/wsa15-conda",
-               "DATA_ROOT": default_root.parent.as_posix(), **overrides}
+               "DATA_ROOT": default_root.parent.as_posix(), "TMPDIR": tmp_path.as_posix(),
+               "PET_NNODES": "1", "PET_NODE_RANK": "0", "PET_NPROC_PER_NODE": "1",
+               "PET_MASTER_ADDR": "127.0.0.1", "PET_MASTER_PORT": "29500", **overrides}
         result = subprocess.run([bash, "launch/wsa_1_5_pretrain.sh", *extra_args], cwd=PROJECT, env=env,
                                 capture_output=True, text=True, check=True, encoding="utf-8")
-        command = shlex.split(result.stdout)
+        command = launch_arguments(result.stdout, bash)
         return dict(arg[2:].split("=", 1) for arg in command if arg.startswith("--") and "=" in arg)
 
     return run
@@ -115,13 +133,13 @@ def test_midtrain_launcher_online_unified_settings_and_resume(tmp_path, bash):
            "DATASET_REPO_ID": "/tmp/native /tmp/human /tmp/umi", "EMBODIMENTS": '["piper","ur7e_wuji"]',
            "ACTION_MODE": "abs", "ACTION_CHUNK_SIZE": "16", "ACTION_FRAME_STRIDE": "2",
            "OUTPUT_DIR": (tmp_path / "midtrain").as_posix(),
+           "TMPDIR": tmp_path.as_posix(),
            "PET_NNODES": "1", "PET_NPROC_PER_NODE": "1", "PET_NODE_RANK": "0"}
     env.pop("RESUME_CONFIG", None)
     def run():
         result = subprocess.run([bash, "launch/wsa_1_5_midtrain.sh"], cwd=PROJECT, env=env,
                                 capture_output=True, text=True, encoding="utf-8", check=True)
-        command = shlex.split(result.stdout)
-        return command[command.index("src/lerobot/scripts/lerobot_train.py") + 1:]
+        return launch_arguments(result.stdout, bash)
     arguments = run()
     config = draccus.parse(TrainPipelineConfig, args=["--policy.device=cpu", *arguments])
     assert config.policy.enable_action and config.policy.action_space == "unified72"

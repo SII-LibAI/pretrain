@@ -124,8 +124,9 @@ def load_action_initialization(module, directory):
     if not config.get("enable_action", False):
         load_stage1_policy(module, directory)
         return False
-    if config.get("action_space", "legacy") != module.config.action_space:
-        raise ValueError("Action checkpoint layout differs; initialize unified72 from a Stage-1 world checkpoint")
+    if (config.get("action_space", "legacy") != module.config.action_space
+            or config.get("active_head", False) != module.config.active_head):
+        raise ValueError("Action checkpoint layout differs; use a matching action checkpoint or a Stage-1 world checkpoint")
     state = read_checkpoint(directory / "model.safetensors")
     merged = _merge_rgb_lora(module, config, state)
     omitted, restored = _prepare_frozen_text(module, config, state)

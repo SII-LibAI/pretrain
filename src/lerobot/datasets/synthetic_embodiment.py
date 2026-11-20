@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 DEFAULT_ANNOTATION_FILE = "meta/annotations/action.parquet"
 HUMAN_EEF_EMBODIMENT = "human_eef"
+HEAD_EEF_KEY = "action.head_eef"
+DEXTEROUS_BODY_NAMES = {"piper_inspire", "ur7e_wuji"}
 HUMAN_EEF_COMPONENTS = (
     ("human_eef.right.pos", 3),
     ("human_eef.right.rot", 4),
@@ -49,6 +51,14 @@ def embodiment_schema_prefix(source_robot_type: str) -> str:
     return EMBODIMENT_SCHEMA_PREFIXES[source_robot_type]
 
 
+def dexterous_body_alias(name: str) -> str:
+    """Resolve older annotation names and the newer dexhand-prefixed names."""
+    short = name.removeprefix("dexhand_")
+    if short not in DEXTEROUS_BODY_NAMES:
+        return name
+    return short if short != name else f"dexhand_{short}"
+
+
 @dataclass(frozen=True)
 class EmbodimentSpec:
     """Schema of one synthetic embodiment in an annotation parquet."""
@@ -59,6 +69,7 @@ class EmbodimentSpec:
     dim: int
     component_keys: tuple[str, ...] = ()
     component_valid_keys: tuple[str, ...] = ()
+    allow_missing: bool = False
 
     @property
     def value_keys(self) -> tuple[str, ...]:
@@ -202,8 +213,14 @@ class SyntheticActionTable:
 
         spec = self.specs[body_id]
         table = self._parquet().read_row_group(row_group, columns=list(spec.value_keys))
-        components = [_feature_column_to_numpy(table[key]) for key in spec.value_keys]
-        values = np.concatenate(components, axis=-1)
+        if spec.allow_missing:
+            rows = table[spec.action_key].to_pylist()
+            if any(row is not None and len(row) != spec.dim for row in rows):
+                raise ValueError(f"{self.path}: {spec.action_key} must contain {spec.dim}D vectors")
+            values = np.asarray([row if row is not None else [np.nan] * spec.dim for row in rows],
+                                dtype=np.float32).reshape(-1, spec.dim)
+        else:
+            values = np.concatenate([_feature_column_to_numpy(table[key]) for key in spec.value_keys], axis=-1)
         if values.shape[1] != spec.dim:
             raise ValueError(
                 f"{self.path}: concatenated values for {spec.name!r} have dimension "
@@ -238,7 +255,7 @@ class SyntheticActionTable:
         result = pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=0)
         if offsets is not None:
             result = result[offsets]
-        if not np.isfinite(result).all():
+        if not self.specs[body_id].allow_missing and not np.isfinite(result).all():
             raise ValueError(
                 f"{self.path}: non-finite values for {self.specs[body_id].name!r} "
                 f"in rows [{start}:{stop}]"
@@ -542,7 +559,7 @@ def discover_embodiments(
     discovered = sorted(
         name.removeprefix("action.").removesuffix("_valid")
         for name in field_names
-        if name.startswith("action.") and name.endswith("_valid")
+        if name.startswith("action.") and name.endswith("_valid") and name != f"{HEAD_EEF_KEY}_valid"
     )
     eef_columns = {key for key, _ in HUMAN_EEF_COMPONENTS} | set(HUMAN_EEF_VALID_KEYS)
     present_eef_columns = eef_columns & field_names
@@ -637,6 +654,8 @@ def load_embodiment_schemas(
     schemas = []
     for spec in specs:
         schema_name = f"{schema_prefix}{spec.name}"
+        if schema_name not in available:
+            schema_name = f"{schema_prefix}{dexterous_body_alias(spec.name)}"
         if schema_name not in available:
             raise KeyError(f"No dataset schema registered for synthetic embodiment {spec.name!r}")
         schema = registry.get(schema_name)
@@ -939,6 +958,8 @@ def _validate_annotation_rows(
     episode_indices: np.ndarray,
     frame_indices: np.ndarray,
     path: Path,
+    *,
+    allow_sparse: bool = False,
 ) -> None:
     if len(indices) == 0:
         raise ValueError(f"Synthetic annotation table is empty: {path}")
@@ -953,7 +974,11 @@ def _validate_annotation_rows(
     if len(np.unique(segment_episodes)) != len(segment_episodes):
         raise ValueError(f"Episode rows must be contiguous: {path}")
     for start, end in zip(starts, ends, strict=True):
-        if not np.array_equal(np.diff(frame_indices[start:end]), np.ones(end - start - 1, dtype=np.int64)):
+        steps = np.diff(frame_indices[start:end])
+        if allow_sparse:
+            if (steps < 1).any():
+                raise ValueError(f"Frame indices must be strictly increasing within every episode: {path}")
+        elif (steps != 1).any():
             raise ValueError(f"Frame indices must be contiguous within every episode: {path}")
 
 

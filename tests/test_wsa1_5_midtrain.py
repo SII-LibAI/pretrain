@@ -18,7 +18,8 @@ from util_scripts.compute_synthetic_embodiment_stats import compute_embodiment_s
 from util_scripts.precompute_wsa1_5_text_embeddings import dataset_prompts
 
 
-def write_retarget(root, bodies=("piper", "ur7e_wuji"), *, split_episode=False, eef=True, robot_type="egodex_v"):
+def write_retarget(root, bodies=("piper", "ur7e_wuji"), *, split_episode=False, eef=True,
+                   robot_type="egodex_v", active_head=False):
     sizes = {"piper": 16, "piper_inspire": 40, "ur7e_wuji": 52, "franka": 18}
     frames = np.arange(40)
     episode = frames // 20 if split_episode else np.zeros(40, dtype=int)
@@ -36,31 +37,40 @@ def write_retarget(root, bodies=("piper", "ur7e_wuji"), *, split_episode=False, 
             payload[f"human_eef.{side}.rot"] = [[0., 0., 0., 1.]] * 40
             payload[f"human_eef.{side}.grasp"] = [0.99] * 40
             payload[f"human_eef.{side}.valid"] = [True] * 40
+    if active_head:
+        payload["action.head_eef"] = [[float(t * t), 1., 2., 0., 0., 0., 1.] for t in frames]
+        payload["action.head_eef"][2] = None
+        payload["action.head_eef_valid"] = frames != 3
     directory = root / "meta/annotations"
     directory.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table(payload), directory / "action.parquet", row_group_size=9)
     (root / "meta/info.json").write_text(json.dumps({"robot_type": robot_type}), encoding="utf-8")
 
 
-def mid_config(**kwargs):
-    return action_config(action_space="unified72", state_dim=72, action_dim=72, load_text_encoder=True, **kwargs)
+def mid_config(active_head=False, **kwargs):
+    dim = 79 if active_head else 72
+    return action_config(action_space="unified72", state_dim=dim, action_dim=dim, active_head=active_head,
+                         load_text_encoder=True, **kwargs)
 
 
-def retarget_dataset(root, monkeypatch, *, mode="delta", stride=1, bodies=("piper", "ur7e_wuji"), robot_type="egodex_v"):
+def retarget_dataset(root, monkeypatch, *, mode="delta", stride=1, bodies=("piper", "ur7e_wuji"),
+                     robot_type="egodex_v", active_head=False):
     fixture, _ = make_data(root, monkeypatch, future_frames=4)
     fixture.base.hf_dataset["index"] = list(range(40))
     fixture.base.meta.robot_type = robot_type
-    write_retarget(root, bodies, robot_type=robot_type)
-    stats, _ = compute_embodiment_stats([root], chunk_size=4, stride=stride, action_mode=mode, action_space="unified72")
+    write_retarget(root, bodies, robot_type=robot_type, active_head=active_head)
+    stats, _ = compute_embodiment_stats([root], chunk_size=4, stride=stride, action_mode=mode,
+                                       action_space="unified72", active_head=active_head)
     write_embodiment_stats(root / "norm", stats)
     cfg = replace(fixture.config, use_subtask=False, allow_endframe_3d=True, action_mode=mode,
                   rgb_height=96, rgb_width=64, motion_height=32, motion_width=32,
                   retarget_stats_dir=str(root / "norm"))
-    return WSA1_5Dataset(fixture.base, cfg, action_config=mid_config(action_mode=mode, action_frame_stride=stride))
+    return WSA1_5Dataset(fixture.base, cfg, action_config=mid_config(
+        active_head=active_head, action_mode=mode, action_frame_stride=stride))
 
 
-@pytest.mark.parametrize("name", ["egodex_synthetic_piper", "egodex_synthetic_piper_inspire",
-                                  "egoverse_synthetic_ur7e_wuji", "aloha", "aloha_robotwin", "piper"])
+@pytest.mark.parametrize("name", ["egodex_synthetic_piper", "egodex_synthetic_dexhand_piper_inspire",
+                                  "egoverse_synthetic_dexhand_ur7e_wuji", "aloha", "aloha_robotwin", "piper"])
 def test_unified_schema_roundtrip_and_legacy_preservation(name):
     original = get_schema(name)
     restored = DatasetSchema.from_config(original.to_config())
@@ -79,7 +89,7 @@ def test_unified_schema_roundtrip_and_legacy_preservation(name):
 def test_training_and_stats_share_windows_and_normalization(tmp_path, monkeypatch, mode, stride, robot_type, prefix):
     dataset = retarget_dataset(tmp_path, monkeypatch, mode=mode, stride=stride, robot_type=robot_type)
     source = dataset.retarget_source
-    assert source.names == (f"{prefix}piper", f"{prefix}ur7e_wuji") and all(source.with_eef)
+    assert source.names == (f"{prefix}piper", f"{prefix}dexhand_ur7e_wuji") and all(source.with_eef)
     seen = set()
     torch.manual_seed(17)
     for _ in range(30):
@@ -96,14 +106,14 @@ def test_training_and_stats_share_windows_and_normalization(tmp_path, monkeypatc
         torch.testing.assert_close(physical, expected, atol=2e-5, rtol=1e-5)
         mask = sample["targets"]["action_valid_mask"]
         assert not sample["targets"]["action"][~mask].any()
-        assert f"Robot Embodiment: {sample['embodiment']}" in sample["condition_text"]
+        assert f"Robot Embodiment: {codec.embodiment_name}\n" in sample["condition_text"]
         assert f"Action Mode: {mode}" in sample["condition_text"]
         # IK gripper labels are kept; the shared EEF grasp=0.99 must not replace them.
         if sample["embodiment"] == f"{prefix}piper":
             torch.testing.assert_close(physical[:, 14:16], torch.from_numpy(future[:, 14:16]))
         np.testing.assert_array_equal(state[-14:-11], [100 + row, 101 + row, 102 + row])
         np.testing.assert_array_equal(state[-7:-4], [200 + row, 201 + row, 202 + row])
-    assert seen == {f"{prefix}piper", f"{prefix}ur7e_wuji"}
+    assert seen == set(source.names)
     for body in source.active_bodies:
         anchors = np.flatnonzero(source.candidate_masks & (np.uint64(1) << np.uint64(body)))
         vectors = [source.read_window(body, int(row)) for row in anchors]
@@ -115,17 +125,24 @@ def test_training_and_stats_share_windows_and_normalization(tmp_path, monkeypatc
         np.testing.assert_allclose(stats["action"]["mean"], action_expected.mean(0), atol=3e-5)
 
 
-def test_inspire_hand_slots_exclude_old_gripper_and_reorder_fingers(tmp_path, monkeypatch):
-    dataset = retarget_dataset(tmp_path, monkeypatch, mode="abs", bodies=("piper_inspire",))
+@pytest.mark.parametrize("robot_type", ["egodex_v", "egoverse_human_bimanual"])
+def test_inspire_hand_slots_exclude_old_gripper_and_reorder_fingers(tmp_path, monkeypatch, robot_type):
+    dataset = retarget_dataset(tmp_path, monkeypatch, mode="abs", bodies=("piper_inspire",), robot_type=robot_type)
     sample = dataset[0]
     codec = dataset.retarget_codecs[0]
     state, future = dataset.retarget_source.read_window(0, 0)
     physical = codec.decode(sample["targets"]["action"], {"observation.state": state})
     assert not sample["targets"]["action_valid_mask"][:, 14:18].any()
-    torch.testing.assert_close(physical[:, 18:22], torch.from_numpy(future[:, 36:40]))
+    if robot_type == "egodex_v":
+        torch.testing.assert_close(physical[:, 18:20], torch.from_numpy(future[:, [37, 36]]))
+        assert not sample["targets"]["action_valid_mask"][:, 20:22].any()
+        hand_dims = 12
+    else:
+        torch.testing.assert_close(physical[:, 18:22], torch.from_numpy(future[:, 36:40]))
+        hand_dims = 24
     torch.testing.assert_close(physical[:, 30], torch.from_numpy(future[:, 34]))  # left ring before pinky
     torch.testing.assert_close(physical[:, 34], torch.from_numpy(future[:, 32]))
-    assert sample["targets"]["action_valid_mask"][0].sum() == 50  # arms12 + hands24 + EEF14
+    assert sample["targets"]["action_valid_mask"][0].sum() == 12 + hand_dims + 14
 
 
 def test_stats_union_handles_source_without_dexterous_columns(tmp_path):
@@ -134,8 +151,8 @@ def test_stats_union_handles_source_without_dexterous_columns(tmp_path):
     write_retarget(umi, ("piper",))
     stats, specs = compute_embodiment_stats([human, umi], chunk_size=4, action_space="unified72",
                                            embodiments=["piper", "ur7e_wuji"])
-    assert set(stats) == {spec.name for spec in specs} == {"egodex_synthetic_piper", "egodex_synthetic_ur7e_wuji"}
-    assert stats["egodex_synthetic_piper"]["observation.state"]["count"] > stats["egodex_synthetic_ur7e_wuji"]["observation.state"]["count"]
+    assert set(stats) == {spec.name for spec in specs} == {"egodex_synthetic_piper", "egodex_synthetic_dexhand_ur7e_wuji"}
+    assert stats["egodex_synthetic_piper"]["observation.state"]["count"] > stats["egodex_synthetic_dexhand_ur7e_wuji"]["observation.state"]["count"]
     selected, _ = compute_embodiment_stats([human, umi], chunk_size=4, action_space="unified72", embodiments=["piper"])
     assert set(selected) == {"egodex_synthetic_piper"}
 
@@ -147,7 +164,7 @@ def test_new_source_retarget_codec_and_prompt(tmp_path, monkeypatch, robot_type)
     name = f"{robot_type}_synthetic_piper"
     sample = dataset[0]
     assert sample["embodiment"] == name
-    assert f"Robot Embodiment: {name}" in sample["condition_text"]
+    assert "Robot Embodiment: piper\n" in sample["condition_text"]
     state, future = dataset.retarget_source.read_window(0, 0)
     assert state.shape == (30,) and future.shape == (4, 30)  # dual-arm IK16 + EEF14
     codec = dataset.retarget_codecs[0]
@@ -190,7 +207,7 @@ def test_source_specific_reorder_reaches_training(tmp_path, monkeypatch):
     monkeypatch.setitem(get_registry()._schemas, name, schema)
     dataset = retarget_dataset(tmp_path, monkeypatch, mode="abs", bodies=("piper",), robot_type="egoverse_human_bimanual")
     sample = dataset[0]
-    assert sample["embodiment"] == name and f"Robot Embodiment: {name}" in sample["condition_text"]
+    assert sample["embodiment"] == name and "Robot Embodiment: piper\n" in sample["condition_text"]
     state, future = dataset.retarget_source.read_window(0, 0)
     physical = dataset.retarget_codecs[0].decode(sample["targets"]["action"], {"observation.state": state})
     torch.testing.assert_close(physical[:, 58:64], torch.from_numpy(future[:, :6]))
@@ -241,10 +258,11 @@ def test_retarget_rejects_offline_cache_and_stale_statistics(tmp_path, monkeypat
         RetargetActionSource(tmp_path, 4, embodiments=["human_eef"])
 
 
-def test_native_and_retarget_mixed_batch_backward(tmp_path, monkeypatch):
+@pytest.mark.parametrize("active_head", [False, True])
+def test_native_and_retarget_mixed_batch_backward(tmp_path, monkeypatch, active_head):
     from lerobot.datasets.transformed_dataset import MultiLeRobotDataset
 
-    retarget = retarget_dataset(tmp_path / "retarget", monkeypatch)
+    retarget = retarget_dataset(tmp_path / "retarget", monkeypatch, active_head=active_head)
     fixture, _ = make_data(tmp_path / "native", monkeypatch, future_frames=4)
     fixture.base.meta.robot_type = "aloha"
     for key in ("observation.state", "action"):
@@ -256,10 +274,11 @@ def test_native_and_retarget_mixed_batch_backward(tmp_path, monkeypatch):
     assert sample["embodiment"] == "aloha" and sample["targets"]["action_valid_mask"][0].sum() == 14
     assert sample["condition_text"] == action_prompt("knit", "joint", "delta", embodiment="aloha")
     mixed = MultiLeRobotDataset([native, retarget], dataset_weights=[0.5, 0.5])
-    loader = torch.utils.data.DataLoader(mixed, batch_size=2, sampler=[2, len(native) + 2],
+    loader = torch.utils.data.DataLoader(mixed, batch_size=2, sampler=[2, len(native)],
                                         collate_fn=wsa1_5_collate)
     batch = next(iter(loader))
-    policy = action_policy(action_space="unified72", state_dim=72, action_dim=72,
+    dim = 79 if active_head else 72
+    policy = action_policy(action_space="unified72", state_dim=dim, action_dim=dim, active_head=active_head,
                            load_text_encoder=True, num_history_frame=4)
     monkeypatch.setattr(policy, "_encode_text", lambda texts: (torch.zeros(len(texts), 4, 8),
                                                              torch.ones(len(texts), 4, dtype=torch.bool)))
@@ -268,6 +287,91 @@ def test_native_and_retarget_mixed_batch_backward(tmp_path, monkeypatch):
     loss.backward()
     assert policy.action_expert.action_encoder.weight.grad.abs().sum() > 0
     assert policy.proprio_encoder.weight.grad.abs().sum() > 0
+    if active_head:
+        mask = batch["targets"]["action_valid_mask"][:, :, 72:]
+        assert not mask[0].any() and not batch["state"][0, 72:].any()
+        assert mask[1].all(dim=1).tolist() == [True, False, False, True]
+        assert policy.predict_action_chunk(batch, return_normalized=True).shape == (2, 4, 79)
+
+
+@pytest.mark.parametrize("mode,robot_type", [("abs", "egodex_v"), ("delta", "egoverse_human_bimanual")])
+def test_active_head_normalization_and_missing_annotations(tmp_path, monkeypatch, mode, robot_type):
+    dataset = retarget_dataset(tmp_path, monkeypatch, mode=mode, bodies=("piper",),
+                               robot_type=robot_type, active_head=True)
+    source = dataset.retarget_source
+    sample = dataset[0]
+    codec = dataset.retarget_codecs[0]
+    state, _ = source.read_window(0, 0)
+    poses, valid = source.read_head_window(0)
+    raw_state = np.concatenate((state, poses[0]))
+    physical = codec.decode(sample["targets"]["action"], {"observation.state": raw_state})
+    torch.testing.assert_close(physical[valid[1:], 72:], torch.from_numpy(poses[1:][valid[1:]]))
+    assert sample["targets"]["action_valid_mask"][:, 72:].all(dim=1).tolist() == [True, False, False, True]
+    assert not sample["targets"]["action"][~valid[1:], 72:].any()
+    missing = dataset[2]
+    assert not missing["state"][72:].any() and not missing["targets"]["action_valid_mask"][:, 72:].any()
+    assert missing["targets"]["action_valid_mask"][:, :72].any()
+
+    source_without_head = retarget_dataset(tmp_path / "no_head", monkeypatch, mode=mode, bodies=("piper",))
+    padded = WSA1_5Dataset(source_without_head.base, source_without_head.config,
+                           action_config=mid_config(active_head=True, action_mode=mode))[0]
+    torch.testing.assert_close(padded["state"][:72], source_without_head[0]["state"])
+    assert not padded["targets"]["action_valid_mask"][:, 72:].any()
+
+
+def test_idle_filter_crops_both_stages_and_matching_stats(tmp_path, monkeypatch):
+    fixture, _ = make_data(tmp_path, monkeypatch, annotations=False, future_frames=4)
+    write_retarget(tmp_path, ("piper",))
+    lengths = [140, 260, 80, 20, 100, 60]
+    frames = np.concatenate([np.arange(length) for length in lengths])
+    episodes = np.repeat(np.arange(len(lengths)), lengths)
+    positions = np.zeros((len(frames), 3))
+    positions[:, 0] = (episodes < 2) & (frames >= 60)
+    positions[episodes == 1, 0] += frames[episodes == 1] >= 200  # Separate bursts with an idle middle.
+    # All motion is on one wrist. Valid but static and too-short episodes should be rejected.
+    columns = {"index": np.arange(len(frames)), "episode_index": episodes, "frame_index": frames,
+               "action.piper": np.zeros((len(frames), 16)).tolist(), "action.piper_valid": [True] * len(frames)}
+    for side in ("right", "left"):
+        columns[f"human_eef.{side}.pos"] = (positions if side == "left" else np.zeros_like(positions)).tolist()
+        columns[f"human_eef.{side}.rot"] = [[0., 0., 0., 1.]] * len(frames)
+        columns[f"human_eef.{side}.grasp"] = [0.] * len(frames)
+        columns[f"human_eef.{side}.valid"] = [True] * len(frames)
+    annotated = (episodes != 4) & ((episodes != 5) | (frames < 35) | (frames >= 40))
+    pq.write_table(pa.table(columns).filter(pa.array(annotated)),
+                   tmp_path / "meta/annotations/action.parquet", row_group_size=17)
+    episode_edges = np.cumsum([0, *lengths])
+    pq.write_table(pa.table({"episode_index": np.arange(len(lengths)), "dataset_from_index": episode_edges[:-1],
+                             "dataset_to_index": episode_edges[1:]}),
+                   tmp_path / "meta/episodes/chunk-000/file-000.parquet")
+    fixture.base.hf_dataset = FrameTable(index=list(columns["index"]), timestamp=(frames / 30).tolist(),
+                                         frame_index=frames.tolist(), episode_index=episodes.tolist())
+    entry = fixture.base.meta.episodes[0]
+    fixture.base.meta.episodes = {i: entry for i in range(len(lengths))}
+    monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames",
+                        lambda path, times, *args: torch.zeros(len(times), 3, 16, 16))
+    cfg = replace(fixture.config, idle_motion_threshold=0.05, use_subtask=False, allow_endframe_3d=True,
+                  action_mode="delta",
+                  retarget_stats_dir=str(tmp_path / "norm"))
+    pretrain = WSA1_5Dataset(fixture.base, cfg, include_3d_targets=True)
+    assert pretrain.sample_indices.tolist() == [*range(29, 91), *range(500, 660)]
+    assert pretrain.num_episodes == 3
+    tail = pretrain[60]
+    assert tail["future_frame_valid"].tolist() == [True, False, False, False]
+    assert tail["goal_timestamp"] == pytest.approx(90 / 30)
+    torch.testing.assert_close(tail["frame_timestamps"], torch.full((4,), 90 / 30, dtype=torch.float64))
+
+    stats, _ = compute_embodiment_stats([tmp_path], chunk_size=32, action_space="unified72",
+                                       idle_motion_threshold=0.05)
+    body_stats = stats["egodex_synthetic_piper"]
+    assert body_stats["observation.state"]["count"] == 33
+    assert body_stats["action"]["count"] == 33 * 32
+    write_embodiment_stats(tmp_path / "norm", stats)
+    midtrain = WSA1_5Dataset(fixture.base, cfg, action_config=mid_config(action_chunk_size=32))
+    assert midtrain.sample_indices.tolist() == [*range(29, 59), 600, 601, 602]
+    assert (midtrain.annotation_rows[500:600] == -1).all()
+    assert not midtrain[0]["history_valid"].any()
+    with pytest.raises(ValueError, match="window/representation"):
+        RetargetActionSource(tmp_path, 32, idle_motion_threshold=0.1, stats_dir=tmp_path / "norm")
 
 
 def test_all_registered_unified_maps_have_unique_destinations():
@@ -382,5 +486,5 @@ def test_factory_retarget_skips_native_stats_override(tmp_path, monkeypatch):
     monkeypatch.setattr(factory, "_apply_dataset_stats_overrides",
                         lambda *a: pytest.fail("Native human skeleton statistics must not be used"))
     built, stats, robot = factory._build_single_dataset(config, tmp_path.name, None, 0)
-    assert robot == "egodex_v" and set(stats) == {"egodex_synthetic_piper", "egodex_synthetic_ur7e_wuji"}
+    assert robot == "egodex_v" and set(stats) == {"egodex_synthetic_piper", "egodex_synthetic_dexhand_ur7e_wuji"}
     assert built[0]["embodiment"] in stats

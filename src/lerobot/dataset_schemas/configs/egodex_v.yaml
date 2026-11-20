@@ -84,7 +84,7 @@
     - [14, 15, 50, 51]
     - [12, 13, 54, 55]
   unified_state_reorder: *unified_egodex_synthetic_piper_inspire
-  embodiment_name: dexhand_piper_inspire
+  embodiment_name: piper_inspire
   state_dim: 40
   action_dim: 40
   action_mode: joint
@@ -251,7 +251,7 @@
     - [0, 6, 65, 71]
     - [6, 26, 38, 58]
   unified_state_reorder: *unified_egodex_synthetic_ur7e_wuji
-  embodiment_name: dexhand_ur7e_wuji
+  embodiment_name: ur7e_wuji
   state_dim: 52
   action_dim: 52
   action_mode: joint

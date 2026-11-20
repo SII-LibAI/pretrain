@@ -84,7 +84,17 @@ norm_stats/midtrain_delta_h32_s1/egodex_synthetic_piper/stats.json
 norm_stats/midtrain_delta_h32_s1/egoverse_synthetic_piper/stats.json
 ```
 
-只有完整 schema 名相同的多个数据集根目录才合并统计。不同来源的同短名本体分开保存，源数据不必拥有相同的本体集合。可用 `--embodiment egodex_synthetic_piper --embodiment egoverse_synthetic_piper` 精确选择两类本体。PiPER 的统计仍是关节/夹爪 16 维加 EEF 14 维，共 30 维；模型输入仍为 72 维。
+开启主动视角训练时，在统计命令加 `--active-head`，并在启动 `launch/wsa_1_5_midtrain.sh` 时设 `ACTIVE_HEAD=true`。模型的 state 和 action 都扩到 79 维，末尾 `[72:79]` 对应 `action.head_eef` 的 xyz 和四元数，坐标系和四元数顺序沿用标注。当前帧位姿进入 state，未来位姿使用原有 retarget action 的 chunk 和 stride。Delta 模式仅对 xyz 减去当前位姿的 xyz，四元数使用标注中的绝对值。
+
+头部统计单独保存到 `retarget_stats_dir/<数据源前缀>head_eef/stats.json`，同一数据源的各本体共用。缺少该列的数据仍可参与中训练，末尾 7 维补零并屏蔽。头部标签为空、非有限，或 `action.head_eef_valid` 为 false 时也会屏蔽对应监督。已有 72 维 Action checkpoint 和 79 维布局不同，首次开启时可从 Stage-1 世界模型初始化。
+
+Stage-1 预训练与 Stage-2 中训练都可设置 `IDLE_MOTION_THRESHOLD=0.01` 开启静止过滤。阈值单位与标注的位置单位相同，若位置以米表示，`0.01` 代表 1 厘米。沿 episode 每次滑动一帧，取连续 32 帧，任一只手全窗口有效并且 XYZ 包围盒对角线超过阈值即视为活跃。保留从首个活跃窗口的首帧到末个活跃窗口的末帧，裁剪区间里的活跃窗口比例低于 70% 时丢弃该 episode。过滤在采样时生效，支持没有腕部标注的混合数据，这些数据沿用原有采样。
+
+Stage-2 归一化命令同步添加 `--idle-motion-threshold 0.01`，并把统计保存到对应的 `RETARGET_STATS_DIR`。有过滤时，统计文件记录窗口大小、活跃比例和位移阈值，加载时会核对。Stage-1 使用相同的裁剪边界，无需生成动作统计。
+
+标注还在进行时，只有 `action.parquet` 已覆盖全部帧且有可用腕部位置的 episode 才做 Idle Filtering。未完全覆盖的 episode 在 Stage-1 继续按原边界采样。Stage-2 与归一化只取已经写入并通过有效性检查的动作窗口，窗口不能跨缺失帧。补齐新标注后，用更新后的标注快照重新计算 Stage-2 统计。
+
+只有完整 schema 名相同的多个数据集根目录才合并统计。不同来源的同短名本体分开保存，源数据不必拥有相同的本体集合。可用 `--embodiment egodex_synthetic_piper --embodiment egoverse_synthetic_piper` 精确选择两类本体。这两个本体在 prompt 中统一写作 `Robot Embodiment: piper`。PiPER 本体统计包含关节、夹爪和 EEF，共 30 维。
 
 **旧版按短名合并的统一72统计需要重新计算，训练不回退读取旧的 `piper/stats.json`。** 其他策略的 legacy 统计格式保持原样。
 
@@ -149,7 +159,7 @@ EMBODIMENTS='["piper","ur7e_wuji"]' bash launch/wsa_1_5_midtrain.sh
 ```text
 You are a robot control agent,follow the instruction.
 Task: knit a scarf
-Robot Embodiment: egodex_synthetic_piper
+Robot Embodiment: piper
 Control Mode: joint
 Action Mode: delta
 ```

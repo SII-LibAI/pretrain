@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,7 +21,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from lerobot.dataset_schemas import get_registry, get_schema
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.retarget_actions import action_offsets
+from lerobot.datasets.retarget_actions import HEAD_EEF_MASK, action_offsets, retarget_idle_bounds
 from lerobot.transforms.core import DeltaActionTransformFn, NormalizeTransformFn
 
 from .configuration_wsa1_5 import WSA1_5DatasetConfig
@@ -317,14 +317,11 @@ class WSA1_5Dataset(Dataset):
                 self.retarget_source = RetargetActionSource(
                     base.root, action_config.action_chunk_size, stride=action_config.action_frame_stride,
                     embodiments=config.embodiments or None, action_mode=action_config.action_mode,
+                    active_head=action_config.active_head, idle_motion_threshold=config.idle_motion_threshold,
                     stats_dir=config.retarget_stats_dir, row_group_cache_size=config.annotation_row_group_cache_size)
                 self.retarget_codecs = {}
                 for body in self.retarget_source.active_bodies:
-                    spec, schema = self.retarget_source.specs[body], self.retarget_source.schemas[body]
-                    meta = SimpleNamespace(robot_type=schema.robot_type,
-                                           features={key: {"shape": [spec.dim]} for key in ("observation.state", "action")},
-                                           stats=self.retarget_source.stats[spec.name])
-                    self.retarget_codecs[body] = ActionCodec(meta, action_config, schema=schema)
+                    self.retarget_codecs[body] = self._retarget_codec(body)
             else:
                 self.action_codec = ActionCodec(base.meta, action_config)
         if type(include_3d_targets) is not bool:
@@ -401,13 +398,36 @@ class WSA1_5Dataset(Dataset):
             self.segment_for_sample[cursor:cursor + length] = sid
             cursor += length
         assert cursor == len(self.timestamps), "Segments must cover every loaded row exactly once"
-        if self.retarget_source is not None:
-            self.annotation_rows = self.retarget_source.rows_for_base(base)
-            eligible = self.retarget_source.candidate_masks[self.annotation_rows[self.sample_indices]] != 0
+        idle_bounds = (self.retarget_source.idle_bounds if self.retarget_source is not None else
+                       retarget_idle_bounds(self.root, self.root / "meta/annotations/action.parquet",
+                                            config.idle_motion_threshold))
+        self.idle_bounds = None
+        if idle_bounds is not None:
+            self.idle_bounds = {}
+            kept = np.ones(len(self.timestamps), dtype=bool)
+            for ep, start, stop in zip(episode_ids, self.episode_starts, self.episode_ends, strict=True):
+                if int(ep) not in idle_bounds:
+                    continue
+                crop = idle_bounds[int(ep)]
+                kept[start:stop] = False
+                if crop is None:
+                    continue
+                lo, hi = crop
+                if not 0 <= lo < hi <= stop - start:
+                    raise ValueError(f"Idle crop for episode {ep} does not align with {self.root}")
+                self.idle_bounds[int(ep)] = (int(start + lo), int(start + hi))
+                kept[start + lo:start + hi] = True
+            eligible = kept[self.sample_indices]
             self.sample_indices = self.sample_indices[eligible]
             self.segment_for_sample = self.segment_for_sample[eligible]
-            if not len(self.sample_indices):
-                raise ValueError(f"No valid retarget action windows in {self.root}")
+        if self.retarget_source is not None:
+            self.annotation_rows = self.retarget_source.rows_for_base(base)
+            rows = self.annotation_rows[self.sample_indices]
+            eligible = (rows >= 0) & (self.retarget_source.candidate_masks[rows] != 0)
+            self.sample_indices = self.sample_indices[eligible]
+            self.segment_for_sample = self.segment_for_sample[eligible]
+        if self.idle_bounds is not None or self.retarget_source is not None:
+            self.meta.total_episodes = len(np.unique(self.episode_indices[self.sample_indices]))
         self.text_embeddings = None
         if text_embedding_shape is not None:
             self.text_embeddings = TextEmbeddingCache(self.root / config.text_embedding_dir, *text_embedding_shape)
@@ -542,16 +562,20 @@ class WSA1_5Dataset(Dataset):
         query_indices, padding = LeRobotDataset._get_query_indices(self, idx, segment.episode)
         future_indices = query_indices[self.config.motion_key]
         valid_time = ~padding[f"{self.config.motion_key}_is_pad"]
+        entry = self.meta.episodes[segment.episode]
+        first, stop = entry["dataset_from_index"], entry["dataset_to_index"]
+        if self.idle_bounds is not None and segment.episode in self.idle_bounds:
+            first, stop = self.idle_bounds[segment.episode]
+            future_indices = np.asarray(future_indices)
+            valid_time &= torch.from_numpy(future_indices < stop)
+            future_indices = np.minimum(future_indices, stop - 1)
         future_ts = self.timestamps[future_indices]
         all_ts = np.concatenate(([self.timestamps[idx]], future_ts))
         need_goal = self.include_3d_targets and (segment.metadata_valid or self.config.allow_endframe_3d)
-        goal_index = (segment.last if segment.metadata_valid else
-                      self.meta.episodes[segment.episode]["dataset_to_index"] - 1)
+        goal_index = min(segment.last, stop - 1) if segment.metadata_valid else stop - 1
         history_count = 0
         if self.action_config is not None:
             cfg = self.action_config
-            entry = self.meta.episodes[segment.episode]
-            first = entry["dataset_from_index"]
             history, history_valid = history_indices(idx - first, cfg.num_history_frame, cfg.history_frame_stride)
             history_count = cfg.num_history_frame
             all_ts = np.concatenate((all_ts, self.timestamps[first + history[:-1]]))
@@ -639,10 +663,22 @@ class WSA1_5Dataset(Dataset):
             body = candidates[torch.randint(len(candidates), ()).item()]
             codec = self.retarget_codecs[body]
             raw_state, raw_action = source.read_window(body, row)
+            if source.head_spec is not None:
+                head, head_valid = source.read_head_window(row)
+                raw_state = np.concatenate((raw_state, head[0]))
+                raw_action = np.concatenate((raw_action, head[1:]), axis=-1)
             encoded = codec.encode({"observation.state": raw_state}, {"action": raw_action})
             dims = _reorder(torch.ones(len(raw_state)), codec.schema.action_reorder, cfg.action_dim).bool()
-            targets.update(action=encoded.pop("action"), action_valid_mask=dims[None].expand(cfg.action_chunk_size, -1).clone())
-            encoded["embodiment"] = codec.embodiment_name
+            mask = dims[None].expand(cfg.action_chunk_size, -1).clone()
+            action = encoded.pop("action")
+            if source.head_spec is not None:
+                head_slice = slice(-source.head_spec.dim, None)
+                mask[:, head_slice] &= torch.from_numpy(head_valid[0] & head_valid[1:])[:, None]
+                action.masked_fill_(~mask, 0)
+                if not head_valid[0]:
+                    encoded["state"][head_slice] = 0
+            targets.update(action=action, action_valid_mask=mask)
+            encoded["embodiment"] = source.names[body]
             encoded["condition_text"] = _action_condition(segment.text, codec.control_mode, cfg.action_mode, codec.embodiment_name)
             return encoded
         entry = self.meta.episodes[segment.episode]
@@ -673,6 +709,25 @@ class WSA1_5Dataset(Dataset):
         if cfg.action_space == "unified72":
             state["embodiment"] = codec.embodiment_name
         return state
+
+    def _retarget_codec(self, body):
+        source, cfg = self.retarget_source, self.action_config
+        spec, schema = source.specs[body], source.schemas[body]
+        dim, stats = spec.dim, source.stats[spec.name]
+        keys = ("observation.state", "action")
+        if source.head_spec is not None:
+            head = source.head_spec
+            slot = [dim, dim + head.dim, cfg.action_dim - head.dim, cfg.action_dim]
+            dim += head.dim
+            schema = replace(schema, state_dim=dim, action_dim=dim,
+                             action_mask_spec=[*schema.action_mask_spec, *HEAD_EEF_MASK],
+                             unified_action_reorder=[*schema.unified_action_reorder, slot],
+                             unified_state_reorder=[*schema.unified_state_reorder, slot])
+            head_stats = source.stats[head.name]
+            stats = {key: {stat: [*stats[key][stat], *head_stats[key][stat]] for stat in ("mean", "std")}
+                     for key in keys}
+        meta = SimpleNamespace(robot_type=schema.robot_type, features={key: {"shape": [dim]} for key in keys}, stats=stats)
+        return ActionCodec(meta, cfg, schema=schema)
 
 
 def wsa1_5_collate(samples):

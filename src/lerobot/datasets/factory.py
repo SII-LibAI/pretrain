@@ -627,6 +627,8 @@ def make_dataset(cfg: TrainPipelineConfig):
         transformed_ds, stats_copy, robot_type = _build_single_dataset(
             cfg, repo_id, image_transforms, rank
         )
+        if isinstance(cfg.dataset, WSA1_5DatasetConfig) and not len(transformed_ds):
+            raise ValueError(f"[WSA data] No training samples remain on rank {rank}: {repo_id}")
         all_data_stats[robot_type] = stats_copy
 
         robot_ds = transformed_ds
@@ -637,9 +639,14 @@ def make_dataset(cfg: TrainPipelineConfig):
             transformed_ds, stats_copy, robot_type = _build_single_dataset(
                 cfg, repo_id, image_transforms, rank * 128 + rid
             )
+            if isinstance(cfg.dataset, WSA1_5DatasetConfig) and not len(transformed_ds):
+                logging.info("[WSA data] Skipping empty dataset %s", repo_id)
+                continue
             transformed_datasets.append(transformed_ds)
             all_data_stats[robot_type] = stats_copy
 
+        if not transformed_datasets:
+            raise ValueError(f"[WSA data] No training samples remain on rank {rank}")
         dataset_weights = [
                 repo_weights_map[ds.repo_id]
                 for ds in transformed_datasets

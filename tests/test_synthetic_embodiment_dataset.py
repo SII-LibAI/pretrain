@@ -453,18 +453,25 @@ def test_stats_files_work_without_manifest(tmp_path: Path) -> None:
 def test_source_schemas_share_action_layout_and_reorder() -> None:
     dimensions = {
         "human_eef": 16,
-        "piper_inspire": 40,
+        "dexhand_piper_inspire": 40,
         "franka": 18,
         "arx_l5": 16,
         "xarm7": 14,
         "rm75": 14,
         "ur7e": 12,
-        "ur7e_wuji": 52,
+        "dexhand_ur7e_wuji": 52,
     }
     for name, dim in dimensions.items():
         egodex = get_schema(f"egodex_synthetic_{name}")
         egoverse = get_schema(f"egoverse_synthetic_{name}")
-        assert egodex.action_mask_spec == egoverse.action_mask_spec
+        if name == "dexhand_piper_inspire":
+            assert egodex.action_mask_spec == [6, -2, 12, 6, -2, 12]
+            assert egoverse.action_mask_spec == [6, -14, 6, -14]
+        elif name == "dexhand_ur7e_wuji":
+            assert egodex.action_mask_spec == [52]
+            assert egoverse.action_mask_spec == [6, -20, 6, -20]
+        else:
+            assert egodex.action_mask_spec == egoverse.action_mask_spec
         assert egodex.action_layout == egoverse.action_layout
         assert egodex.state_reorder == egoverse.state_reorder
         assert egodex.action_reorder == egoverse.action_reorder

@@ -42,7 +42,8 @@ def test_source_schemas_preserve_egodex_layouts(source, images):
     prefix = embodiment_schema_prefix(source)
     bodies = (*ARM_BODIES, *DEX_BODIES) if source in EGO_SOURCES else ARM_BODIES
     for body in ("human_eef", *bodies):
-        original = get_schema(f"egodex_synthetic_{body}")
+        original_name = f"dexhand_{body}" if body in DEX_BODIES else body
+        original = get_schema(f"egodex_synthetic_{original_name}")
         actual = get_schema(f"{prefix}{body}")
         assert actual.robot_type in registry.list_available()
         assert actual == replace(original, robot_type=actual.robot_type, image_mapping=images)
@@ -60,7 +61,7 @@ def test_source_stats_and_training_use_full_names(tmp_path, source):
     columns = {"index": frames, "episode_index": np.zeros(6, dtype=np.int64), "frame_index": frames}
     bodies = (*ARM_BODIES, *DEX_BODIES) if source in EGO_SOURCES else ARM_BODIES
     for body in bodies:
-        dim = get_schema(f"egodex_synthetic_{body}").action_dim
+        dim = get_schema(f"{embodiment_schema_prefix(source)}{body}").action_dim
         columns[f"action.{body}"] = (frames[:, None] + np.arange(dim)[None]).tolist()
         columns[f"action.{body}_valid"] = [True] * 6
     pq.write_table(pa.table(columns), annotation_dir / "action.parquet")

@@ -74,6 +74,7 @@ class WSA1_5Config(PreTrainedConfig):
     scheduler_decay_lr_ratio: float = 0.1
     enable_action: bool = False
     action_space: str = "legacy"  # unified72: EEF14, grippers4, hands40, arm joints14.
+    active_head: bool = False  # Append 7D head EEF to the unified state and action.
     state_dim: int | None = None
     action_dim: int | None = None
     action_hidden_dim: int = 1024
@@ -102,8 +103,15 @@ class WSA1_5Config(PreTrainedConfig):
             raise TypeError("enable_action must be boolean")
         if self.action_space not in {"legacy", "unified72"}:
             raise ValueError("action_space must be legacy or unified72")
-        if self.action_space == "unified72" and (not self.enable_action or self.state_dim != 72 or self.action_dim != 72):
-            raise ValueError("unified72 requires enable_action=true and state_dim=action_dim=72")
+        if type(self.active_head) is not bool:
+            raise TypeError("active_head must be boolean")
+        if self.active_head and self.action_space != "unified72":
+            raise ValueError("active_head requires action_space=unified72")
+        unified_dim = 79 if self.active_head else 72
+        if self.action_space == "unified72" and (
+            not self.enable_action or self.state_dim != unified_dim or self.action_dim != unified_dim
+        ):
+            raise ValueError(f"unified72 requires enable_action=true and state_dim=action_dim={unified_dim}")
         if self.sparse_frame_encoding not in {"joint", "independent"}:
             raise ValueError("sparse_frame_encoding must be joint or independent")
         if self.enable_action:
@@ -261,6 +269,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     allow_endframe_3d: bool = False  # Both stages may use the episode endpoint without a valid subtask.
     embodiments: list[str] = field(default_factory=list)  # Empty selects every available IK embodiment.
     retarget_stats_dir: str | None = None
+    idle_motion_threshold: float | None = None  # Wrist XYZ threshold in annotation units; None disables filtering.
     annotation_row_group_cache_size: int = 2
     image_augment: bool = False
     object_paste: bool = False
@@ -272,6 +281,10 @@ class WSA1_5DatasetConfig(DatasetConfig):
             raise ValueError("embodiments contains duplicate names")
         if self.annotation_row_group_cache_size < 0:
             raise ValueError("annotation_row_group_cache_size must be non-negative")
+        if self.idle_motion_threshold is not None and (
+            not math.isfinite(self.idle_motion_threshold) or self.idle_motion_threshold <= 0
+        ):
+            raise ValueError("idle_motion_threshold must be finite and positive")
         if type(self.use_subtask) is not bool or type(self.allow_endframe_3d) is not bool:
             raise TypeError("use_subtask and allow_endframe_3d must be boolean")
         if type(self.image_augment) is not bool or type(self.object_paste) is not bool:

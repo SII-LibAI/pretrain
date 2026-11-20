@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export -n DATASET_REPO_ID  # Keep the potentially large list out of child environments.
 
 # Server entry point; WSA_DRY_RUN=1 only prints the exact command.
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,22 +19,14 @@ if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
     DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego}"
-    DATASET_REPO_ID="${DATASET_REPO_ID:-}"
-    DATASET_REPO_ID="$(
-    {
-        find -L ${DATA_ROOT} -type d -name data 2>/dev/null \
-        | while read -r d; do
-            root="$(dirname "$d")"
-            if [[ -d "$root/meta" && -d "$root/videos" ]]; then
-                echo "${root#data/}"
-            fi
-            done
-    } | shuf | tr '\n' ' ' | xargs
-    )"
-    if [[ -z "${DATASET_REPO_ID}" ]]; then
-        echo "No annotated LeRobotV3 datasets found under ${DATASET_ROOT}" >&2
-        exit 1
-    fi
+    DATASET_REPO_ID="$(bash util_scripts/discover_wsa1_5_datasets.sh "$DATA_ROOT")"
+    DATASET_CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/wsa1_5-datasets.XXXXXX.yaml")"
+    printf '%s' "$DATASET_REPO_ID" | python -c '
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    json.dump({"dataset": {"repo_id": sys.stdin.read().strip()}}, output)
+' "$DATASET_CONFIG_PATH"
+    unset DATASET_REPO_ID
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B}"
     TRAIN_ARGS=(
         --policy.type=WSA_1_5
@@ -62,7 +55,7 @@ else
         --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-300000}"
         --dataset.type=wsa1_5
         --dataset.root="$DATA_ROOT"
-        --dataset.repo_id="$DATASET_REPO_ID"
+        --yaml_path="$DATASET_CONFIG_PATH"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}"
         --dataset.video_decode_threads="${VIDEO_DECODE_THREADS:-1}"
         --dataset.prefetch_factor="${PREFETCH_FACTOR:-2}"
@@ -82,6 +75,7 @@ else
         --wandb.mode="${WANDB_MODE:-offline}"
     )
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
+    [[ -z "${IDLE_MOTION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_motion_threshold="$IDLE_MOTION_THRESHOLD")
 fi
 
 # PROC_PER_NODE="${PROC_PER_NODE:-8}"

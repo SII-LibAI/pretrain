@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export -n DATASET_REPO_ID  # Keep the potentially large list out of child environments.
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
@@ -18,23 +19,27 @@ else
     DATA_ROOT="${DATA_ROOT:-$PROJ_ROOT/data}"
     DATASET_REPO_ID="${DATASET_REPO_ID:-}"
     if [[ -z "$DATASET_REPO_ID" ]]; then
-        DATA_ROOT="$(cd "$DATA_ROOT" && pwd)"
-        DATASET_REPO_ID="$(
-            find -L "$DATA_ROOT" -type d -name data \
-            | while IFS= read -r d; do
-                root="$(dirname "$d")"
-                if [[ -f "$root/meta/info.json" && -d "$root/videos" ]]; then
-                    echo "$root"
-                fi
-            done | shuf | tr '\n' ' ' | xargs
-        )"
+        DATASET_REPO_ID="$(bash util_scripts/discover_wsa1_5_datasets.sh "$DATA_ROOT")"
     fi
     [[ -n "$DATASET_REPO_ID" ]] || { echo "No LeRobot datasets found under $DATA_ROOT" >&2; exit 1; }
+    DATASET_CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/wsa1_5-datasets.XXXXXX.yaml")"
+    printf '%s' "$DATASET_REPO_ID" | python -c '
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    json.dump({"dataset": {"repo_id": sys.stdin.read().strip()}}, output)
+' "$DATASET_CONFIG_PATH"
+    unset DATASET_REPO_ID
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/hdd/global_user/zhangjianing-253108140206/dataset/model/wan}"
+    ACTIVE_HEAD="${ACTIVE_HEAD:-false}"
+    UNIFIED_DIM=72
+    if [[ "$ACTIVE_HEAD" == true ]]; then
+        UNIFIED_DIM=79
+    fi
     TRAIN_ARGS=(
         --policy.type=WSA_1_5 --policy.push_to_hub=false
         --policy.enable_action=true --policy.action_space=unified72
-        --policy.state_dim=72 --policy.action_dim=72
+        --policy.active_head="$ACTIVE_HEAD"
+        --policy.state_dim="$UNIFIED_DIM" --policy.action_dim="$UNIFIED_DIM"
         --policy.init_checkpoint_path="$INIT_CHECKPOINT_PATH"
         --policy.load_text_encoder=true
         --policy.text_encoder_path="${TEXT_ENCODER_PATH:-$WAN_MODEL_PATH/models_t5_umt5-xxl-enc-bf16.pth}"
@@ -59,7 +64,7 @@ else
         --policy.scheduler_decay_lr_ratio="${SCHEDULER_DECAY_LR_RATIO:-0.1}"
         --policy.gradient_checkpointing="${GRADIENT_CHECKPOINTING:-true}"
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
-        --dataset.type=wsa1_5 --dataset.root="$DATA_ROOT" --dataset.repo_id="$DATASET_REPO_ID"
+        --dataset.type=wsa1_5 --dataset.root="$DATA_ROOT" --yaml_path="$DATASET_CONFIG_PATH"
         --dataset.action_mode="${ACTION_MODE:-delta}"
         --dataset.use_external_stats=true
         --dataset.retarget_stats_dir="$RETARGET_STATS_DIR" --dataset.embodiments="${EMBODIMENTS:-[]}"
@@ -77,6 +82,7 @@ else
     )
     [[ -z "${EXTERNAL_STATS_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.external_stats_path="$EXTERNAL_STATS_PATH")
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
+    [[ -z "${IDLE_MOTION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_motion_threshold="$IDLE_MOTION_THRESHOLD")
 fi
 NODE_COUNT="${PET_NNODES:-${NODE_COUNT:-1}}"
 NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"

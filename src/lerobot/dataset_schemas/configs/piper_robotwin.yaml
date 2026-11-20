@@ -1,5 +1,6 @@
 # Piper RobotWin robot
 robot_type: piper_robotwin
+embodiment_name: piper
 unified_action_reorder: &unified_piper_robotwin
   - [0, 6, 58, 64]
   - [6, 7, 14, 15]

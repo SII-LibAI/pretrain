@@ -25,7 +25,7 @@ python util_scripts/compute_synthetic_embodiment_stats.py \
     
 """
 from lerobot.datasets.synthetic_embodiment import DEFAULT_ANNOTATION_FILE, EmbodimentSpec
-from lerobot.datasets.retarget_actions import RetargetActionSource
+from lerobot.datasets.retarget_actions import HEAD_EEF_MASK, RetargetActionSource
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -123,12 +123,15 @@ def _compute_one_root(
     action_mode: str,
     stride: int = 1,
     action_space: str = "legacy",
+    active_head: bool = False,
+    idle_motion_threshold: float | None = None,
 ):
     """Worker: accumulate each embodiment's trainable state/action vectors."""
     from lerobot.transforms.core import DeltaActionTransformFn
 
     source = RetargetActionSource(root, chunk_size, stride=stride, embodiments=embodiments,
-                                  action_space=action_space, action_mode=action_mode, annotation_file=annotation_file)
+                                  action_space=action_space, action_mode=action_mode, active_head=active_head,
+                                  idle_motion_threshold=idle_motion_threshold, annotation_file=annotation_file)
     specs, schemas = source.specs, source.schemas
     accumulators = {
         spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
@@ -161,6 +164,22 @@ def _compute_one_root(
 
     training = {spec.name: {**source.training_spec, "action_mask_spec": schema.action_mask_spec}
                 for spec, schema in zip(specs, schemas, strict=True)}
+    if source.head_spec is not None:
+        head = source.head_spec
+        state_stats, action_stats = RunningVectorStats(head.dim), RunningVectorStats(head.dim)
+        anchors = np.flatnonzero(source.candidate_masks)
+        for start in range(0, len(anchors), batch_size):
+            windows = [source.read_head_window(int(row)) for row in anchors[start:start + batch_size]]
+            poses, valid = (np.stack(items) for items in zip(*windows, strict=True))
+            state, future = poses[:, 0], poses[:, 1:]
+            state_stats.update(state[valid[:, 0]])
+            if action_mode == "delta":
+                xyz = slice(0, HEAD_EEF_MASK[0])
+                future[..., xyz] -= state[:, None, xyz]
+            action_stats.update(future[valid[:, :1] & valid[:, 1:]])
+        specs = [*specs, head]
+        accumulators[head.name] = state_stats, action_stats
+        training[head.name] = {**source.training_spec, "action_mask_spec": list(HEAD_EEF_MASK)}
     return tuple(specs), accumulators, training
 
 
@@ -175,6 +194,8 @@ def compute_embodiment_stats(
     action_mode: str = "delta",
     stride: int = 1,
     action_space: str = "legacy",
+    active_head: bool = False,
+    idle_motion_threshold: float | None = None,
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], tuple[EmbodimentSpec, ...]]:
     """Aggregate worker-local statistics, parallelized across dataset roots."""
     if chunk_size < 1 or batch_size < 1 or num_workers < 1 or stride < 1:
@@ -185,7 +206,8 @@ def compute_embodiment_stats(
     if not roots:
         raise ValueError("dataset_roots is empty")
     jobs = [
-        (root, annotation_file, embodiments, chunk_size, batch_size, action_mode, stride, action_space)
+        (root, annotation_file, embodiments, chunk_size, batch_size, action_mode, stride, action_space, active_head,
+         idle_motion_threshold)
         for root in roots
     ]
     if num_workers == 1:
@@ -210,7 +232,7 @@ def compute_embodiment_stats(
             state_stats.merge(worker_state)
             action_stats.merge(worker_action)
 
-    reference_specs = tuple(spec for name, spec in sorted(specs_by_name.items()) if accumulators[name][0].count)
+    reference_specs = tuple(spec for name, spec in sorted(specs_by_name.items()) if accumulators[name][1].count)
     if not reference_specs:
         raise ValueError("No valid state/action windows for the selected embodiments")
     stats = {
@@ -284,6 +306,9 @@ def parse_args() -> argparse.Namespace:
         help="Action representation whose normalization statistics are computed.",
     )
     parser.add_argument("--action-space", choices=("legacy", "unified72"), default="legacy")
+    parser.add_argument("--active-head", action="store_true", help="Also compute shared action.head_eef statistics.")
+    parser.add_argument("--idle-motion-threshold", type=float,
+                        help="Match dataset.idle_motion_threshold when training with wrist idle filtering.")
     parser.add_argument("--stride", type=int, default=1, help="Future pose stride; match policy.action_frame_stride.")
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument(
@@ -308,6 +333,8 @@ def main() -> None:
         action_mode=args.action_mode,
         stride=args.stride,
         action_space=args.action_space,
+        active_head=args.active_head,
+        idle_motion_threshold=args.idle_motion_threshold,
     )
     output_dir = (
         Path(args.output_dir)
