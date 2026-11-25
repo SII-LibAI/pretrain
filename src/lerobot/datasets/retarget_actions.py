@@ -19,7 +19,7 @@ HEAD_EEF_DIM = 7
 HEAD_EEF_MASK = (3, -4)  # Delta translation, absolute quaternion, like the arm EEF.
 IDLE_WINDOW = 32
 MIN_ACTIVE_WINDOW_RATIO = 0.7
-IDLE_ROTATION_THRESHOLD = 0.1  # rad/s
+DEFAULT_IDLE_ROTATION_THRESHOLD = 0.1  # rad/s
 IDLE_MAD_MULTIPLIER = 6
 WRIST_POSITION_KEYS = ("human_eef.right.pos", "human_eef.left.pos")
 WRIST_ROTATION_KEYS = ("human_eef.right.rot", "human_eef.left.rot")
@@ -74,13 +74,15 @@ def _idle_windows(pose, valid, threshold, angular, steps, outlier):
     return visible & (score > threshold), visible, jump_windows
 
 
-def retarget_idle_bounds(root, path, threshold):
+def retarget_idle_bounds(root, path, threshold, *, rotation_threshold=DEFAULT_IDLE_ROTATION_THRESHOLD):
     """Return crops for assessed episodes; None values mark rejected episodes."""
-    return _scan_retarget_idle(root, path, threshold)[0]
+    return _scan_retarget_idle(root, path, threshold, rotation_threshold)[0]
 
 
-def _scan_retarget_idle(root, path, threshold):
+def _scan_retarget_idle(root, path, threshold, rotation_threshold):
     """Return idle crops and a bad-frame mask in annotation row order."""
+    if not math.isfinite(rotation_threshold) or rotation_threshold <= 0:
+        raise ValueError("idle_rotation_threshold must be finite and positive (rad/s)")
     if threshold is None or not path.is_file():
         return None, None
     if not math.isfinite(threshold) or threshold <= 0:
@@ -127,7 +129,7 @@ def _scan_retarget_idle(root, path, threshold):
                 valid &= norm > 0
                 pose[valid] /= norm[valid, None]
             pose[~valid] = 0
-            signals.append((pose, valid, IDLE_ROTATION_THRESHOLD / fps if angular else threshold, angular))
+            signals.append((pose, valid, rotation_threshold / fps if angular else threshold, angular))
     bounds = np.r_[0, np.flatnonzero(np.diff(episodes) != 0) + 1, len(episodes)]
     crops = {}
     bad_rows = np.zeros(len(indices), dtype=bool)
@@ -179,7 +181,7 @@ class RetargetActionSource:
     """Read one embodiment plus its shared robot EEF, preserving source frame indices."""
     def __init__(self, root, chunk_size, *, stride=1, embodiments=None, action_space="unified72",
                  action_mode="delta", active_head=False, stats_dir=None, row_group_cache_size=2,
-                 idle_motion_threshold=None,
+                 idle_motion_threshold=None, idle_rotation_threshold=DEFAULT_IDLE_ROTATION_THRESHOLD,
                  annotation_file="meta/annotations/action.parquet"):
         if chunk_size < 1 or stride < 1:
             raise ValueError("chunk_size and stride must be positive")
@@ -195,6 +197,7 @@ class RetargetActionSource:
         self.chunk_size, self.stride = chunk_size, stride
         self.action_space, self.action_mode = action_space, action_mode
         self.idle_motion_threshold = idle_motion_threshold
+        self.idle_rotation_threshold = idle_rotation_threshold
         self.offsets = np.concatenate(([0], action_offsets(chunk_size, stride, retarget=True)))
         self.table = SyntheticActionTable.from_parquet(
             self.root / annotation_file, row_group_cache_size=row_group_cache_size)
@@ -264,7 +267,8 @@ class RetargetActionSource:
         self.indices, self.episodes, self.frames = [
             _scalar_column_to_numpy(metadata[key], np.int64) for key in ("index", "episode_index", "frame_index")]
         _validate_annotation_rows(self.indices, self.episodes, self.frames, self.table.path, allow_sparse=True)
-        self.idle_bounds, bad_rows = _scan_retarget_idle(self.root, self.table.path, idle_motion_threshold)
+        self.idle_bounds, bad_rows = _scan_retarget_idle(
+            self.root, self.table.path, idle_motion_threshold, idle_rotation_threshold)
         continuous = (np.diff(self.episodes) == 0) & (np.diff(self.frames) == 1)
         if bad_rows is not None:
             continuous &= ~(bad_rows[:-1] | bad_rows[1:])
@@ -315,7 +319,7 @@ class RetargetActionSource:
         if self.idle_motion_threshold is not None:
             spec["idle_filter"] = {"window": IDLE_WINDOW, "min_active_ratio": MIN_ACTIVE_WINDOW_RATIO,
                                    "motion_threshold": self.idle_motion_threshold,
-                                   "rotation_threshold_rad_s": IDLE_ROTATION_THRESHOLD,
+                                   "rotation_threshold_rad_s": self.idle_rotation_threshold,
                                    "mad_multiplier": IDLE_MAD_MULTIPLIER, "outlier_scope": "window",
                                    "bad_frame_policy": "split_action"}
         return spec

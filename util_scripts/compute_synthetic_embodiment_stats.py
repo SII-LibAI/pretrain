@@ -25,7 +25,7 @@ python util_scripts/compute_synthetic_embodiment_stats.py \
     
 """
 from lerobot.datasets.synthetic_embodiment import DEFAULT_ANNOTATION_FILE, EmbodimentSpec
-from lerobot.datasets.retarget_actions import HEAD_EEF_MASK, RetargetActionSource
+from lerobot.datasets.retarget_actions import DEFAULT_IDLE_ROTATION_THRESHOLD, HEAD_EEF_MASK, RetargetActionSource
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -125,13 +125,15 @@ def _compute_one_root(
     action_space: str = "legacy",
     active_head: bool = False,
     idle_motion_threshold: float | None = None,
+    idle_rotation_threshold: float = DEFAULT_IDLE_ROTATION_THRESHOLD,
 ):
     """Worker: accumulate each embodiment's trainable state/action vectors."""
     from lerobot.transforms.core import DeltaActionTransformFn
 
     source = RetargetActionSource(root, chunk_size, stride=stride, embodiments=embodiments,
                                   action_space=action_space, action_mode=action_mode, active_head=active_head,
-                                  idle_motion_threshold=idle_motion_threshold, annotation_file=annotation_file)
+                                  idle_motion_threshold=idle_motion_threshold,
+                                  idle_rotation_threshold=idle_rotation_threshold, annotation_file=annotation_file)
     specs, schemas = source.specs, source.schemas
     accumulators = {
         spec.name: (RunningVectorStats(spec.dim), RunningVectorStats(spec.dim))
@@ -196,6 +198,7 @@ def compute_embodiment_stats(
     action_space: str = "legacy",
     active_head: bool = False,
     idle_motion_threshold: float | None = None,
+    idle_rotation_threshold: float = DEFAULT_IDLE_ROTATION_THRESHOLD,
 ) -> tuple[dict[str, dict[str, dict[str, Any]]], tuple[EmbodimentSpec, ...]]:
     """Aggregate worker-local statistics, parallelized across dataset roots."""
     if chunk_size < 1 or batch_size < 1 or num_workers < 1 or stride < 1:
@@ -207,7 +210,7 @@ def compute_embodiment_stats(
         raise ValueError("dataset_roots is empty")
     jobs = [
         (root, annotation_file, embodiments, chunk_size, batch_size, action_mode, stride, action_space, active_head,
-         idle_motion_threshold)
+         idle_motion_threshold, idle_rotation_threshold)
         for root in roots
     ]
     if num_workers == 1:
@@ -309,6 +312,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-head", action="store_true", help="Also compute shared action.head_eef statistics.")
     parser.add_argument("--idle-motion-threshold", type=float,
                         help="Match dataset.idle_motion_threshold when training with wrist idle filtering.")
+    parser.add_argument("--idle-rotation-threshold", type=float, default=DEFAULT_IDLE_ROTATION_THRESHOLD,
+                        help="Wrist rotation threshold in rad/s; match dataset.idle_rotation_threshold (default: %(default)s).")
     parser.add_argument("--stride", type=int, default=1, help="Future pose stride; match policy.action_frame_stride.")
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument(
@@ -335,6 +340,7 @@ def main() -> None:
         action_space=args.action_space,
         active_head=args.active_head,
         idle_motion_threshold=args.idle_motion_threshold,
+        idle_rotation_threshold=args.idle_rotation_threshold,
     )
     output_dir = (
         Path(args.output_dir)

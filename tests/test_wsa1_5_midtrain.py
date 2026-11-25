@@ -349,7 +349,8 @@ def test_idle_filter_crops_both_stages_and_matching_stats(tmp_path, monkeypatch)
     fixture.base.meta.episodes = {i: entry for i in range(len(lengths))}
     monkeypatch.setattr("lerobot.policies.wsa1_5.dataset_wsa1_5.decode_video_frames",
                         lambda path, times, *args: torch.zeros(len(times), 3, 16, 16))
-    cfg = replace(fixture.config, idle_motion_threshold=0.05, use_subtask=False, allow_endframe_3d=True,
+    cfg = replace(fixture.config, idle_motion_threshold=0.05, idle_rotation_threshold=0.2,
+                  use_subtask=False, allow_endframe_3d=True,
                   action_mode="delta",
                   retarget_stats_dir=str(tmp_path / "norm"))
     pretrain = WSA1_5Dataset(fixture.base, cfg, include_3d_targets=True)
@@ -361,7 +362,7 @@ def test_idle_filter_crops_both_stages_and_matching_stats(tmp_path, monkeypatch)
     torch.testing.assert_close(tail["frame_timestamps"], torch.full((4,), 90 / 30, dtype=torch.float64))
 
     stats, _ = compute_embodiment_stats([tmp_path], chunk_size=32, action_space="unified72",
-                                       idle_motion_threshold=0.05)
+                                       idle_motion_threshold=0.05, idle_rotation_threshold=0.2)
     body_stats = stats["egodex_synthetic_piper"]
     assert body_stats["observation.state"]["count"] == 33
     assert body_stats["action"]["count"] == 33 * 32
@@ -371,7 +372,7 @@ def test_idle_filter_crops_both_stages_and_matching_stats(tmp_path, monkeypatch)
     assert (midtrain.annotation_rows[500:600] == -1).all()
     assert not midtrain[0]["history_valid"].any()
     with pytest.raises(ValueError, match="window/representation"):
-        RetargetActionSource(tmp_path, 32, idle_motion_threshold=0.1, stats_dir=tmp_path / "norm")
+        RetargetActionSource(tmp_path, 32, idle_motion_threshold=0.05, stats_dir=tmp_path / "norm")
 
 
 def test_idle_filter_counts_rotation_and_excludes_invalid_windows(tmp_path):
@@ -417,6 +418,7 @@ def test_idle_filter_counts_rotation_and_excludes_invalid_windows(tmp_path):
     assert retarget_idle_bounds(tmp_path, annotation, 0.05) == {
         0: (23, 158), 1: None, 2: (9, 171), 3: None, 4: (9, 151),
     }
+    assert retarget_idle_bounds(tmp_path, annotation, 0.05, rotation_threshold=0.8)[0] == (47, 84)
     source = RetargetActionSource(tmp_path, 16, stride=2, idle_motion_threshold=0.05)
     assert source.frames[(source.episodes == 4) & (source.candidate_masks != 0)].tolist() == [
         *range(9, 48), *range(81, 119),

@@ -83,6 +83,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
     [[ -z "${EXTERNAL_STATS_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.external_stats_path="$EXTERNAL_STATS_PATH")
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
     [[ -z "${IDLE_MOTION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_motion_threshold="$IDLE_MOTION_THRESHOLD")
+    [[ -z "${IDLE_ROTATION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_rotation_threshold="$IDLE_ROTATION_THRESHOLD")
 fi
 NODE_COUNT="${PET_NNODES:-${NODE_COUNT:-1}}"
 NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"

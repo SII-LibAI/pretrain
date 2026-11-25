@@ -318,6 +318,7 @@ class WSA1_5Dataset(Dataset):
                     base.root, action_config.action_chunk_size, stride=action_config.action_frame_stride,
                     embodiments=config.embodiments or None, action_mode=action_config.action_mode,
                     active_head=action_config.active_head, idle_motion_threshold=config.idle_motion_threshold,
+                    idle_rotation_threshold=config.idle_rotation_threshold,
                     stats_dir=config.retarget_stats_dir, row_group_cache_size=config.annotation_row_group_cache_size)
                 self.retarget_codecs = {}
                 for body in self.retarget_source.active_bodies:
@@ -400,7 +401,8 @@ class WSA1_5Dataset(Dataset):
         assert cursor == len(self.timestamps), "Segments must cover every loaded row exactly once"
         idle_bounds = (self.retarget_source.idle_bounds if self.retarget_source is not None else
                        retarget_idle_bounds(self.root, self.root / "meta/annotations/action.parquet",
-                                            config.idle_motion_threshold))
+                                            config.idle_motion_threshold,
+                                            rotation_threshold=config.idle_rotation_threshold))
         self.idle_bounds = None
         if idle_bounds is not None:
             self.idle_bounds = {}

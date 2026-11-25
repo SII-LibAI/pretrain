@@ -4,6 +4,7 @@ import math
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.retarget_actions import DEFAULT_IDLE_ROTATION_THRESHOLD
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import MultiGroupCosineDecayWithWarmupSchedulerConfig
 
@@ -270,6 +271,7 @@ class WSA1_5DatasetConfig(DatasetConfig):
     embodiments: list[str] = field(default_factory=list)  # Empty selects every available IK embodiment.
     retarget_stats_dir: str | None = None
     idle_motion_threshold: float | None = None  # Wrist XYZ threshold in annotation units; None disables filtering.
+    idle_rotation_threshold: float = DEFAULT_IDLE_ROTATION_THRESHOLD  # Mean wrist rotation in rad/s.
     annotation_row_group_cache_size: int = 2
     image_augment: bool = False
     object_paste: bool = False
@@ -285,6 +287,8 @@ class WSA1_5DatasetConfig(DatasetConfig):
             not math.isfinite(self.idle_motion_threshold) or self.idle_motion_threshold <= 0
         ):
             raise ValueError("idle_motion_threshold must be finite and positive")
+        if not math.isfinite(self.idle_rotation_threshold) or self.idle_rotation_threshold <= 0:
+            raise ValueError("idle_rotation_threshold must be finite and positive (rad/s)")
         if type(self.use_subtask) is not bool or type(self.allow_endframe_3d) is not bool:
             raise TypeError("use_subtask and allow_endframe_3d must be boolean")
         if type(self.image_augment) is not bool or type(self.object_paste) is not bool:

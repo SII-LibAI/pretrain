@@ -76,6 +76,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
     )
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
     [[ -z "${IDLE_MOTION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_motion_threshold="$IDLE_MOTION_THRESHOLD")
+    [[ -z "${IDLE_ROTATION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_rotation_threshold="$IDLE_ROTATION_THRESHOLD")
 fi
 
 # PROC_PER_NODE="${PROC_PER_NODE:-8}"
