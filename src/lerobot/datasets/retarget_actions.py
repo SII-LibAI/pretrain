@@ -19,7 +19,10 @@ HEAD_EEF_DIM = 7
 HEAD_EEF_MASK = (3, -4)  # Delta translation, absolute quaternion, like the arm EEF.
 IDLE_WINDOW = 32
 MIN_ACTIVE_WINDOW_RATIO = 0.7
+IDLE_ROTATION_THRESHOLD = 0.1  # rad/s
+IDLE_MAD_MULTIPLIER = 6
 WRIST_POSITION_KEYS = ("human_eef.right.pos", "human_eef.left.pos")
+WRIST_ROTATION_KEYS = ("human_eef.right.rot", "human_eef.left.rot")
 
 
 def action_offsets(chunk_size, stride=1, *, retarget=False):
@@ -27,6 +30,41 @@ def action_offsets(chunk_size, stride=1, *, retarget=False):
     if chunk_size < 1 or stride < 1:
         raise ValueError("chunk_size and stride must be positive")
     return (np.arange(chunk_size, dtype=np.int64) + int(retarget)) * stride
+
+
+def _pose_distance(a, b, angular):
+    if not angular:
+        return np.linalg.norm(a - b, axis=1)
+    # Align quaternion signs before measuring the shortest relative rotation.
+    b = np.where((a * b).sum(axis=1, keepdims=True) < 0, -b, b)
+    return 4 * np.arctan2(np.linalg.norm(a - b, axis=1), np.linalg.norm(a + b, axis=1))
+
+
+def _idle_windows(pose, valid, threshold, angular):
+    windows = np.lib.stride_tricks.sliding_window_view
+    visible = windows(valid, IDLE_WINDOW).all(axis=1)
+    steps = _pose_distance(pose[:-1], pose[1:], angular)
+    valid_steps = valid[:-1] & valid[1:]
+    # Pauses must not drive the outlier cutoff below ordinary motion.
+    min_step = threshold if angular else threshold / (IDLE_WINDOW - 1)
+    moving = steps[valid_steps & (steps > min_step)]
+    if moving.size:
+        median = np.median(moving)
+        mad = np.median(np.abs(moving - median))
+        tolerance = np.finfo(np.float32).eps * max(1., median)
+        outlier = valid_steps & (steps > median + IDLE_MAD_MULTIPLIER * mad + tolerance)
+        if mad <= tolerance:
+            # A lone out-and-back jump otherwise defines its own zero-MAD baseline.
+            fast = valid_steps & (steps > min_step) & (steps >= median - tolerance)
+            spike = fast[:-1] & fast[1:] & (_pose_distance(pose[:-2], pose[2:], angular) <= min_step)
+            outlier[:-1] |= spike
+            outlier[1:] |= spike
+        visible &= ~windows(outlier, IDLE_WINDOW - 1).any(axis=1)
+    if angular:
+        score = windows(steps, IDLE_WINDOW - 1).mean(axis=1)
+    else:
+        score = np.linalg.norm(np.ptp(windows(pose, IDLE_WINDOW, axis=0), axis=-1), axis=1)
+    return visible & (score > threshold), visible
 
 
 def retarget_idle_bounds(root, path, threshold):
@@ -45,7 +83,13 @@ def retarget_idle_bounds(root, path, threshold):
         return None
     if len(present) != len(keys):
         raise ValueError(f"{path}: incomplete wrist positions or validity columns for idle filtering")
-    metadata = parquet.read(columns=["index", "episode_index", "frame_index", *keys])
+    rotation_keys = set(WRIST_ROTATION_KEYS).intersection(parquet.schema_arrow.names)
+    if rotation_keys:
+        info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+        fps = float(info.get("fps", 0))
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f"{root}: idle rotation filtering requires a positive dataset fps")
+    metadata = parquet.read(columns=["index", "episode_index", "frame_index", *keys, *sorted(rotation_keys)])
     indices, episodes, frames = (_scalar_column_to_numpy(metadata[key], np.int64)
                                  for key in ("index", "episode_index", "frame_index"))
     _validate_annotation_rows(indices, episodes, frames, path, allow_sparse=True)
@@ -53,16 +97,25 @@ def retarget_idle_bounds(root, path, threshold):
     episode_table = pq.ParquetDataset(root / "meta/episodes").read(columns=list(episode_columns))
     episode_ranges = {ep: (lo, hi) for ep, lo, hi in zip(
         *(episode_table[key].to_pylist() for key in episode_columns), strict=True)}
-    poses, masks = [], []
-    for key, valid_key in zip(WRIST_POSITION_KEYS, HUMAN_EEF_VALID_KEYS, strict=True):
+    signals = []
+    for pos_key, rot_key, valid_key in zip(WRIST_POSITION_KEYS, WRIST_ROTATION_KEYS, HUMAN_EEF_VALID_KEYS, strict=True):
         if not pa.types.is_boolean(metadata[valid_key].type):
             raise TypeError(f"{path}: {valid_key} must be boolean")
-        column = metadata[key]
-        missing = pa.scalar([float("nan")] * 3, type=column.type)
-        position = _vector_column_to_numpy(column.fill_null(missing), expected_dim=3)
-        valid = _scalar_column_to_numpy(metadata[valid_key].fill_null(False), np.bool_)
-        poses.append(position)
-        masks.append(valid & np.isfinite(position).all(axis=1))
+        annotated = _scalar_column_to_numpy(metadata[valid_key].fill_null(False), np.bool_)
+        for key, dim in ((pos_key, 3), (rot_key, 4)):
+            if key not in metadata.column_names:
+                continue
+            column = metadata[key]
+            missing = pa.scalar([float("nan")] * dim, type=column.type)
+            pose = _vector_column_to_numpy(column.fill_null(missing), expected_dim=dim).astype(np.float64)
+            valid = annotated & np.isfinite(pose).all(axis=1)
+            angular = dim == 4
+            if angular:
+                norm = np.linalg.norm(pose, axis=1)
+                valid &= norm > 0
+                pose[valid] /= norm[valid, None]
+            pose[~valid] = 0
+            signals.append((pose, valid, IDLE_ROTATION_THRESHOLD / fps if angular else threshold, angular))
     bounds = np.r_[0, np.flatnonzero(np.diff(episodes) != 0) + 1, len(episodes)]
     crops = {}
     for start, end in zip(bounds[:-1], bounds[1:], strict=True):
@@ -74,22 +127,23 @@ def retarget_idle_bounds(root, path, threshold):
                 or frames[start] < 0 or indices[end - 1] >= source_stop):
             raise ValueError(f"{path}: annotation indices do not align with episode {ep}")
         length = end - start
-        if length != source_stop - source_start or not any(mask[start:end].any() for mask in masks):
+        if length != source_stop - source_start or not any(valid[start:end].any() for _, valid, _, _ in signals):
             continue
         crops[ep] = None
         if length < IDLE_WINDOW:
             continue
         active = np.zeros(length - IDLE_WINDOW + 1, dtype=bool)
-        for position, valid in zip(poses, masks, strict=True):
-            xyz = np.lib.stride_tricks.sliding_window_view(position[start:end], IDLE_WINDOW, axis=0)
-            visible = np.lib.stride_tricks.sliding_window_view(valid[start:end], IDLE_WINDOW).all(axis=1)
-            extent = np.ptp(xyz, axis=-1)
-            active |= visible & (np.linalg.norm(extent, axis=1) > threshold)
+        valid_windows = np.zeros_like(active)
+        for pose, valid, signal_threshold, angular in signals:
+            moving_windows, visible = _idle_windows(pose[start:end], valid[start:end], signal_threshold, angular)
+            active |= moving_windows
+            valid_windows |= visible
         moving = np.flatnonzero(active)
         if not len(moving):
             continue
         first, last = moving[0], moving[-1]
-        if active[first:last + 1].mean() >= MIN_ACTIVE_WINDOW_RATIO:
+        # Keep all frames between these windows, including pauses and invalid measurements.
+        if len(moving) / valid_windows[first:last + 1].sum() >= MIN_ACTIVE_WINDOW_RATIO:
             lo = int(frames[start + first])
             hi = int(frames[start + last + IDLE_WINDOW - 1]) + 1
             crops[ep] = (lo, hi)
@@ -234,7 +288,9 @@ class RetargetActionSource:
                 "chunk_size": self.chunk_size, "stride": self.stride}
         if self.idle_motion_threshold is not None:
             spec["idle_filter"] = {"window": IDLE_WINDOW, "min_active_ratio": MIN_ACTIVE_WINDOW_RATIO,
-                                   "motion_threshold": self.idle_motion_threshold}
+                                   "motion_threshold": self.idle_motion_threshold,
+                                   "rotation_threshold_rad_s": IDLE_ROTATION_THRESHOLD,
+                                   "mad_multiplier": IDLE_MAD_MULTIPLIER}
         return spec
 
     @property

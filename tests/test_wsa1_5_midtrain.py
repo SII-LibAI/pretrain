@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from lerobot.dataset_schemas import DatasetSchema, get_registry, get_schema
-from lerobot.datasets.retarget_actions import RetargetActionSource
+from lerobot.datasets.retarget_actions import RetargetActionSource, retarget_idle_bounds
 from lerobot.policies.wsa1_5.dataset_wsa1_5 import WSA1_5Dataset, action_prompt, wsa1_5_collate
 from test_wsa1_5_action import action_config, action_policy
 from test_wsa1_5_dataset import FrameTable, make_data
@@ -44,7 +44,7 @@ def write_retarget(root, bodies=("piper", "ur7e_wuji"), *, split_episode=False, 
     directory = root / "meta/annotations"
     directory.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table(payload), directory / "action.parquet", row_group_size=9)
-    (root / "meta/info.json").write_text(json.dumps({"robot_type": robot_type}), encoding="utf-8")
+    (root / "meta/info.json").write_text(json.dumps({"robot_type": robot_type, "fps": 30}), encoding="utf-8")
 
 
 def mid_config(active_head=False, **kwargs):
@@ -372,6 +372,40 @@ def test_idle_filter_crops_both_stages_and_matching_stats(tmp_path, monkeypatch)
     assert not midtrain[0]["history_valid"].any()
     with pytest.raises(ValueError, match="window/representation"):
         RetargetActionSource(tmp_path, 32, idle_motion_threshold=0.1, stats_dir=tmp_path / "norm")
+
+
+def test_idle_filter_counts_rotation_and_excludes_invalid_windows(tmp_path):
+    write_retarget(tmp_path, ("piper",))
+    local_frames = np.arange(180)
+    frames = np.tile(local_frames, 4)
+    episodes = np.repeat(np.arange(4), 180)
+    xyz = np.zeros((len(frames), 3))
+    angles = np.zeros(len(frames))
+    # Rotation-only motion separated by a real pause, with changing quaternion signs.
+    rotating = ((local_frames > 50) & (local_frames <= 80)) | ((local_frames > 115) & (local_frames <= 130))
+    angles[episodes == 0] = np.cumsum(rotating * (0.029 + 0.001 * (local_frames % 3)))
+    angles[(episodes == 0) & (frames >= 170)] += 2  # A tracking jump far above the moving baseline.
+    # Isolated position and rotation glitches cannot make a static episode active.
+    xyz[(episodes == 1) & (frames == 70), 0] = 2
+    angles[(episodes == 1) & (frames == 100)] = 2
+    for ep in (2, 3):
+        xyz[episodes == ep, 0] = (local_frames >= 40) + (local_frames >= 140).astype(int)
+    # The same pair of bursts should pass only when the middle windows lack measurements.
+    valid = (episodes != 2) | (frames < 45) | (frames >= 136)
+    quats = np.column_stack((np.zeros((len(frames), 2)), np.sin(angles / 2), np.cos(angles / 2)))
+    quats[frames % 2 == 0] *= -1
+    columns = {"index": np.arange(len(frames)), "episode_index": episodes, "frame_index": frames,
+               "human_eef.left.pos": xyz.tolist(), "human_eef.left.rot": quats.tolist(),
+               "human_eef.right.pos": np.zeros_like(xyz).tolist(),
+               "human_eef.left.valid": valid, "human_eef.right.valid": valid}
+    annotation = tmp_path / "meta/annotations/action.parquet"
+    pq.write_table(pa.table(columns), annotation)
+    episode_dir = tmp_path / "meta/episodes"
+    episode_dir.mkdir()
+    pq.write_table(pa.table({"episode_index": np.arange(4), "dataset_from_index": np.arange(4) * 180,
+                             "dataset_to_index": np.arange(1, 5) * 180}), episode_dir / "episodes.parquet")
+
+    assert retarget_idle_bounds(tmp_path, annotation, 0.05) == {0: (23, 158), 1: None, 2: (9, 171), 3: None}
 
 
 def test_all_registered_unified_maps_have_unique_destinations():
