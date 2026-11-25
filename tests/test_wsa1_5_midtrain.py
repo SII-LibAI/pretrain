@@ -377,8 +377,8 @@ def test_idle_filter_crops_both_stages_and_matching_stats(tmp_path, monkeypatch)
 def test_idle_filter_counts_rotation_and_excludes_invalid_windows(tmp_path):
     write_retarget(tmp_path, ("piper",))
     local_frames = np.arange(180)
-    frames = np.tile(local_frames, 4)
-    episodes = np.repeat(np.arange(4), 180)
+    frames = np.tile(local_frames, 5)
+    episodes = np.repeat(np.arange(5), 180)
     xyz = np.zeros((len(frames), 3))
     angles = np.zeros(len(frames))
     # Rotation-only motion separated by a real pause, with changing quaternion signs.
@@ -390,22 +390,42 @@ def test_idle_filter_counts_rotation_and_excludes_invalid_windows(tmp_path):
     angles[(episodes == 1) & (frames == 100)] = 2
     for ep in (2, 3):
         xyz[episodes == ep, 0] = (local_frames >= 40) + (local_frames >= 140).astype(int)
+    xyz[episodes == 4, 0] = (local_frames >= 40) + (local_frames >= 120).astype(int)
+    angles[(episodes == 4) & (frames == 80)] = 2  # Jump windows don't count as idle in the ratio.
+    right_xyz = np.zeros_like(xyz)
+    right_xyz[(episodes == 0) & (frames >= 170), 0] = 1  # Valid motion cannot rescue a jump window.
     # The same pair of bursts should pass only when the middle windows lack measurements.
     valid = (episodes != 2) | (frames < 45) | (frames >= 136)
     quats = np.column_stack((np.zeros((len(frames), 2)), np.sin(angles / 2), np.cos(angles / 2)))
     quats[frames % 2 == 0] *= -1
+    piper = np.zeros((len(frames), 16))
+    piper[(episodes == 4) & (frames == 80)] = 1000
     columns = {"index": np.arange(len(frames)), "episode_index": episodes, "frame_index": frames,
+               "action.piper": piper.tolist(), "action.piper_valid": np.ones(len(frames), dtype=bool),
                "human_eef.left.pos": xyz.tolist(), "human_eef.left.rot": quats.tolist(),
-               "human_eef.right.pos": np.zeros_like(xyz).tolist(),
+               "human_eef.right.pos": right_xyz.tolist(),
+               "human_eef.right.rot": [[0., 0., 0., 1.]] * len(frames),
+               "human_eef.left.grasp": np.zeros(len(frames)), "human_eef.right.grasp": np.zeros(len(frames)),
                "human_eef.left.valid": valid, "human_eef.right.valid": valid}
     annotation = tmp_path / "meta/annotations/action.parquet"
     pq.write_table(pa.table(columns), annotation)
     episode_dir = tmp_path / "meta/episodes"
     episode_dir.mkdir()
-    pq.write_table(pa.table({"episode_index": np.arange(4), "dataset_from_index": np.arange(4) * 180,
-                             "dataset_to_index": np.arange(1, 5) * 180}), episode_dir / "episodes.parquet")
+    pq.write_table(pa.table({"episode_index": np.arange(5), "dataset_from_index": np.arange(5) * 180,
+                             "dataset_to_index": np.arange(1, 6) * 180}), episode_dir / "episodes.parquet")
 
-    assert retarget_idle_bounds(tmp_path, annotation, 0.05) == {0: (23, 158), 1: None, 2: (9, 171), 3: None}
+    assert retarget_idle_bounds(tmp_path, annotation, 0.05) == {
+        0: (23, 158), 1: None, 2: (9, 171), 3: None, 4: (9, 151),
+    }
+    source = RetargetActionSource(tmp_path, 16, stride=2, idle_motion_threshold=0.05)
+    assert source.frames[(source.episodes == 4) & (source.candidate_masks != 0)].tolist() == [
+        *range(9, 48), *range(81, 119),
+    ]
+    stats, _ = compute_embodiment_stats([tmp_path], chunk_size=16, stride=2,
+                                       action_space="unified72", idle_motion_threshold=0.05)
+    piper_stats = stats["egodex_synthetic_piper"]
+    assert piper_stats["action"]["count"] == np.count_nonzero(source.candidate_masks) * 16
+    assert max(piper_stats["action"]["max"]) < 1000
 
 
 def test_all_registered_unified_maps_have_unique_destinations():

@@ -40,47 +40,59 @@ def _pose_distance(a, b, angular):
     return 4 * np.arctan2(np.linalg.norm(a - b, axis=1), np.linalg.norm(a + b, axis=1))
 
 
-def _idle_windows(pose, valid, threshold, angular):
-    windows = np.lib.stride_tricks.sliding_window_view
-    visible = windows(valid, IDLE_WINDOW).all(axis=1)
-    steps = _pose_distance(pose[:-1], pose[1:], angular)
-    valid_steps = valid[:-1] & valid[1:]
+def _pose_jumps(pose, steps, valid_steps, threshold, angular):
     # Pauses must not drive the outlier cutoff below ordinary motion.
     min_step = threshold if angular else threshold / (IDLE_WINDOW - 1)
     moving = steps[valid_steps & (steps > min_step)]
-    if moving.size:
-        median = np.median(moving)
-        mad = np.median(np.abs(moving - median))
-        tolerance = np.finfo(np.float32).eps * max(1., median)
-        outlier = valid_steps & (steps > median + IDLE_MAD_MULTIPLIER * mad + tolerance)
-        if mad <= tolerance:
-            # A lone out-and-back jump otherwise defines its own zero-MAD baseline.
-            fast = valid_steps & (steps > min_step) & (steps >= median - tolerance)
-            spike = fast[:-1] & fast[1:] & (_pose_distance(pose[:-2], pose[2:], angular) <= min_step)
-            outlier[:-1] |= spike
-            outlier[1:] |= spike
-        visible &= ~windows(outlier, IDLE_WINDOW - 1).any(axis=1)
+    if not moving.size:
+        return np.zeros_like(valid_steps), np.empty(0, dtype=np.int64)
+    median = np.median(moving)
+    mad = np.median(np.abs(moving - median))
+    tolerance = np.finfo(np.float32).eps * max(1., median)
+    outlier = valid_steps & (steps > median + IDLE_MAD_MULTIPLIER * mad + tolerance)
+    neighbor_distance = _pose_distance(pose[:-2], pose[2:], angular)
+    if mad <= tolerance:
+        # A lone out-and-back jump otherwise defines its own zero-MAD baseline.
+        fast = valid_steps & (steps > min_step) & (steps >= median - tolerance)
+        spike = fast[:-1] & fast[1:] & (neighbor_distance <= min_step)
+        outlier[:-1] |= spike
+        outlier[1:] |= spike
+    spike = outlier[:-1] & outlier[1:] & (neighbor_distance <= 2 * median + tolerance)
+    # Consecutive candidates cannot use each other as clean neighbors.
+    isolated = spike & ~np.r_[False, spike][:-1] & ~np.r_[spike, False][1:]
+    return outlier, np.flatnonzero(isolated) + 1
+
+
+def _idle_windows(pose, valid, threshold, angular, steps, outlier):
+    windows = np.lib.stride_tricks.sliding_window_view
+    visible = windows(valid, IDLE_WINDOW).all(axis=1)
+    jump_windows = windows(outlier, IDLE_WINDOW - 1).any(axis=1)
     if angular:
         score = windows(steps, IDLE_WINDOW - 1).mean(axis=1)
     else:
         score = np.linalg.norm(np.ptp(windows(pose, IDLE_WINDOW, axis=0), axis=-1), axis=1)
-    return visible & (score > threshold), visible
+    return visible & (score > threshold), visible, jump_windows
 
 
 def retarget_idle_bounds(root, path, threshold):
     """Return crops for assessed episodes; None values mark rejected episodes."""
+    return _scan_retarget_idle(root, path, threshold)[0]
+
+
+def _scan_retarget_idle(root, path, threshold):
+    """Return idle crops and a bad-frame mask in annotation row order."""
     if threshold is None or not path.is_file():
-        return None
+        return None, None
     if not math.isfinite(threshold) or threshold <= 0:
         raise ValueError("idle_motion_threshold must be finite and positive")
     parquet = pq.ParquetFile(path)
     if parquet.metadata.num_rows == 0:
-        return None
+        return None, None
     keys = (*WRIST_POSITION_KEYS, *HUMAN_EEF_VALID_KEYS)
     present = set(keys).intersection(parquet.schema_arrow.names)
     if not present:
         logging.info("[WSA idle] %s has no human wrist positions, keeping original windows", path)
-        return None
+        return None, None
     if len(present) != len(keys):
         raise ValueError(f"{path}: incomplete wrist positions or validity columns for idle filtering")
     rotation_keys = set(WRIST_ROTATION_KEYS).intersection(parquet.schema_arrow.names)
@@ -118,6 +130,7 @@ def retarget_idle_bounds(root, path, threshold):
             signals.append((pose, valid, IDLE_ROTATION_THRESHOLD / fps if angular else threshold, angular))
     bounds = np.r_[0, np.flatnonzero(np.diff(episodes) != 0) + 1, len(episodes)]
     crops = {}
+    bad_rows = np.zeros(len(indices), dtype=bool)
     for start, end in zip(bounds[:-1], bounds[1:], strict=True):
         ep = int(episodes[start])
         if ep not in episode_ranges:
@@ -127,17 +140,27 @@ def retarget_idle_bounds(root, path, threshold):
                 or frames[start] < 0 or indices[end - 1] >= source_stop):
             raise ValueError(f"{path}: annotation indices do not align with episode {ep}")
         length = end - start
-        if length != source_stop - source_start or not any(valid[start:end].any() for _, valid, _, _ in signals):
-            continue
-        crops[ep] = None
-        if length < IDLE_WINDOW:
-            continue
-        active = np.zeros(length - IDLE_WINDOW + 1, dtype=bool)
+        assessed = length == source_stop - source_start and any(valid[start:end].any() for _, valid, _, _ in signals)
+        if assessed:
+            crops[ep] = None
+        active = np.zeros(max(0, length - IDLE_WINDOW + 1) if assessed else 0, dtype=bool)
         valid_windows = np.zeros_like(active)
+        jump_windows = np.zeros_like(active)
+        contiguous = np.diff(frames[start:end]) == 1
         for pose, valid, signal_threshold, angular in signals:
-            moving_windows, visible = _idle_windows(pose[start:end], valid[start:end], signal_threshold, angular)
+            pose, valid = pose[start:end], valid[start:end]
+            steps = _pose_distance(pose[:-1], pose[1:], angular)
+            outlier, bad_frames = _pose_jumps(pose, steps, contiguous & valid[:-1] & valid[1:],
+                                              signal_threshold, angular)
+            bad_rows[start + bad_frames] = True
+            if not active.size:
+                continue
+            moving_windows, visible, jumps = _idle_windows(pose, valid, signal_threshold, angular, steps, outlier)
             active |= moving_windows
             valid_windows |= visible
+            jump_windows |= jumps
+        valid_windows &= ~jump_windows
+        active &= valid_windows
         moving = np.flatnonzero(active)
         if not len(moving):
             continue
@@ -149,7 +172,7 @@ def retarget_idle_bounds(root, path, threshold):
             crops[ep] = (lo, hi)
     logging.info("[WSA idle] %s kept %d/%d assessed episodes; skipped filtering for %d unassessed episodes",
                  path, sum(crop is not None for crop in crops.values()), len(crops), len(episode_ranges) - len(crops))
-    return crops
+    return crops, bad_rows
 
 
 class RetargetActionSource:
@@ -241,8 +264,10 @@ class RetargetActionSource:
         self.indices, self.episodes, self.frames = [
             _scalar_column_to_numpy(metadata[key], np.int64) for key in ("index", "episode_index", "frame_index")]
         _validate_annotation_rows(self.indices, self.episodes, self.frames, self.table.path, allow_sparse=True)
-        self.idle_bounds = retarget_idle_bounds(self.root, self.table.path, idle_motion_threshold)
+        self.idle_bounds, bad_rows = _scan_retarget_idle(self.root, self.table.path, idle_motion_threshold)
         continuous = (np.diff(self.episodes) == 0) & (np.diff(self.frames) == 1)
+        if bad_rows is not None:
+            continuous &= ~(bad_rows[:-1] | bad_rows[1:])
         bounds = np.r_[0, np.flatnonzero(~continuous) + 1, len(self.episodes)]
         anchors = np.zeros(len(self.episodes), dtype=bool)
         for start, stop in zip(bounds[:-1], bounds[1:], strict=True):
@@ -251,7 +276,8 @@ class RetargetActionSource:
                 crop = self.idle_bounds[ep]
                 if crop is None:
                     continue
-                start, stop = (int(start - self.frames[start] + edge) for edge in crop)
+                origin = start - self.frames[start]
+                start, stop = max(start, origin + crop[0]), min(stop, origin + crop[1])
             anchors[start:max(start, stop - self.offsets[-1])] = True
         self.candidate_masks = np.zeros(len(self.table), dtype=np.uint64)
         for body, (body_id, include_eef) in enumerate(zip(self.body_ids, self.with_eef, strict=True)):
@@ -290,7 +316,8 @@ class RetargetActionSource:
             spec["idle_filter"] = {"window": IDLE_WINDOW, "min_active_ratio": MIN_ACTIVE_WINDOW_RATIO,
                                    "motion_threshold": self.idle_motion_threshold,
                                    "rotation_threshold_rad_s": IDLE_ROTATION_THRESHOLD,
-                                   "mad_multiplier": IDLE_MAD_MULTIPLIER}
+                                   "mad_multiplier": IDLE_MAD_MULTIPLIER, "outlier_scope": "window",
+                                   "bad_frame_policy": "split_action"}
         return spec
 
     @property
