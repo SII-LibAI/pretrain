@@ -14,14 +14,22 @@ export HF_LEROBOT_HOME="$PROJ_ROOT/data"
 if [[ -n "${RESUME_CONFIG:-}" ]]; then
     TRAIN_ARGS=(--config_path="$RESUME_CONFIG" --resume=true)
 else
-    : "${INIT_CHECKPOINT_PATH:?Set INIT_CHECKPOINT_PATH to the Stage-1 pretrained_model directory}"
-    : "${RETARGET_STATS_DIR:?Set RETARGET_STATS_DIR to unified72 per-embodiment statistics}"
-    DATA_ROOT="${DATA_ROOT:-$PROJ_ROOT/data}"
+    INIT_CHECKPOINT_PATH=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_1w5/2026_11_22_08_52_47/checkpoints/030000/pretrained_model
+    RETARGET_STATS_DIR=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/stats/midtrain_delta_h32_s3_r1_active
+    DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/pre-train}"
     DATASET_REPO_ID="${DATASET_REPO_ID:-}"
-    if [[ -z "$DATASET_REPO_ID" ]]; then
-        DATASET_REPO_ID="$(bash util_scripts/discover_wsa1_5_datasets.sh "$DATA_ROOT")"
-    fi
-    [[ -n "$DATASET_REPO_ID" ]] || { echo "No LeRobot datasets found under $DATA_ROOT" >&2; exit 1; }
+    DATASET_REPO_ID="$(
+    {
+        find -L ${DATA_ROOT} -type d -name data 2>/dev/null \
+        | while read -r d; do
+            root="$(dirname "$d")"
+            if [[ -d "$root/meta" && -d "$root/videos" ]]; then
+                echo "${root#data/}"
+            fi
+            done
+    } | shuf | tr '\n' ' ' | xargs
+    )"
+    export -n DATASET_REPO_ID
     DATASET_CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/wsa1_5-datasets.XXXXXX.yaml")"
     printf '%s' "$DATASET_REPO_ID" | python -c '
 import json, sys
@@ -30,7 +38,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
 ' "$DATASET_CONFIG_PATH"
     unset DATASET_REPO_ID
     WAN_MODEL_PATH="${WAN_MODEL_PATH:-/inspire/hdd/global_user/zhangjianing-253108140206/dataset/model/wan}"
-    ACTIVE_HEAD="${ACTIVE_HEAD:-false}"
+    ACTIVE_HEAD="${ACTIVE_HEAD:-true}"
     UNIFIED_DIM=72
     if [[ "$ACTIVE_HEAD" == true ]]; then
         UNIFIED_DIM=79
@@ -55,12 +63,14 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
         --policy.future_frames="${FUTURE_FRAMES:-8}"
         --policy.rgb_height="${RGB_HEIGHT:-384}" --policy.rgb_width="${RGB_WIDTH:-320}"
         --policy.motion_height="${MOTION_HEIGHT:-192}" --policy.motion_width="${MOTION_WIDTH:-160}"
-        --policy.lambda_rgb="${LAMBDA_RGB:-1.0}" --policy.lambda_motion="${LAMBDA_MOTION:-0.5}"
-        --policy.lambda_3d="${LAMBDA_3D:-0.5}" --policy.lambda_action="${LAMBDA_ACTION:-1.0}"
-        --policy.rgb_lr="${RGB_LR:-5e-5}" --policy.motion_lr="${MOTION_LR:-5e-5}"
-        --policy.goal_lr="${GOAL_LR:-5e-5}" --policy.heads_lr="${HEADS_LR:-5e-5}" --policy.action_lr="${ACTION_LR:-5e-5}"
-        --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS:-2000}"
-        --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-100000}"
+        --policy.lambda_rgb="${LAMBDA_RGB:-1.0}" --policy.lambda_motion="${LAMBDA_MOTION:-1.0}"
+        --policy.lambda_3d="${LAMBDA_3D:-1.0}" --policy.lambda_action="${LAMBDA_ACTION:-1.0}"
+        --policy.rgb_lr="${RGB_LR:-1e-5}" --policy.motion_lr="${MOTION_LR:-1e-5}"
+        --policy.goal_lr="${GOAL_LR:-1e-5}" --policy.heads_lr="${HEADS_LR:-1e-5}"
+        --policy.action_lr="${ACTION_LR:-1e-4}"
+        --policy.action_scheduler_decay_lr_ratio=0.01
+        --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS:-5000}"
+        --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS:-200000}"
         --policy.scheduler_decay_lr_ratio="${SCHEDULER_DECAY_LR_RATIO:-0.1}"
         --policy.gradient_checkpointing="${GRADIENT_CHECKPOINTING:-true}"
         --policy.gradient_accumulation_steps="${GRAD_ACCUM_STEPS:-1}"
@@ -68,22 +78,22 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
         --dataset.action_mode="${ACTION_MODE:-delta}"
         --dataset.use_external_stats=true
         --dataset.retarget_stats_dir="$RETARGET_STATS_DIR" --dataset.embodiments="${EMBODIMENTS:-[]}"
-        --dataset.annotation_row_group_cache_size="${ANNOTATION_ROW_GROUP_CACHE_SIZE:-2}"
-        --dataset.future_frames="${FUTURE_FRAMES:-8}" --dataset.frame_stride="${FRAME_STRIDE:-4}"
+        --dataset.annotation_row_group_cache_size="${ANNOTATION_ROW_GROUP_CACHE_SIZE:-3}"
+        --dataset.future_frames="${FUTURE_FRAMES:-8}" --dataset.frame_stride="${FRAME_STRIDE:-6}"
         --dataset.rgb_height="${RGB_HEIGHT:-384}" --dataset.rgb_width="${RGB_WIDTH:-320}"
         --dataset.motion_height="${MOTION_HEIGHT:-192}" --dataset.motion_width="${MOTION_WIDTH:-160}"
-        --dataset.use_subtask="${USE_SUBTASK:-false}" --dataset.allow_endframe_3d="${ALLOW_ENDFRAME_3D:-true}"
+        --dataset.use_subtask="${USE_SUBTASK:-true}" --dataset.allow_endframe_3d="${ALLOW_ENDFRAME_3D:-false}"
         --dataset.video_backend="${VIDEO_BACKEND:-pyav}" --dataset.video_decode_threads="${VIDEO_DECODE_THREADS:-1}"
-        --dataset.dist_loading="${DIST_LOADING:-false}"
+        --dataset.dist_loading="${DIST_LOADING:-true}"
+        --dataset.idle_motion_threshold="${IDLE_MOTION_THRESHOLD:-0.03}"
+        --dataset.idle_rotation_threshold="${IDLE_ROTATION_THRESHOLD:-0.1}"
         --output_dir="${OUTPUT_DIR:-outputs/wsa1_5_midtrain/$(date +%Y_%m_%d_%H_%M_%S)}"
-        --steps="${STEPS:-100000}" --batch_size="${BATCH_SIZE:-8}" --num_workers="${NUM_WORKERS:-8}"
-        --log_freq="${LOG_FREQ:-20}" --save_freq="${SAVE_FREQ:-10000}" --eval_freq="${EVAL_FREQ:-5000}"
+        --steps="${STEPS:-200000}" --batch_size="${BATCH_SIZE:-64}" --num_workers="${NUM_WORKERS:-10}"
+        --log_freq="${LOG_FREQ:-20}" --save_freq="${SAVE_FREQ:-10000}" --eval_freq="${EVAL_FREQ:-100}"
         --wandb.enable="${WANDB_ENABLE:-true}" --wandb.mode="${WANDB_MODE:-offline}"
     )
-    [[ -z "${EXTERNAL_STATS_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.external_stats_path="$EXTERNAL_STATS_PATH")
     [[ -z "${WEIGHT_RULES_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.weight_rules_path="$WEIGHT_RULES_PATH")
-    [[ -z "${IDLE_MOTION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_motion_threshold="$IDLE_MOTION_THRESHOLD")
-    [[ -z "${IDLE_ROTATION_THRESHOLD:-}" ]] || TRAIN_ARGS+=(--dataset.idle_rotation_threshold="$IDLE_ROTATION_THRESHOLD")
+    [[ -z "${EXTERNAL_STATS_PATH:-}" ]] || TRAIN_ARGS+=(--dataset.external_stats_path="$EXTERNAL_STATS_PATH")
 fi
 NODE_COUNT="${PET_NNODES:-${NODE_COUNT:-1}}"
 NODE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"

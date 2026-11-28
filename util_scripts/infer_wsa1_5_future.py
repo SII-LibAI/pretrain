@@ -1,10 +1,11 @@
 """
+cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
 python util_scripts/infer_wsa1_5_future.py \
-    --checkpoint /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_robotwin/2026_11_15_00_31_35/checkpoints/010000/pretrained_model  \
-    --dataset-root /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/RoboTwin/blocks_ranking_size/aloha-agilex_randomized_500 \
-    --output /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/future/wsa15/robotwin/02 \
+    --checkpoint /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_1w5/2026_11_22_08_52_47/checkpoints/010000/pretrained_model \
+    --dataset-root /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/ego/Egodex-LerobotV3/extra/basic_pick_place \
+    --output /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/future/filter_1w/egodex/00 \
     --device cuda \
-    --seed 4200 \
+    --seed 0 \
     --omega-checkpoint /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/vggt-omega/vggt_omega_1b_256_text.pt
 """
 """从 LeRobot V3 抽取当前观测和文本，按 checkpoint 配置预测未来 RGB。"""

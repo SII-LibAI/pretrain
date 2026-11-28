@@ -14,14 +14,18 @@ import numpy as np
 import torch
 """
 cd /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series
-python util_scripts/compute_synthetic_embodiment_stats.py \
-    --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/lerobot_annotation_engine/outputs/repo_dir/egoverse/sum.txt \
-    --output-dir /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/data/stats/norm_stats32_unified \
-    --action-space unified72 \
-    --action-mode delta \
-    --chunk-size 32 \
-    --num-workers 30 \
-    --embodiment dexhand_piper_inspire \
+export RETARGET_STATS_DIR="$PWD/stats/midtrain_delta_h32_s3_r1_active"
+python /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/util_scripts/compute_synthetic_embodiment_stats.py \
+  --dataset-roots-file /inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/lerobot_annotation_engine/outputs/repo_dir/egosuite/sum.txt \
+  --output-dir "$RETARGET_STATS_DIR" \
+  --action-space unified72 \
+  --action-mode delta \
+  --chunk-size 32 \
+  --stride 1 \
+  --idle-motion-threshold 0.03 \
+  --idle-rotation-threshold 0.1 \
+  --num-workers 100 \
+  --active-head
     
 """
 from lerobot.datasets.synthetic_embodiment import DEFAULT_ANNOTATION_FILE, EmbodimentSpec

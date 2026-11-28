@@ -71,7 +71,7 @@ TOKENIZER_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140
 bash evaluation/RoboTwin/wsa1_5/eval_ngpu.sh
 
 GPUS=0,1 \
-TASK_CONFIG=demo_randomized \
+TASK_CONFIG=demo_clean \
 PRETRAINED_CKPT=/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/outputs/wsa1_5_robotwin/2026_11_15_00_31_35/checkpoints/010000/pretrained_model \
 OUTPUT_ROOT="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/InternVLA-A-series/evaluation/RoboTwin/output/eval_smoketest" \
 TEXT_ENCODER_PATH="/inspire/ssd/project/embodied-basic-model/zhangjianing-253108140206/DATASET/model/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth" \

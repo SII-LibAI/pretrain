@@ -84,5 +84,10 @@ def save_training_sample(batch, dataset, output_dir, step):
         "current_motion_valid": bool(motion_valid[0]), "goal_view_valid": goal_valid,
         "future_motion_valid": batch["targets"]["motion_valid"][index].detach().cpu().tolist(),
     }
+    if "action" in targets:
+        action_valid = targets["action_valid_mask"][index].detach().cpu()
+        if action_valid.any():
+            metadata["action"] = targets["action"][index].detach().cpu().tolist()
+            metadata["action_valid_mask"] = action_valid.tolist()
     (directory / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return directory

@@ -91,6 +91,9 @@ class WSA1_5Config(PreTrainedConfig):
     sparse_frame_encoding: str = "joint"  # joint video VAE | independent one-frame VAE calls.
     lambda_action: float = 1.0
     action_lr: float = 1e-4
+    action_scheduler_warmup_steps: int | None = None
+    action_scheduler_decay_steps: int | None = None
+    action_scheduler_decay_lr_ratio: float | None = None
     rgb_finetune_mode: str = "lora"  # Applied only when enable_action=True.
     rgb_lora_rank: int = 16
     rgb_lora_alpha: int = 32
@@ -179,6 +182,12 @@ class WSA1_5Config(PreTrainedConfig):
             raise ValueError("Scheduler requires integer 0 <= warmup < decay steps")
         if not 0 <= self.scheduler_decay_lr_ratio <= 1:
             raise ValueError("scheduler_decay_lr_ratio must be within [0, 1]")
+        if self.enable_action:
+            warmup, decay, ratio = self._action_schedule()
+            if type(warmup) is not int or type(decay) is not int or not 0 <= warmup < decay:
+                raise ValueError("Action scheduler requires integer 0 <= warmup < decay steps")
+            if not 0 <= ratio <= 1:
+                raise ValueError("action_scheduler_decay_lr_ratio must be within [0, 1]")
         if self.dtype not in {"float32", "bfloat16", "float16"}:
             raise ValueError("Unsupported WSA dtype")
         if not any((self.enable_rgb, self.enable_motion, self.enable_3d_queries)):
@@ -233,14 +242,30 @@ class WSA1_5Config(PreTrainedConfig):
     def get_optimizer_preset(self):
         return AdamWConfig(lr=self.motion_lr, weight_decay=self.optimizer_weight_decay, grad_clip_norm=1.0)
 
+    def _action_schedule(self):
+        return tuple(
+            shared if override is None else override
+            for override, shared in (
+                (self.action_scheduler_warmup_steps, self.scheduler_warmup_steps),
+                (self.action_scheduler_decay_steps, self.scheduler_decay_steps),
+                (self.action_scheduler_decay_lr_ratio, self.scheduler_decay_lr_ratio),
+            )
+        )
+
     def get_scheduler_preset(self):
         rates = {"rgb": self.rgb_lr, "motion": self.motion_lr, "3d": self.goal_lr, "heads": self.heads_lr}
+        schedules = {name: {
+            "peak_lr": lr, "decay_lr": lr * self.scheduler_decay_lr_ratio,
+            "num_warmup_steps": self.scheduler_warmup_steps, "num_decay_steps": self.scheduler_decay_steps,
+        } for name, lr in rates.items()}
         if self.enable_action:
-            rates["action"] = self.action_lr
-        return MultiGroupCosineDecayWithWarmupSchedulerConfig(auto_scale_to_training_steps=False, group_schedules={name: {
-            "peak_lr": lr, "decay_lr": lr * self.scheduler_decay_lr_ratio, "num_warmup_steps": self.scheduler_warmup_steps,
-            "num_decay_steps": self.scheduler_decay_steps,
-        } for name, lr in rates.items()})
+            warmup, decay, ratio = self._action_schedule()
+            schedules["action"] = {
+                "peak_lr": self.action_lr, "decay_lr": self.action_lr * ratio,
+                "num_warmup_steps": warmup, "num_decay_steps": decay,
+            }
+        return MultiGroupCosineDecayWithWarmupSchedulerConfig(
+            auto_scale_to_training_steps=False, group_schedules=schedules)
 
 
 @DatasetConfig.register_subclass("wsa1_5")
